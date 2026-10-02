@@ -32,6 +32,9 @@ struct PlayerPlaybackTests {
     Preference.Key.autoRepeat.rawValue: false,
     Preference.Key.playlistAutoAdd.rawValue: true,
     Preference.Key.pauseWhenOpen.rawValue: true,
+    Preference.Key.horizontalScrollAction.rawValue: Preference.ScrollAction.seek.rawValue,
+    Preference.Key.relativeSeekAmount.rawValue: 3,
+    Preference.Key.useExactSeek.rawValue: Preference.SeekOption.exact.rawValue,
   ]
 
   private static var playerCount = 0
@@ -151,6 +154,35 @@ struct PlayerPlaybackTests {
       player.navigateInPlaylist(nextMedia: false)
       try await Self.waitForPosition(0, of: player)
       #expect(player.mpv.getInt(MPVProperty.playlistPos) == 0)
+    }
+  }
+
+  @Test("A mouse wheel scrolled sideways over the window seeks")
+  func scrollSeek() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      let scroll = try #require(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: 0, wheel2: 1,
+                                        wheel3: 0))
+      // A mouse wheel scroll begins only once its time is far enough past the last scroll's, see ScrollGesture.
+      scroll.timestamp = CGEventTimestamp(DispatchTime.now().uptimeNanoseconds)
+      let event = try #require(NSEvent(cgEvent: scroll))
+      player.mainWindow.scrollWheel(with: event)
+      // Which way a sideways wheel turns playback follows the system's scroll direction, so only the move is checked.
+      try await Self.waitUntil { abs(player.mpv.getDouble(MPVProperty.timePos) - 2) >= 0.5 }
+    }
+  }
+
+  @Test("The inspector shows the length of the file being played")
+  func inspector() async throws {
+    try await Self.withPlayer { player, _ in
+      PlayerCore.lastActive = player
+      let inspector = InspectorWindowController()
+      _ = inspector.window
+      defer { inspector.close() }
+      inspector.updateInfo()
+      let length = VideoTime(4).stringRepresentation
+      try await Self.waitUntil { inspector.durationField.stringValue == length }
     }
   }
 
