@@ -20,6 +20,19 @@ final class StartingPlayer: EntryStartPlayer {
   /// The messages logged, in order.
   private(set) var messages: [String] = []
 
+  /// The replies waiting for `mpv` to answer whether playback is paused, oldest first.
+  private(set) var pauseQuestions: [(Bool) -> Void] = []
+
+  func fetchMpvPaused(_ reply: @escaping (Bool) -> Void) {
+    calls.append("fetchMpvPaused")
+    pauseQuestions.append(reply)
+  }
+
+  /// Answer the oldest waiting question with whether `mpv` has playback paused.
+  func answerPauseQuestion() {
+    pauseQuestions.removeFirst()(isMpvPaused)
+  }
+
   func resumeMpv() {
     calls.append("resumeMpv")
     isMpvPaused = false
@@ -42,7 +55,7 @@ struct EntryPlayStateTests {
     player.playerState = state
     player.isMpvPaused = true
     player.pausedForLoading = true
-    #expect(!EntryStart.decidePlayState(player))
+    #expect(!EntryStart.decidePlayState(player, paused: player.isMpvPaused))
     #expect(player.playerState == state)
     #expect(player.pausedForLoading)
     #expect(player.calls.isEmpty)
@@ -53,7 +66,7 @@ struct EntryPlayStateTests {
     let player = StartingPlayer()
     player.isMpvPaused = true
     player.pausedForLoading = true
-    #expect(EntryStart.decidePlayState(player))
+    #expect(EntryStart.decidePlayState(player, paused: player.isMpvPaused))
     #expect(player.calls == ["displayActive", "resumeMpv"])
     #expect(player.playerState == .playing)
     #expect(!player.pausedForLoading)
@@ -66,7 +79,7 @@ struct EntryPlayStateTests {
     player.isMpvPaused = true
     player.pausedForLoading = true
     player.pausesWhenOpened = true
-    #expect(EntryStart.decidePlayState(player))
+    #expect(EntryStart.decidePlayState(player, paused: player.isMpvPaused))
     #expect(player.calls.isEmpty)
     #expect(player.playerState == .paused)
     #expect(!player.pausedForLoading)
@@ -77,7 +90,7 @@ struct EntryPlayStateTests {
     let player = StartingPlayer()
     player.isMpvPaused = true
     player.pausesWhenOpened = pausesWhenOpened
-    #expect(EntryStart.decidePlayState(player))
+    #expect(EntryStart.decidePlayState(player, paused: player.isMpvPaused))
     #expect(player.calls.isEmpty)
     #expect(player.playerState == .paused)
   }
@@ -86,10 +99,64 @@ struct EntryPlayStateTests {
   func unpausedPlays(pausedForLoading: Bool) {
     let player = StartingPlayer()
     player.pausedForLoading = pausedForLoading
-    #expect(EntryStart.decidePlayState(player))
+    #expect(EntryStart.decidePlayState(player, paused: player.isMpvPaused))
     #expect(player.calls.isEmpty)
     #expect(player.playerState == .playing)
     #expect(!player.pausedForLoading)
+  }
+
+  @Test("Nothing is asked of mpv unless the player is in the loaded state",
+        arguments: [PlayerState.loading, .starting, .playing, .paused, .stopping, .idle, .shuttingDown, .shutDown])
+  func onlyLoadedAsks(state: PlayerState) {
+    let player = StartingPlayer()
+    player.playerState = state
+    var decided = 0
+    EntryStart.decidePlayState(player) { decided += 1 }
+    #expect(player.calls.isEmpty)
+    #expect(decided == 0)
+  }
+
+  @Test("The play state is decided once mpv answers whether playback is paused")
+  func decidedWhenMpvAnswers() {
+    let player = StartingPlayer()
+    player.isMpvPaused = true
+    player.pausedForLoading = true
+    var decided = 0
+    EntryStart.decidePlayState(player) { decided += 1 }
+    #expect(player.calls == ["fetchMpvPaused"])
+    #expect(player.playerState == .loaded)
+    #expect(decided == 0)
+    player.answerPauseQuestion()
+    #expect(player.calls == ["fetchMpvPaused", "displayActive", "resumeMpv"])
+    #expect(player.playerState == .playing)
+    #expect(decided == 1)
+  }
+
+  @Test("A pause the user gives before mpv answers keeps the entry paused")
+  func pauseBeforeAnswerHolds() {
+    let player = StartingPlayer()
+    player.isMpvPaused = true
+    player.pausedForLoading = true
+    EntryStart.decidePlayState(player) {}
+    player.pausedForLoading = false
+    player.answerPauseQuestion()
+    #expect(player.calls == ["fetchMpvPaused"])
+    #expect(player.playerState == .paused)
+  }
+
+  @Test("An answer arriving after the play state was decided changes nothing")
+  func laterAnswerChangesNothing() {
+    let player = StartingPlayer()
+    player.isMpvPaused = true
+    player.pausedForLoading = true
+    var decided = 0
+    EntryStart.decidePlayState(player) { decided += 1 }
+    EntryStart.decidePlayState(player) { decided += 1 }
+    player.answerPauseQuestion()
+    player.isMpvPaused = true
+    player.answerPauseQuestion()
+    #expect(decided == 1)
+    #expect(player.playerState == .playing)
   }
 
   @Test("A pause notice leaves the state unchanged only while the entry is loaded")

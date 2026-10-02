@@ -13,10 +13,13 @@ final class SteppingPlayer: PlaylistSteppingPlayer {
   var playerState: PlayerState = .playing
   var isMpvPaused = false
   var pausedForLoading = false
+  var userPauseCount = 0
   var isInteractiveModeActive = false
   var isFirstEntryPlaying = false
-  /// The value `mpv` returns for a command to move to another entry.
-  var moveReturnValue: Int32 = 0
+  /// Whether `mpv` accepts a command to move to another entry.
+  var acceptsMove = true
+  /// Called after `mpv` has handled a command to move to another entry and before its reply reaches the main thread.
+  var beforeReply: (() -> Void)?
   /// What the player was asked to do, in order.
   private(set) var calls: [String] = []
   /// The messages logged, in order.
@@ -24,9 +27,13 @@ final class SteppingPlayer: PlaylistSteppingPlayer {
 
   func seekToStart() { calls.append("seekToStart") }
 
-  func movePlaylistPosition(forward: Bool, reply: @escaping (Int32) -> Void) {
+  func movePlaylistPosition(forward: Bool, whenAccepted: @escaping () -> Void, reply: @escaping (Bool) -> Void) {
     calls.append(forward ? "moveForward" : "moveBackward")
-    reply(moveReturnValue)
+    if acceptsMove {
+      whenAccepted()
+    }
+    beforeReply?()
+    reply(acceptsMove)
   }
 
   func playPlaylistEntry(at index: Int) { calls.append("playEntry \(index)") }
@@ -75,14 +82,14 @@ struct PlaylistStepTests {
     let player = SteppingPlayer()
     player.isFirstEntryPlaying = true
     PlaylistStepping.step(player, forward: true)
-    #expect(player.calls == ["moveForward", "cancelThumbnailGeneration", "displayActive", "pauseMpv"])
+    #expect(player.calls == ["moveForward", "cancelThumbnailGeneration", "pauseMpv", "displayActive"])
     #expect(player.pausedForLoading)
   }
 
   @Test("A step mpv refuses leaves playback unchanged", arguments: [true, false])
   func refusedStepLeavesPlayback(forward: Bool) {
     let player = SteppingPlayer()
-    player.moveReturnValue = -12
+    player.acceptsMove = false
     PlaylistStepping.step(player, forward: forward)
     #expect(player.calls == [forward ? "moveForward" : "moveBackward"])
     #expect(!player.isMpvPaused)
@@ -94,38 +101,61 @@ struct PlaylistStepTests {
   func acceptedStepWhilePlayingPauses(forward: Bool) {
     let player = SteppingPlayer()
     PlaylistStepping.step(player, forward: forward)
-    #expect(player.calls == [forward ? "moveForward" : "moveBackward", "cancelThumbnailGeneration", "displayActive",
-                             "pauseMpv"])
+    #expect(player.calls == [forward ? "moveForward" : "moveBackward", "cancelThumbnailGeneration", "pauseMpv",
+                             "displayActive"])
     #expect(player.pausedForLoading)
     #expect(player.messages == ["Pausing playback before playing \(forward ? "next" : "previous") entry in playlist"])
   }
 
-  @Test("A step mpv accepts while paused keeps playback paused for the loading of the entry")
+  @Test("A step mpv accepts while paused asks for the pause again and pauses for the loading of the entry")
   func acceptedStepWhilePausedKeepsPause() {
     let player = SteppingPlayer()
     player.isMpvPaused = true
     player.playerState = .paused
     PlaylistStepping.step(player, forward: true)
-    #expect(player.calls == ["moveForward", "cancelThumbnailGeneration", "displayActive"])
+    #expect(player.calls == ["moveForward", "cancelThumbnailGeneration", "pauseMpv", "displayActive"])
+    #expect(player.isMpvPaused)
     #expect(player.pausedForLoading)
-    #expect(player.messages.isEmpty)
+  }
+
+  @Test("A pause the user gives before mpv replies to a step holds once the entry has loaded")
+  func pauseBeforeReplyHolds() {
+    let player = SteppingPlayer()
+    player.beforeReply = { PlaylistStepping.pause(player) }
+    PlaylistStepping.step(player, forward: true)
+    #expect(player.calls == ["moveForward", "cancelThumbnailGeneration", "pauseMpv", "pauseMpv", "displayActive"])
+    #expect(player.userPauseCount == 1)
+    #expect(!player.pausedForLoading)
+  }
+
+  @Test("A step mpv refuses while an entry loads leaves that entry paused for its loading")
+  func refusedStepKeepsPauseForLoading() {
+    let player = SteppingPlayer()
+    player.playerState = .loading
+    player.isMpvPaused = true
+    player.pausedForLoading = true
+    player.acceptsMove = false
+    PlaylistStepping.step(player, forward: true)
+    #expect(player.calls == ["moveForward"])
+    #expect(player.pausedForLoading)
   }
 
   @Test("Playing an entry by index leaves the entry playing before asking mpv to play it")
   func playEntryAtIndex() {
     let player = SteppingPlayer()
     PlaylistStepping.play(player, at: 3)
-    #expect(player.calls == ["cancelThumbnailGeneration", "displayActive", "pauseMpv", "playEntry 3", "refreshPlaylist"])
+    #expect(player.calls == ["cancelThumbnailGeneration", "pauseMpv", "displayActive", "playEntry 3", "refreshPlaylist"])
     #expect(player.pausedForLoading)
     #expect(player.messages == ["Pausing playback before playing entry at index 3 in the playlist"])
   }
 
-  @Test("Playing an entry by index while paused does not pause again")
+  @Test("Playing an entry by index while paused asks for the pause again")
   func playEntryAtIndexWhilePaused() {
     let player = SteppingPlayer()
     player.isMpvPaused = true
     PlaylistStepping.play(player, at: 0)
-    #expect(player.calls == ["cancelThumbnailGeneration", "displayActive", "playEntry 0", "refreshPlaylist"])
+    #expect(player.calls == ["cancelThumbnailGeneration", "pauseMpv", "displayActive", "playEntry 0", "refreshPlaylist"])
+    #expect(player.isMpvPaused)
     #expect(player.pausedForLoading)
   }
 }
@@ -151,6 +181,7 @@ struct PlaylistPauseTests {
     PlaylistStepping.togglePause(player)
     #expect(player.calls == ["pauseMpv"])
     #expect(!player.pausedForLoading)
+    #expect(player.userPauseCount == 1)
     #expect(player.messages == ["Pausing playback"])
   }
 
@@ -174,6 +205,7 @@ struct PlaylistPauseTests {
     PlaylistStepping.pause(player)
     #expect(player.calls.isEmpty)
     #expect(player.pausedForLoading)
+    #expect(player.userPauseCount == 0)
   }
 
   @Test("A pause given while an entry loads ends the pause for loading", arguments: [PlayerState.loading, .starting, .loaded])
