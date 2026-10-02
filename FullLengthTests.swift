@@ -73,6 +73,60 @@ struct FullLengthTests {
     #expect(FFmpegController.fullLength(ofFragmentedFile: url.path) < 0)
   }
 
+  @Test("A seek by percentage goes to that fraction of the full length as an absolute time while the full length is known")
+  func seekArguments() {
+    #expect(FullLength.seekArguments(percent: 50, fullLength: 3720, exact: false) == ["1860.0", "absolute"])
+    #expect(FullLength.seekArguments(percent: 50, fullLength: 3720, exact: true) == ["1860.0", "absolute+exact"])
+    #expect(FullLength.seekArguments(percent: 50, fullLength: nil, exact: false) == ["50.0", "absolute-percent"])
+    #expect(FullLength.seekArguments(percent: 50, fullLength: nil, exact: true) == ["50.0", "absolute-percent+exact"])
+  }
+
+  @Test("A full length found for the file playing replaces its duration and remaining time")
+  @MainActor
+  func shownForFilePlaying() {
+    let player = Self.player(playing: "/media/a.mp4")
+    player.showFullLength(3720, shown: 229, ofFileAt: "/media/a.mp4")
+    #expect(player.info.fullLength == 3720)
+    #expect(player.info.videoDuration?.second == 3720)
+    #expect(player.info.getCachedVideoDurationAndProgress("/media/a.mp4")?.duration == 3720)
+    #expect(player.info.videoRemaining?.second == 3000)
+  }
+
+  @Test("A full length found after another file became current is dropped")
+  @MainActor
+  func droppedForAnotherFile() {
+    let player = Self.player(playing: "/media/b.mp4")
+    player.showFullLength(3720, shown: 229, ofFileAt: "/media/a.mp4")
+    #expect(player.info.fullLength == nil)
+    #expect(player.info.videoDuration?.second == 229)
+  }
+
+  @Test("A full length found after playback stopped is dropped")
+  @MainActor
+  func droppedWhenStopped() {
+    let player = Self.player(playing: "/media/a.mp4")
+    player.info.state = .idle
+    player.showFullLength(3720, shown: 229, ofFileAt: "/media/a.mp4")
+    #expect(player.info.fullLength == nil)
+    #expect(player.info.videoDuration?.second == 229)
+  }
+
+  /// The players the tests made, kept for the rest of the run like those of `MPVAsyncRequestTests`.
+  @MainActor private static var players: [PlayerCore] = []
+
+  /// A player whose `mpv` core was never started, playing the file at the given path 720 s in, a file `mpv` says is 229 s long.
+  @MainActor private static func player(playing path: String) -> PlayerCore {
+    let player = PlayerCore()
+    players.append(player)
+    player.info.state = .playing
+    player.info.currentURL = URL(fileURLWithPath: path)
+    player.info.videoDuration = VideoTime(229.0)
+    player.info.videoPosition = VideoTime(720.0)
+    player.info.videoRemaining = VideoTime(0.0)
+    player.info.setCachedVideoDurationAndProgress(path, (duration: 229, progress: nil))
+    return player
+  }
+
   /// The path of `fragmented.mp4` in the test bundle: a fragmented MP4 that ends in an mfra index, 4 s long, its 40 frames at
   /// 10 frames a second in four fragments. It was written by ffmpeg 9.0.1 with
   /// `ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10:duration=4 -c:v libx264 -bf 0 -g 10 -pix_fmt yuv420p
