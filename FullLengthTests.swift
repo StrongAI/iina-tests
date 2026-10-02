@@ -117,6 +117,8 @@ struct FullLengthTests {
   /// A player whose `mpv` core was never started, playing the file at the given path 720 s in, a file `mpv` says is 229 s long.
   @MainActor private static func player(playing path: String) -> PlayerCore {
     let player = PlayerCore()
+    // Like PlayerCore.createPlayerCore, label the player before it logs anything, since its log subsystem is named after it.
+    player.label = "iinaTests-fulllength-\(players.count)"
     players.append(player)
     player.info.state = .playing
     player.info.currentURL = URL(fileURLWithPath: path)

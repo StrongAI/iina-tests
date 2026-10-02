@@ -24,6 +24,8 @@ struct MPVAsyncRequestTests {
   /// A player whose `mpv` core was never started.
   private static func unstartedPlayer() -> PlayerCore {
     let player = PlayerCore()
+    // Like PlayerCore.createPlayerCore, label the player before it logs anything, since its log subsystem is named after it.
+    player.label = "iinaTests-mpv-\(players.count)"
     players.append(player)
     return player
   }
