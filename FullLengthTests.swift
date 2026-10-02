@@ -54,4 +54,36 @@ struct FullLengthTests {
   func missingFile() {
     #expect(FFmpegController.fullLength(ofFragmentedFile: "/nonexistent/missing.mp4") < 0)
   }
+
+  @Test("A file opened from its mfra index runs from its first packet to the end of its last")
+  func indexedFile() throws {
+    let path = try #require(Self.fragmentedFile)
+    #expect(abs(FFmpegController.fullLength(ofFragmentedFile: path) - 4) < 1e-6)
+  }
+
+  @Test("A file that ends in an mfra index but cannot be opened has no full length to find")
+  func unopenableFile() throws {
+    let path = try #require(Self.fragmentedFile)
+    var data = try Data(contentsOf: URL(fileURLWithPath: path))
+    // Clear the file type and movie boxes, which come before the first fragment, and keep the index at the end.
+    data.replaceSubrange(0..<Self.fragmentedHeaderLength, with: Data(count: Self.fragmentedHeaderLength))
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("iinaTests-\(UUID().uuidString).mp4")
+    try data.write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+    #expect(FFmpegController.fullLength(ofFragmentedFile: url.path) < 0)
+  }
+
+  /// The path of `fragmented.mp4` in the test bundle: a fragmented MP4 that ends in an mfra index, 4 s long, its 40 frames at
+  /// 10 frames a second in four fragments. It was written by ffmpeg 9.0.1 with
+  /// `ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10:duration=4 -c:v libx264 -bf 0 -g 10 -pix_fmt yuv420p
+  /// -movflags +frag_keyframe+empty_moov -an fragmented.mp4`.
+  private static var fragmentedFile: String? {
+    Bundle(for: FullLengthTestsBundle.self).path(forResource: "fragmented", ofType: "mp4")
+  }
+
+  /// The length of the boxes of `fragmented.mp4` before its first fragment, its file type and movie boxes.
+  private static let fragmentedHeaderLength = 784
 }
+
+/// A class whose bundle is the test bundle.
+private final class FullLengthTestsBundle {}
