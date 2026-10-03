@@ -5,6 +5,7 @@
 //  Tests for adding the playable files in the folder of the opened file to its playlist.
 //
 
+import Foundation
 import Testing
 @testable import IINA
 
@@ -74,6 +75,26 @@ struct FolderPlaylistAssemblyTests {
     #expect(playlist.additions == ["insert a.mp4 at 0", "insert b.mp4 at 1", "insert c.mp4 at 2", "insert d.mp4 at 3",
                                    "insert e.mp4 at 4"])
     #expect(playlist.paths == folder + ["z.mp4"])
+  }
+
+  @Test("A file opened through a symbolic link is found among the files listed through its target, and the other way round",
+        arguments: [false, true])
+  func openedThroughSymlink(openedThroughTarget: Bool) throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    for name in folder {
+      FileManager.default.createFile(atPath: directory.appendingPathComponent(name).path, contents: nil)
+    }
+    let throughLink = folder.map { directory.appendingPathComponent($0).path }
+    try #require(throughLink[0].hasPrefix("/var/"), "the temporary directory is reached through the /var symbolic link")
+    let throughTarget = throughLink.map { "/private" + $0 }
+    let listed = openedThroughTarget ? throughLink : throughTarget
+    let opened = openedThroughTarget ? throughTarget[2] : throughLink[2]
+    let playlist = RecordingFolderPlaylist(paths: [opened])
+    try FolderPlaylistAssembly.add(listed, openedPath: opened, to: playlist)
+    #expect(playlist.additions == ["append \(listed[3])", "append \(listed[4])", "insert \(listed[0]) at 0",
+                                   "insert \(listed[1]) at 1"])
   }
 
   @Test("Adding stops once the playlist is abandoned", arguments: [0, 1, 2, 3])
