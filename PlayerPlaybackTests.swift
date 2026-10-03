@@ -291,6 +291,18 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Resuming before the end returns before mpv handles it and plays on from where playback was")
+  func resumeDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.resume() }
+      #expect(returnedWhileHeld, "Resuming waited for mpv")
+      try await Self.waitUntil { !player.mpv.getFlag(MPVOption.PlaybackControl.pause) }
+      #expect(player.mpv.getDouble(MPVProperty.timePos) >= 2 - 0.1)
+    }
+  }
+
   @Test("Steps and plays move between the entries, each paused when opened")
   func steps() async throws {
     try await Self.withPlayer { player, _ in
