@@ -464,6 +464,48 @@ struct PlayerPlaybackTests {
       }
     }
   }
+
+  @Test("Opening nothing reports nothing opened, a file opened without auto loading turns it off, and a playlist file is left to mpv")
+  func openKinds() async throws {
+    try await Self.withPlayer { player, folder in
+      var counts: [Int?] = []
+      player.openURLs([]) { counts.append($0) }
+      #expect(counts == [0])
+      let video = folder.appendingPathComponent("a.mp4")
+      player.openURLs([video], shouldAutoLoad: false) { counts.append($0) }
+      try await Self.waitUntil {
+        player.info.currentURL?.path == video.path && player.info.state == .paused && !player.info.pausedForLoading
+      }
+      #expect(counts == [0, 1])
+      #expect(!player.info.shouldAutoLoadFiles)
+      // A cue sheet is a playlist file, whose entries mpv reads itself.
+      let cue = folder.appendingPathComponent("b.cue")
+      try "FILE \"b.mp4\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".write(to: cue, atomically: true, encoding: .utf8)
+      player.openURLs([cue]) { counts.append($0) }
+      try await Self.waitUntil {
+        player.info.currentURL?.path == cue.path && player.info.state == .paused && !player.info.pausedForLoading
+      }
+      #expect(counts == [0, 1, nil])
+      #expect(!player.info.shouldAutoLoadFiles)
+    }
+  }
+
+  @Test("Files opened in the current window open in the active player")
+  func openInActiveWindow() async throws {
+    try await Self.withPlayer { player, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: false]) {
+        let video = folder.appendingPathComponent("c.mp4")
+        let target = PlayerCore.activeOrNew
+        #expect(await Self.open([video]) == 1)
+        try await Self.waitUntil {
+          target.info.currentURL?.path == video.path && target.info.state == .paused && !target.info.pausedForLoading
+        }
+        if target !== player {
+          try await Self.close([target])
+        }
+      }
+    }
+  }
 }
 
 private final class PlayerPlaybackTestsBundle {}
