@@ -141,5 +141,48 @@ struct FullLengthTests {
   private static let fragmentedHeaderLength = 784
 }
 
+@Suite("Value the play slider seeks to when the mouse button is released")
+struct PlaySliderTrackingTests {
+
+  @Test("The release seeks to the value the pointer set, whatever the slider was set to since")
+  func releaseSeeksToPointerValue() {
+    var tracking = PlaySliderTracking()
+    tracking.began()
+    #expect(tracking.seekValue(sliderValue: 24.638) == 24.638)
+    tracking.ended()
+    #expect(tracking.seekValue(sliderValue: 6.224) == 24.638)
+  }
+
+  @Test("A drag is released at the last value the pointer set")
+  func dragReleasedAtLastValue() {
+    var tracking = PlaySliderTracking()
+    tracking.began()
+    #expect(tracking.seekValue(sliderValue: 10) == 10)
+    #expect(tracking.seekValue(sliderValue: 20) == 20)
+    #expect(tracking.seekValue(sliderValue: 30) == 30)
+    tracking.ended()
+    #expect(tracking.seekValue(sliderValue: 5) == 30)
+  }
+
+  @Test("An action sent without the mouse seeks to the slider's value")
+  func untrackedSeeksToSliderValue() {
+    var tracking = PlaySliderTracking()
+    #expect(tracking.seekValue(sliderValue: 40) == 40)
+  }
+
+  @Test("The value of one click is not used again")
+  func pointerValueUsedOnce() {
+    var tracking = PlaySliderTracking()
+    tracking.began()
+    #expect(tracking.seekValue(sliderValue: 24.638) == 24.638)
+    tracking.ended()
+    #expect(tracking.seekValue(sliderValue: 6.224) == 24.638)
+    #expect(tracking.seekValue(sliderValue: 50) == 50)
+    tracking.began()
+    tracking.ended()
+    #expect(tracking.seekValue(sliderValue: 70) == 70)
+  }
+}
+
 /// A class whose bundle is the test bundle.
 private final class FullLengthTestsBundle {}
