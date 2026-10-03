@@ -121,6 +121,18 @@ struct PlayerPlaybackTests {
     return returnedWhileHeld
   }
 
+  /// Ask `mpv` whether playback is paused and wait for the answer, which comes after its answers to every request made before.
+  private static func paused(_ player: PlayerCore) async -> Bool? {
+    await withCheckedContinuation { continuation in
+      player.mpv.getFlagAsync(MPVOption.PlaybackControl.pause) { continuation.resume(returning: $0) }
+    }
+  }
+
+  /// Wait until every block the main queue holds has run.
+  private static func drainMain() async {
+    await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+  }
+
   @Test("A file opened from a folder is joined by the folder's other files in folder order and shown paused")
   func opened() async throws {
     try await Self.withPlayer { player, folder in
@@ -167,7 +179,7 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("Seeks by seconds and to the start of the file return before mpv handles them")
+  @Test("Seeks by seconds, to a time and to the start of the file return before mpv handles them")
   func seeksDoNotWait() async throws {
     try await Self.withPlayer { player, _ in
       player.seek(percent: 50, forceExact: true)
@@ -177,6 +189,7 @@ struct PlayerPlaybackTests {
         ("relative", { player.seek(relativeSecond: -1, option: .relative) }, 2),
         ("auto", { player.seek(relativeSecond: 1, option: .auto) }, 3),
         ("scroll", { player.seek(relativeSecond: -2, option: .exact, byScrolling: true) }, 1),
+        ("to a time", { player.seek(absoluteSecond: 2) }, 2),
         ("to the start", { player.seekToStart() }, 0),
       ]
       for (name, seek, landing) in seeks {
@@ -184,6 +197,40 @@ struct PlayerPlaybackTests {
         #expect(returnedWhileHeld, "The \(name) seek waited for mpv")
         try await Self.waitForPosition(landing, of: player)
       }
+    }
+  }
+
+  @Test("Resuming at the end of the last file returns before mpv handles it and plays the file again from its start")
+  func resumeAtEndDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.playFileInPlaylist(2)
+      try await Self.waitForEntry(2, of: player)
+      player.seek(absoluteSecond: 3.5)
+      try await Self.waitForPosition(3.5, of: player)
+      // Playback that reaches the end of the last entry stops there, paused, and mpv reports eof-reached. A paused seek to the end
+      // shows the last frame without reaching the end.
+      player.mpv.setFlagAsync(MPVOption.PlaybackControl.pause, false)
+      try await Self.waitUntil { player.mpv.getFlag(MPVProperty.eofReached) }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.resume() }
+      #expect(returnedWhileHeld, "Resuming waited for mpv")
+      try await Self.waitUntil {
+        !player.mpv.getFlag(MPVOption.PlaybackControl.pause) && player.mpv.getDouble(MPVProperty.timePos) < 2
+      }
+    }
+  }
+
+  @Test("A pause given before mpv answers a resume keeps playback paused")
+  func pauseDuringResumeHolds() async throws {
+    try await Self.withPlayer { player, _ in
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      player.resume()
+      player.pause()
+      hold.release()
+      // mpv answers in the order it was asked, and the resume's answer reaches the main queue ahead of this read's.
+      #expect(await Self.paused(player) == true)
+      await Self.drainMain()
+      #expect(await Self.paused(player) == true)
+      #expect(player.info.userPauseCount == 1)
     }
   }
 
