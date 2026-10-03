@@ -101,6 +101,36 @@ struct MPVAsyncRequestTests {
     #expect(!reply.onMain)
   }
 
+  @Test("Properties read as nodes are answered together in the order asked, with nil for one mpv cannot read")
+  func nodesRead() async {
+    let player = Self.startedPlayer()
+    player.mpv.setFlagAsync(MPVOption.PlaybackControl.pause, true)
+    let names = [MPVOption.PlaybackControl.pause, "iina-tests-no-such-property", MPVProperty.playlistCount]
+    let reply = await withCheckedContinuation { continuation in
+      player.mpv.getNodesAsync(names) { values in
+        continuation.resume(returning: (count: values.count, paused: values[0] as? Bool, unread: values[1] == nil,
+                                        playlistCount: values[2] as? Int64, onMain: Thread.isMainThread))
+      }
+    }
+    #expect(reply.count == 3)
+    #expect(reply.paused == true)
+    #expect(reply.unread)
+    #expect(reply.playlistCount == 0)
+    #expect(!reply.onMain)
+  }
+
+  @Test("Properties read as nodes before mpv is initialized are answered at once with nil")
+  func nodesBeforeInitialized() {
+    let player = Self.unstartedPlayer()
+    var replies: [(count: Int, allNil: Bool)] = []
+    player.mpv.getNodesAsync([MPVOption.PlaybackControl.pause, MPVProperty.playlistCount]) { values in
+      replies.append((values.count, values.allSatisfy { $0 == nil }))
+    }
+    #expect(replies.count == 1)
+    #expect(replies.first?.count == 2)
+    #expect(replies.first?.allNil == true)
+  }
+
   @Test("A command mpv runs is answered with success once it has run")
   func commandSucceeds() async {
     let player = Self.startedPlayer()

@@ -41,6 +41,14 @@ struct PlayerSteppingTests {
     await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
   }
 
+  /// Fault threshold for a hold on the core of a player's `mpv`, not an estimate of how long the hold lasts.
+  private static let holdLimit: DispatchTimeInterval = .seconds(30)
+
+  /// Read the player's playlist from `mpv` and wait until it is stored.
+  private static func readPlaylist(of player: PlayerCore) async {
+    await withCheckedContinuation { continuation in player.getPlaylist { continuation.resume() } }
+  }
+
   /// Ask `mpv` whether playback is paused and wait for the reply, which comes after the replies to every request made before.
   private static func paused(_ player: PlayerCore) async -> Bool? {
     await withCheckedContinuation { continuation in
@@ -153,23 +161,35 @@ struct PlayerSteppingTests {
     #expect(player.info.userPauseCount == 0)
   }
 
-  @Test("The playlist is read from mpv")
-  func playlistRead() {
+  @Test("The playlist is read from mpv in a request that returns before mpv handles it")
+  func playlistRead() async throws {
     let player = Self.startedPlayer()
     player.mpv.playlistAppend("/iinaTests/a.mp4")
     player.mpv.playlistAppend("/iinaTests/b.mp4")
-    player.getPlaylist()
+    let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+    var returnedWhileHeld = false
+    var completedOnMain = false
+    await withCheckedContinuation { continuation in
+      player.getPlaylist {
+        completedOnMain = Thread.isMainThread
+        continuation.resume()
+      }
+      returnedWhileHeld = !hold.hasLetGo
+      hold.release()
+    }
+    #expect(returnedWhileHeld, "Reading the playlist waited for mpv")
+    #expect(completedOnMain)
     #expect(player.info.playlist.map(\.filename) == ["/iinaTests/a.mp4", "/iinaTests/b.mp4"])
     #expect(player.info.playlist.allSatisfy { !$0.isCurrent && !$0.isPlaying })
   }
 
-  @Test("Refreshing the playlist reads it from mpv on the playlist queue")
+  @Test("Refreshing the playlist reads it from mpv")
   func playlistRefreshed() async {
     let player = Self.startedPlayer()
     player.mpv.playlistAppend("/iinaTests/a.mp4")
     player.refreshPlaylist()
-    // The playlist queue runs its blocks in order, so this one runs after the refresh.
-    await withCheckedContinuation { continuation in player.playlistQueue.async { continuation.resume() } }
+    // mpv answers in the order it is asked, and the refresh stores the playlist when its answer comes, ahead of this one.
+    _ = await Self.paused(player)
     #expect(player.info.playlist.map(\.filename) == ["/iinaTests/a.mp4"])
   }
 
@@ -217,13 +237,13 @@ struct PlayerSteppingTests {
   }
 
   @Test("The folder playlist adds entries to mpv's playlist until the playlist is abandoned")
-  func folderPlaylist() throws {
+  func folderPlaylist() async throws {
     let player = Self.startedPlayer()
     let matcher = AutoFileMatcher(player: player, ticket: player.folderPlaylistTicket.value)
     try matcher.checkFolderTicket()
     matcher.append("/iinaTests/b.mp4")
     matcher.insert("/iinaTests/a.mp4", at: 0)
-    player.getPlaylist()
+    await Self.readPlaylist(of: player)
     #expect(player.info.playlist.map(\.filename) == ["/iinaTests/a.mp4", "/iinaTests/b.mp4"])
     player.folderPlaylistTicket.abandon()
     #expect(throws: PlayerCore.TicketExpiredError.self) { try matcher.checkFolderTicket() }

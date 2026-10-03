@@ -133,15 +133,24 @@ struct PlayerPlaybackTests {
     await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
   }
 
+  /// Read the player's playlist from `mpv` and wait until it is stored.
+  private static func readPlaylist(of player: PlayerCore) async {
+    await withCheckedContinuation { continuation in player.getPlaylist { continuation.resume() } }
+  }
+
   @Test("A file opened from a folder is joined by the folder's other files in folder order and shown paused")
   func opened() async throws {
     try await Self.withPlayer { player, folder in
-      player.getPlaylist()
+      await Self.readPlaylist(of: player)
       let paths = ["a", "b", "c"].map { folder.appendingPathComponent("\($0).mp4").path }
       #expect(player.info.playlist.map(\.filename) == paths)
       #expect(player.info.playlist.map(\.isCurrent) == [false, true, false])
       #expect(player.mpv.getFlag(MPVOption.PlaybackControl.pause))
       #expect(player.isVideoLoaded)
+      // fileLoaded stores the size read when mpv reported the file loaded, on the queue for reading mpv events.
+      #expect((player.info.videoWidth ?? 0) > 0)
+      #expect(player.info.videoWidth == player.mpv.getInt(MPVProperty.width))
+      #expect(player.info.videoHeight == player.mpv.getInt(MPVProperty.height))
       // The full length is worked out off the main thread once the play state has been decided.
       try await Self.waitUntil { player.info.videoDuration?.second ?? 0 >= 4 - 1e-6 }
       #expect(player.mainWindow.videoView.value(forKey: "wantsBestResolutionOpenGLSurface") as? Bool == true)
@@ -246,7 +255,7 @@ struct PlayerPlaybackTests {
       // A step back from the first entry while it plays goes to its start instead.
       player.seek(percent: 50, forceExact: true)
       try await Self.waitForPosition(2, of: player)
-      player.getPlaylist()
+      await Self.readPlaylist(of: player)
       #expect(player.isFirstEntryPlaying)
       player.navigateInPlaylist(nextMedia: false)
       try await Self.waitForPosition(0, of: player)
