@@ -209,6 +209,19 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The time is synchronized with mpv in a request that returns before mpv handles it, then stored")
+  func timeSyncDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      var synced = false
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.syncTime { synced = true } }
+      #expect(returnedWhileHeld, "Synchronizing the time waited for mpv")
+      try await Self.waitUntil { synced }
+      #expect(abs((player.info.videoPosition?.second ?? 0) - 2) < 0.11)
+    }
+  }
+
   @Test("Resuming at the end of the last file returns before mpv handles it and plays the file again from its start")
   func resumeAtEndDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
