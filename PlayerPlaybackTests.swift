@@ -439,6 +439,21 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A file asked twice at once to open in windows of its own opens in one player")
+  func openTwiceInOwnWindows() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true, .groupSimultaneousOpensInPlaylist: false,
+                                   .allowDuplicatePlayers: false]) {
+        let video = folder.appendingPathComponent("c.mp4")
+        // The second url is handed out while the first open is still finding its files, so no player shows it yet.
+        #expect(await Self.open([video, video]) == 1)
+        let players = try await Self.players(showing: [video.path])
+        #expect(PlayerCore.playerCores.filter { $0.info.currentURL?.path == video.path }.count == 1)
+        try await Self.close(players)
+      }
+    }
+  }
+
   @Test("Files dropped with the app's open routing open together in a new player when the settings group them")
   func dropGrouped() async throws {
     try await Self.withPlayer { player, folder in
