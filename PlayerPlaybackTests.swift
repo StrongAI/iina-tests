@@ -138,6 +138,41 @@ struct PlayerPlaybackTests {
     await withCheckedContinuation { continuation in player.getPlaylist { continuation.resume() } }
   }
 
+  /// Run `body` with `settings` added to the test settings in the argument domain, then restore them.
+  private static func withSettings(_ settings: [Preference.Key: Any], _ body: () async throws -> Void) async throws {
+    let defaults = UserDefaults.standard
+    let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    let added = Dictionary(uniqueKeysWithValues: settings.map { ($0.key.rawValue, $0.value) })
+    defaults.setVolatileDomain(arguments.merging(added) { $1 }, forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+    try await body()
+  }
+
+  /// Open `urls` in the players the settings choose and wait until they have been opened.
+  /// - Returns: What `PlayerCore.openURLs` reported once they were opened.
+  private static func open(_ urls: [URL]) async -> Int? {
+    await withCheckedContinuation { continuation in PlayerCore.openURLs(urls) { continuation.resume(returning: $0) } }
+  }
+
+  /// Wait until a player of `PlayerCore` shows each file at `paths`, paused once opened.
+  /// - Returns: The player showing each file, in the order of `paths`.
+  private static func players(showing paths: [String]) async throws -> [PlayerCore] {
+    var players: [PlayerCore] = []
+    try await waitUntil {
+      players = paths.compactMap { path in PlayerCore.playerCores.first { $0.info.currentURL?.path == path } }
+      return players.count == paths.count && players.allSatisfy { $0.info.state == .paused && !$0.info.pausedForLoading }
+    }
+    return players
+  }
+
+  /// Close the windows of `players` and wait until each is idle.
+  private static func close(_ players: [PlayerCore]) async throws {
+    for player in players {
+      player.mainWindow.close()
+    }
+    try await waitUntil { players.allSatisfy { $0.info.state == .idle } }
+  }
+
   @Test("A file opened from a folder is joined by the folder's other files in folder order and shown paused")
   func opened() async throws {
     try await Self.withPlayer { player, folder in
@@ -334,6 +369,99 @@ struct PlayerPlaybackTests {
       #expect(abs(centre - point.x) <= 1)
     }
   }
+
+  @Test("Opening a folder returns before its files are found and before mpv handles it, then shows the first file and the rest after it")
+  func openDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      // A folder URL as Finder gives it, which getPlayableFiles reads as a directory.
+      let directory = URL(fileURLWithPath: folder.path, isDirectory: true)
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      var opened: Int??
+      player.openURLs([directory]) { opened = $0 }
+      let returnedWhileHeld = !hold.hasLetGo
+      // The files are found on the queue for opening files and opened on the main thread, which this test holds until here.
+      let returnedBeforeOpening = opened == nil
+      hold.release()
+      try await Self.waitUntil { hold.hasLetGo }
+      #expect(returnedWhileHeld, "Opening files waited for mpv")
+      #expect(returnedBeforeOpening, "Opening files found and opened them before returning")
+      try await Self.waitUntil { opened != nil }
+      #expect(opened == 3)
+      let paths = ["a", "b", "c"].map { folder.appendingPathComponent("\($0).mp4").path }
+      try await Self.waitUntil {
+        player.info.currentURL?.path == paths[0] && player.info.state == .paused && !player.info.pausedForLoading
+          && player.mpv.getInt(MPVProperty.playlistCount) == 3
+      }
+      await Self.readPlaylist(of: player)
+      #expect(player.info.playlist.map(\.filename) == paths)
+      #expect(player.info.playlist.map(\.isCurrent) == [true, false, false])
+    }
+  }
+
+  @Test("Files dropped on the window open in the player, and a dropped subtitle file is loaded in their place")
+  func drops() async throws {
+    try await Self.withPlayer { player, folder in
+      let videos = ["a", "c"].map { folder.appendingPathComponent("\($0).mp4") }
+      #expect(player.openFromPasteboard(FileDrop(videos)))
+      try await Self.waitUntil {
+        player.info.currentURL?.path == videos[0].path && player.info.state == .paused && !player.info.pausedForLoading
+          && player.mpv.getInt(MPVProperty.playlistCount) == 2
+      }
+      // A subtitle file is not a playable file, so none is opened and the subtitle file is loaded instead.
+      let subtitle = folder.appendingPathComponent("a.srt")
+      try "1\n00:00:00,000 --> 00:00:01,000\nIINA\n".write(to: subtitle, atomically: true, encoding: .utf8)
+      #expect(player.openFromPasteboard(FileDrop([subtitle])))
+      try await Self.waitUntil { player.info.subTracks.contains { $0.externalFilename == subtitle.path } }
+      #expect(player.info.currentURL?.path == videos[0].path)
+      #expect(player.openFromPasteboard(FileDrop([videos[1]])))
+      try await Self.waitUntil {
+        player.info.currentURL?.path == videos[1].path && player.info.state == .paused && !player.info.pausedForLoading
+      }
+    }
+  }
+
+  @Test("Files opened in windows of their own each open in a player of their own, and a file already open is not opened again")
+  func openInOwnWindows() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true, .groupSimultaneousOpensInPlaylist: false,
+                                   .allowDuplicatePlayers: false]) {
+        let videos = ["a", "c"].map { folder.appendingPathComponent("\($0).mp4") }
+        #expect(await Self.open(videos) == 2)
+        let players = try await Self.players(showing: videos.map(\.path))
+        #expect(players[0] !== players[1])
+        // The player showing the file is brought forward instead.
+        #expect(await Self.open([videos[0]]) == nil)
+        #expect(PlayerCore.playerCores.filter { $0.info.currentURL?.path == videos[0].path }.count == 1)
+        try await Self.close(players)
+      }
+    }
+  }
+
+  @Test("Files dropped with the app's open routing open together in a new player when the settings group them")
+  func dropGrouped() async throws {
+    try await Self.withPlayer { player, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true, .groupSimultaneousOpensInPlaylist: true]) {
+        let videos = ["a", "c"].map { folder.appendingPathComponent("\($0).mp4") }
+        #expect(player.openFromPasteboard(FileDrop(videos), useGlobalOpenRouting: true))
+        let players = try await Self.players(showing: [videos[0].path])
+        #expect(players[0] !== player)
+        #expect(players[0].mpv.getInt(MPVProperty.playlistCount) == 2)
+        try await Self.close(players)
+      }
+    }
+  }
+
+  @Test("A file the system asks the app to open is opened in a player")
+  func systemOpen() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true]) {
+        let video = folder.appendingPathComponent("c.mp4")
+        #expect(AppDelegate.shared.application(NSApp, openFile: video.path))
+        let players = try await Self.players(showing: [video.path])
+        try await Self.close(players)
+      }
+    }
+  }
 }
 
 private final class PlayerPlaybackTestsBundle {}
@@ -351,6 +479,41 @@ private final class PlaylistChangeRecord: @unchecked Sendable {
   func classes(for player: PlayerCore) -> [qos_class_t] {
     lock.withLock { classes[ObjectIdentifier(player)] ?? [] }
   }
+}
+
+/// A drop of files on a view, carrying their paths on a pasteboard of its own as a drag from Finder does.
+private final class FileDrop: NSObject, NSDraggingInfo {
+  let draggingPasteboard = NSPasteboard(name: NSPasteboard.Name("iinaTests-drop-\(UUID().uuidString)"))
+  var draggingFormation: NSDraggingFormation = .default
+  var animatesToDestination = false
+  var numberOfValidItemsForDrop = 0
+
+  init(_ urls: [URL]) {
+    super.init()
+    draggingPasteboard.declareTypes([.nsFilenames], owner: nil)
+    draggingPasteboard.setPropertyList(urls.map(\.path), forType: .nsFilenames)
+  }
+
+  deinit {
+    draggingPasteboard.releaseGlobally()
+  }
+
+  var draggingDestinationWindow: NSWindow? { nil }
+  var draggingSourceOperationMask: NSDragOperation { .copy }
+  var draggingLocation: NSPoint { .zero }
+  var draggedImageLocation: NSPoint { .zero }
+  var draggedImage: NSImage? { nil }
+  var draggingSource: Any? { nil }
+  var draggingSequenceNumber: Int { 0 }
+  var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+
+  func slideDraggedImage(to screenPoint: NSPoint) {}
+
+  func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions, for view: NSView?, classes classArray: [AnyClass],
+                              searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+                              using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+
+  func resetSpringLoading() {}
 }
 
 private extension PlayerCore {
