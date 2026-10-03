@@ -370,23 +370,25 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("Opening a folder returns before its files are found and before mpv handles it, then shows the first file and the rest after it")
+  @Test("Opening a folder returns at once and opens its files without waiting for mpv, the first shown and the rest after it")
   func openDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
       // A folder URL as Finder gives it, which getPlayableFiles reads as a directory.
       let directory = URL(fileURLWithPath: folder.path, isDirectory: true)
       let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
-      var opened: Int??
-      player.openURLs([directory]) { opened = $0 }
+      var opened: (count: Int?, whileHeld: Bool)?
+      player.openURLs([directory]) { opened = ($0, !hold.hasLetGo) }
       let returnedWhileHeld = !hold.hasLetGo
-      // The files are found on the queue for opening files and opened on the main thread, which this test holds until here.
       let returnedBeforeOpening = opened == nil
+      // The files are found on the queue for opening files, then opened on the main thread, which this wait leaves free while
+      // mpv is held.
+      try await Self.waitUntil { opened != nil }
       hold.release()
       try await Self.waitUntil { hold.hasLetGo }
       #expect(returnedWhileHeld, "Opening files waited for mpv")
       #expect(returnedBeforeOpening, "Opening files found and opened them before returning")
-      try await Self.waitUntil { opened != nil }
-      #expect(opened == 3)
+      #expect(opened?.whileHeld == true, "Opening the files found waited for mpv")
+      #expect(opened?.count == 3)
       let paths = ["a", "b", "c"].map { folder.appendingPathComponent("\($0).mp4").path }
       try await Self.waitUntil {
         player.info.currentURL?.path == paths[0] && player.info.state == .paused && !player.info.pausedForLoading
