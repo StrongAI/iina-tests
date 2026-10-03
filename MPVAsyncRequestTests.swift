@@ -139,6 +139,18 @@ struct MPVAsyncRequestTests {
     #expect(replies == [0])
   }
 
+  @Test("A playlist mpv cannot read leaves the stored playlist as it was")
+  func playlistUnread() async {
+    let player = Self.unstartedPlayer()
+    let stored = MPVPlaylistItem(filename: "/iinaTests/a.mp4", isCurrent: true, isPlaying: false, title: nil)
+    player.info.$playlist.withLock { $0 = [stored] }
+    let completedOnMain = await withCheckedContinuation { continuation in
+      player.getPlaylist { continuation.resume(returning: Thread.isMainThread) }
+    }
+    #expect(completedOnMain)
+    #expect(player.info.playlist.map(\.filename) == ["/iinaTests/a.mp4"])
+  }
+
   @Test("A command mpv runs is answered with success once it has run")
   func commandSucceeds() async {
     let player = Self.startedPlayer()
