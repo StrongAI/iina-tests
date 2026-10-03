@@ -131,6 +131,14 @@ struct MPVAsyncRequestTests {
     #expect(replies.first?.allNil == true)
   }
 
+  @Test("No properties read as nodes are answered at once with no values")
+  func nodesNone() {
+    let player = Self.unstartedPlayer()
+    var replies: [Int] = []
+    player.mpv.getNodesAsync([]) { replies.append($0.count) }
+    #expect(replies == [0])
+  }
+
   @Test("A command mpv runs is answered with success once it has run")
   func commandSucceeds() async {
     let player = Self.startedPlayer()
