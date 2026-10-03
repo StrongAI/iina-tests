@@ -106,6 +106,21 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// Fault threshold for a hold on the core of a player's `mpv`, not an estimate of how long the hold lasts.
+  private static let holdLimit: DispatchTimeInterval = .seconds(30)
+
+  /// Make `request` while the core of the player's `mpv` is held, then let the core go.
+  /// - Returns: Whether `request` returned while the core was held, before `mpv` handled it.
+  private static func returnsWhileHeld(_ player: PlayerCore, _ request: () -> Void) async throws -> Bool {
+    let hold = try MPVCoreHold(player.mpv, limit: holdLimit)
+    request()
+    let returnedWhileHeld = !hold.hasLetGo
+    hold.release()
+    // A hold shows something only once the core has reached it, so wait for the core to reach it and go on.
+    try await waitUntil { hold.hasLetGo }
+    return returnedWhileHeld
+  }
+
   @Test("A file opened from a folder is joined by the folder's other files in folder order and shown paused")
   func opened() async throws {
     try await Self.withPlayer { player, folder in
@@ -149,6 +164,26 @@ struct PlayerPlaybackTests {
       try await Self.waitForPosition(3, of: player)
       player.seek(relativeSecond: -2, option: .exact, byScrolling: true)
       try await Self.waitForPosition(1, of: player)
+    }
+  }
+
+  @Test("Seeks by seconds and to the start of the file return before mpv handles them")
+  func seeksDoNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      let seeks: [(name: String, seek: () -> Void, landing: Double)] = [
+        ("exact", { player.seek(relativeSecond: 1, option: .exact) }, 3),
+        ("relative", { player.seek(relativeSecond: -1, option: .relative) }, 2),
+        ("auto", { player.seek(relativeSecond: 1, option: .auto) }, 3),
+        ("scroll", { player.seek(relativeSecond: -2, option: .exact, byScrolling: true) }, 1),
+        ("to the start", { player.seekToStart() }, 0),
+      ]
+      for (name, seek, landing) in seeks {
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player, seek)
+        #expect(returnedWhileHeld, "The \(name) seek waited for mpv")
+        try await Self.waitForPosition(landing, of: player)
+      }
     }
   }
 

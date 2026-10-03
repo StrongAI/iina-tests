@@ -21,6 +21,9 @@ struct MPVAsyncRequestTests {
   /// The players the tests made.
   private static var players: [PlayerCore] = []
 
+  /// Fault threshold for a hold on a core that the test releases itself, not an estimate of how long the hold lasts.
+  private static let holdLimit: DispatchTimeInterval = .seconds(30)
+
   /// A player whose `mpv` core was never started.
   private static func unstartedPlayer() -> PlayerCore {
     let player = PlayerCore()
@@ -122,5 +125,25 @@ struct MPVAsyncRequestTests {
     player.mpv.asyncCommand(.seek, args: ["not-a-time"]) { codes.append($0) }
     #expect(codes.count == 1)
     #expect(codes.allSatisfy { $0 < 0 })
+  }
+
+  @Test("A request that waits for mpv returns only once mpv's core has been let go")
+  func waitingRequestHeld() throws {
+    let player = Self.startedPlayer()
+    // Nothing can release the hold while the main thread waits, so the hold lets the core go at its limit.
+    let hold = try MPVCoreHold(player.mpv, limit: .milliseconds(200))
+    _ = player.mpv.getFlag(MPVOption.PlaybackControl.pause)
+    #expect(hold.hasLetGo)
+  }
+
+  @Test("A request that does not wait for mpv returns while mpv's core is held, and is handled once it is let go")
+  func asyncRequestHeld() async throws {
+    let player = Self.startedPlayer()
+    let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+    player.mpv.setFlagAsync(MPVOption.PlaybackControl.pause, true)
+    #expect(!hold.hasLetGo)
+    hold.release()
+    #expect(await Self.flag(MPVOption.PlaybackControl.pause, of: player).value == true)
+    #expect(hold.hasLetGo)
   }
 }
