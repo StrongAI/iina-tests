@@ -10,35 +10,32 @@ import Foundation
 
 /// Holds the core of a player's `mpv` until it is released.
 ///
-/// The hold is a second client of the core that asks for a property without waiting. `mpv` handles the request on the thread of
-/// its core and queues the reply for the client there, calling the client's wakeup callback on that thread. The callback waits until
-/// the hold is released, and the core handles no other request until then. The initializer returns once the core is held, so a
-/// request made after it that waits for `mpv` cannot return until the core is let go, while a request that does not wait returns at
-/// once.
+/// The hold is a second client of the core that asks it, without waiting, to load a config file read from one end of a socket pair.
+/// `mpv` reads the file on the thread of its core, and the hold keeps the other end open without writing to it, so the read waits
+/// there and the core handles no other request until the hold closes its end. The initializer returns once the core is reading, so
+/// a request made after it that waits for `mpv` cannot return until the core is let go, while a request that does not wait returns
+/// at once.
 ///
-/// `mpv` asks a wakeup callback to return quickly. The hold keeps the core only until it is released, and never longer than its
-/// limit. Every event but the replies to requests is turned off for the client, so that nothing but the reply wakes it.
+/// The core waits inside a command it is running, as a busy core does, and holds no lock of any client while it waits. A hold
+/// that waited inside a client's wakeup callback would keep that client's locks, which every thread that sends `mpv` an event to
+/// all clients takes, such as a render that resizes the OSD; no client of the app blocks in its wakeup callback. A FIFO would not
+/// do: on macOS, closing its last writer does not wake a reader waiting in `poll`, while closing one end of a socket pair does.
 final class MPVCoreHold {
 
   enum HoldError: Error {
     case clientNotCreated
+    case socketNotCreated(Int32)
     case requestRefused(Int32)
     case notHeld
   }
 
   /// The second client of the core.
   private let client: OpaquePointer
-  /// The longest the core is held.
-  private let limit: DispatchTimeInterval
-  /// Signalled once the core is held.
-  private let held = DispatchSemaphore(value: 0)
-  /// Signalled to let the core go.
-  private let letGo = DispatchSemaphore(value: 0)
-  /// Whether the next wakeup of the client holds the core.
-  @Atomic private var isArmed = false
+  /// The end of the socket pair the hold keeps; `mpv` reads the other end and closes it when done.
+  private let writer: Int32
   /// Whether the core has been let go, when the hold was released or at its limit.
   ///
-  /// This is set on the thread of the core before the core goes on, so while it is `false` after a request returns, the request
+  /// This is set before the hold closes its end and the core goes on, so while it is `false` after a request returns, the request
   /// returned without `mpv` having handled it.
   @Atomic private(set) var hasLetGo = false
 
@@ -50,29 +47,49 @@ final class MPVCoreHold {
   ///     for `mpv` returns and the test fails instead of hanging. It is not an estimate of how long a hold lasts.
   init(_ mpv: MPVController, limit: DispatchTimeInterval) throws {
     guard let client = mpv_create_client(mpv.mpv, "iinaTests-core-hold") else { throw HoldError.clientNotCreated }
-    self.client = client
-    self.limit = limit
-    let replies = [MPV_EVENT_GET_PROPERTY_REPLY, MPV_EVENT_SET_PROPERTY_REPLY, MPV_EVENT_COMMAND_REPLY]
-    for raw in UInt32(1)...UInt32(31) where !replies.contains(mpv_event_id(rawValue: raw)) {
+    // Nothing reads the client's events, so none are queued for it. The reply to its request is queued whatever it asks for.
+    for raw in UInt32(1)...UInt32(31) {
       // Event numbers mpv does not have are refused, which is harmless.
       _ = mpv_request_event(client, mpv_event_id(rawValue: raw), 0)
     }
-    mpv_set_wakeup_callback(client, { context in
-      guard let context else { return }
-      Unmanaged<MPVCoreHold>.fromOpaque(context).takeUnretainedValue().clientWoken()
-    }, Unmanaged.passUnretained(self).toOpaque())
-    // An event queued before the other events were turned off has used up the client's wakeup. Taking the events lets the reply
-    // wake the client again.
-    while mpv_wait_event(client, 0).pointee.event_id != MPV_EVENT_NONE {}
-    isArmed = true
-    let returnValue = mpv_get_property_async(client, 0, MPVOption.PlaybackControl.pause, MPV_FORMAT_FLAG)
+    var ends: [Int32] = [-1, -1]
+    guard socketpair(AF_UNIX, SOCK_STREAM, 0, &ends) == 0 else {
+      let error = errno
+      mpv_destroy(client)
+      throw HoldError.socketNotCreated(error)
+    }
+    let reader = ends[0]
+    // A comment for mpv to read first. Once it is read the core is inside the command, waiting for the rest of the file.
+    let comment: [UInt8] = Array("#\n".utf8)
+    let command = ["load-config-file", "fdclose://\(reader)"]
+    var arguments: [UnsafePointer<CChar>?] = command.map { UnsafePointer(strdup($0)) }
+    defer { arguments.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
+    arguments.append(nil)
+    guard write(ends[1], comment, comment.count) == comment.count else {
+      let error = errno
+      ends.forEach { close($0) }
+      mpv_destroy(client)
+      throw HoldError.socketNotCreated(error)
+    }
+    let returnValue = mpv_command_async(client, 0, &arguments)
     guard returnValue >= 0 else {
-      isArmed = false
+      ends.forEach { close($0) }
+      mpv_destroy(client)
       throw HoldError.requestRefused(returnValue)
     }
+    // mpv owns the reader from here on and closes it once it has read the end of the file. From here on every property is set,
+    // so a hold that throws is let go and cleaned up by deinit.
+    self.client = client
+    writer = ends[1]
     // A request that waits for mpv is handled ahead of the requests queued before it, so it could be handled before the core
     // reaches this hold. Requests are made only once the core is held.
-    guard held.wait(timeout: .now() + limit) == .success else { throw HoldError.notHeld }
+    let deadline = DispatchTime.now() + limit
+    var unread = pollfd(fd: reader, events: Int16(POLLIN), revents: 0)
+    while poll(&unread, 1, 0) > 0 {
+      guard DispatchTime.now() < deadline else { throw HoldError.notHeld }
+      usleep(1000)
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + limit) { [weak self] in self?.release() }
   }
 
   deinit {
@@ -83,17 +100,11 @@ final class MPVCoreHold {
 
   /// Let the core go.
   func release() {
-    letGo.signal()
-  }
-
-  /// The client was woken, on the thread that queued it an event.
-  private func clientWoken() {
-    guard $isArmed.withLock({ isArmed in
-      defer { isArmed = false }
-      return isArmed
+    guard $hasLetGo.withLock({ hasLetGo in
+      defer { hasLetGo = true }
+      return !hasLetGo
     }) else { return }
-    held.signal()
-    _ = letGo.wait(timeout: .now() + limit)
-    hasLetGo = true
+    // mpv reads the end of the file and finishes the command.
+    close(writer)
   }
 }
