@@ -121,6 +121,21 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The folder's other files are added by work at user-initiated priority, which a busy Mac does not hold back")
+  func folderPriority() async throws {
+    // AutoFileMatcher posts the playlist-changed notification on the thread that added the folder's files, right after adding them.
+    let record = PlaylistChangeRecord()
+    let observer = NotificationCenter.default.addObserver(forName: .iinaPlaylistChanged, object: nil, queue: nil) { notification in
+      guard !Thread.isMainThread, let player = notification.object as? PlayerCore else { return }
+      record.add(qos_class_self(), for: player)
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+    try await Self.withPlayer { player, _ in
+      try await Self.waitUntil { !record.classes(for: player).isEmpty }
+      #expect(record.classes(for: player).allSatisfy { $0 == QOS_CLASS_USER_INITIATED })
+    }
+  }
+
   @Test("Seeks by percentage and by seconds move playback within the file")
   func seeks() async throws {
     try await Self.withPlayer { player, _ in
@@ -218,6 +233,21 @@ struct PlayerPlaybackTests {
 }
 
 private final class PlayerPlaybackTestsBundle {}
+
+/// The quality-of-service classes of the threads other than the main thread on which each player posted the playlist-changed
+/// notification.
+private final class PlaylistChangeRecord: @unchecked Sendable {
+  private let lock = NSLock()
+  private var classes: [ObjectIdentifier: [qos_class_t]] = [:]
+
+  func add(_ qos: qos_class_t, for player: PlayerCore) {
+    lock.withLock { classes[ObjectIdentifier(player), default: []].append(qos) }
+  }
+
+  func classes(for player: PlayerCore) -> [qos_class_t] {
+    lock.withLock { classes[ObjectIdentifier(player)] ?? [] }
+  }
+}
 
 private extension PlayerCore {
   /// The state of the player and of its `mpv` core that the tests wait on.
