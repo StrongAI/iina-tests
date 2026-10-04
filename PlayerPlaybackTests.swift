@@ -6,6 +6,8 @@
 //
 
 import AppKit
+import MediaPlayer
+import Network
 import Testing
 @testable import IINA
 
@@ -108,6 +110,10 @@ struct PlayerPlaybackTests {
 
   /// Fault threshold for a hold on the core of a player's `mpv`, not an estimate of how long the hold lasts.
   private static let holdLimit: DispatchTimeInterval = .seconds(30)
+
+  /// Time in which `mpv` would answer a request many times over, were its core not held. A held core answers nothing, so an answer
+  /// in this time shows the hold failed.
+  private static let heldAnswerWindow: Duration = .milliseconds(300)
 
   /// Make `request` while the core of the player's `mpv` is held, then let the core go.
   /// - Returns: Whether `request` returned while the core was held, before `mpv` handled it.
@@ -705,6 +711,190 @@ struct PlayerPlaybackTests {
       }
     }
   }
+
+  @Test("The OSD of a seek shows the position mpv answers once it has handled the seek")
+  func seekOSDShowsAnsweredPosition() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSettings([.enableOSD: true]) {
+        // The OSD is turned off while a file loads, until shortly after its playback starts.
+        try await Self.waitUntil { !player.info.disableOSDForFileLoading }
+        let label = try #require(player.mainWindow.osdView?.label)
+        let seeks: [(name: String, seek: () -> Void, landing: Double)] = [
+          ("by seconds", { player.seek(relativeSecond: 2.25, option: .exact) }, 2.25),
+          ("to the start", { player.seekToStart() }, 0),
+        ]
+        for (name, seek, landing) in seeks {
+          label.stringValue = ""
+          seek()
+          try await Self.waitUntil { !label.stringValue.isEmpty }
+          // A seek's OSD shows the position, then the duration.
+          #expect(label.stringValue.hasPrefix(VideoTime(landing).stringRepresentation + " / "),
+                  "The OSD of the \(name) seek showed \(label.stringValue)")
+          try await Self.waitForPosition(landing, of: player)
+        }
+      }
+    }
+  }
+
+  @Test("For a stream read over the network the time sync also stores the duration and cache state mpv answers")
+  func timeSyncNetwork() async throws {
+    try await Self.withPlayer { player, folder in
+      let server = try await LocalStreamServer(serving: folder.appendingPathComponent("a.mp4"))
+      defer { server.stop() }
+      player.addToPlaylist(paths: [server.url.absoluteString])
+      try await Self.waitUntil { player.mpv.getInt(MPVProperty.playlistCount) == 4 }
+      player.playFileInPlaylist(3)
+      try await Self.waitForEntry(3, of: player)
+      #expect(player.info.isNetworkResource)
+      // Once mpv has read the whole stream, the values it answers stay as they are.
+      try await Self.waitUntil { player.mpv.getFlag(MPVProperty.demuxerCacheIdle) }
+      // Values mpv does not hold show that the sync stores what mpv answers.
+      player.info.videoDuration = VideoTime(-1)
+      player.info.pausedForCache = true
+      player.info.cacheTime = -1
+      player.info.bufferingState = -1
+      var synced = false
+      player.syncTime { synced = true }
+      try await Self.waitUntil { synced }
+      #expect(player.info.videoDuration?.second == player.mpv.getDouble(MPVProperty.duration))
+      #expect(!player.info.pausedForCache)
+      #expect(player.info.cacheTime == Int(player.mpv.getDouble(MPVProperty.demuxerCacheTime)))
+      #expect(player.info.bufferingState == player.mpv.getInt(MPVProperty.cacheBufferingState))
+    }
+  }
+
+  @Test("A request the player makes without waiting is answered only once the core MPVCoreHold holds is let go")
+  func coreHoldDefersAnswers() async throws {
+    try await Self.withPlayer { player, _ in
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      let letGoWhenAnswered = MainReply<Bool>()
+      player.mpv.getNodesAsync([MPVProperty.timePos]) { _ in letGoWhenAnswered.set(hold.hasLetGo) }
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      #expect(letGoWhenAnswered.value == nil, "mpv answered while its core was held")
+      #expect(!hold.hasLetGo, "The core was let go before it was released")
+      hold.release()
+      try await Self.waitUntil { letGoWhenAnswered.value != nil }
+      #expect(letGoWhenAnswered.value == true)
+    }
+  }
+
+  @Test("A file the player moves to is stored as it was read when mpv reported it loaded, and its entry is then marked current")
+  func fileLoadedFromEvent() async throws {
+    try await Self.withPlayer { player, folder in
+      var stored: (path: String?, width: Int?, duration: Double?, vid: Int?)?
+      // The player reports the file loaded once fileLoaded has stored it.
+      player.observe(.iinaFileLoaded) { [unowned player] _ in
+        stored = (player.info.currentURL?.path, player.info.videoWidth, player.info.videoDuration?.second, player.info.vid)
+      }
+      player.playFileInPlaylist(2)
+      try await Self.waitUntil { stored != nil }
+      #expect(stored?.path == folder.appendingPathComponent("c.mp4").path)
+      #expect(stored?.width == player.mpv.getInt(MPVProperty.width))
+      // mpv's duration of a fragmented file grows as it reads the fragments, so only its presence at load is checked.
+      #expect((stored?.duration ?? 0) > 0)
+      #expect(stored?.vid == player.mpv.getInt(MPVOption.TrackSelection.vid))
+      // fileLoaded asks mpv for the playlist, whose answer marks the entry loaded as current.
+      try await Self.waitUntil { player.info.playlist.map(\.isCurrent) == [false, false, true] }
+    }
+  }
+
+  @Test("Now Playing is given the position mpv answers, asked without waiting for mpv while the time is not kept up to date")
+  func nowPlayingPositionDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSettings([.enableNowPlayingArtwork: false]) {
+        let useSystemMediaControl = RemoteCommandController.useSystemMediaControl
+        RemoteCommandController.useSystemMediaControl = true
+        defer { RemoteCommandController.useSystemMediaControl = useSystemMediaControl }
+        PlayerCore.lastActive = player
+        player.seek(percent: 50, forceExact: true)
+        try await Self.waitForPosition(2, of: player)
+        player.syncUITimer?.invalidate()
+        // A position mpv does not hold shows that Now Playing is given the one mpv answers.
+        player.info.videoPosition = VideoTime(0)
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+          NowPlayingInfoManager.shared.updateInfo(withTitle: true)
+        }
+        #expect(returnedWhileHeld, "Updating Now Playing waited for mpv")
+        try await Self.waitUntil {
+          let elapsed = MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double
+          return abs((elapsed ?? 0) - 2) < 0.11
+        }
+      }
+    }
+  }
+
+  @Test("Files added to the playlist are listed by the playlist read their change notice asks for, though asked before mpv adds them")
+  func addToPlaylistReadBack() async throws {
+    try await Self.withPlayer { player, folder in
+      let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
+      var reads: [[String]] = []
+      // As the playlist pane does, the playlist is read each time the player reports it changed.
+      player.observe(.iinaPlaylistChanged) { [unowned player] _ in
+        player.getPlaylist { reads.append(player.info.playlist.map(\.filename)) }
+      }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.addToPlaylist(paths: [path("d")], at: 1) }
+      #expect(returnedWhileHeld, "Adding files waited for mpv")
+      // mpv answers in the order it is asked, so the read asked for after the add lists the file added.
+      try await Self.waitUntil { !reads.isEmpty }
+      #expect(reads.first == ["a", "d", "b", "c"].map(path))
+    }
+  }
+
+  @Test("A file the system asks the app to open just after a command-line launch is not opened, and one asked after it is")
+  func systemOpenIgnoredOnce() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true, .groupSimultaneousOpensInPlaylist: false,
+                                   .allowDuplicatePlayers: false]) {
+        let app = AppDelegate.shared
+        let video = folder.appendingPathComponent("c.mp4")
+        app.shouldIgnoreOpenFile = true
+        #expect(app.application(NSApp, openFile: video.path))
+        try await Self.waitUntil { !app.shouldIgnoreOpenFile }
+        await Self.drainMain()
+        #expect(!PlayerCore.playerCores.contains { $0.info.currentURL?.path == video.path })
+        #expect(app.application(NSApp, openFile: video.path))
+        let players = try await Self.players(showing: [video.path])
+        #expect(PlayerCore.playerCores.filter { $0.info.currentURL?.path == video.path }.count == 1)
+        try await Self.close(players)
+      }
+    }
+  }
+
+  @Test("A file the system asks the app to open that is not played on its own is reported as nothing to open")
+  func systemOpenNothing() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true]) {
+        // A subtitle file is not opened on its own, so the open finds no file to play.
+        let file = folder.appendingPathComponent("a.srt")
+        try "IINA".write(to: file, atomically: true, encoding: .utf8)
+        let dismisser = ModalWindowDismisser()
+        defer { dismisser.stop() }
+        #expect(AppDelegate.shared.application(NSApp, openFile: file.path))
+        let message = NSLocalizedString("alert.nothing_to_open", comment: "nothing_to_open")
+        try await Self.waitUntil { !dismisser.texts.isEmpty }
+        #expect(dismisser.texts.contains { $0.contains(message) }, "The alerts shown read \(dismisser.texts)")
+      }
+    }
+  }
+
+  @Test("A plugin package the system asks the app to open is handed to the plugin settings, which report one that cannot be read")
+  func systemOpenPlugin() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.enableNewSettings: true]) {
+        let package = folder.appendingPathComponent("iinaTests.iinaplgz")
+        try "IINA".write(to: package, atomically: true, encoding: .utf8)
+        let settings = SettingsWindow.default
+        #expect(AppDelegate.shared.application(NSApp, openFile: package.path))
+        // The package cannot be unpacked, which the plugin settings report in a sheet on their window.
+        try await Self.waitUntil { settings.isVisible && settings.attachedSheet != nil }
+        #expect(!PlayerCore.playerCores.contains { $0.info.currentURL?.path == package.path })
+        if let sheet = settings.attachedSheet {
+          settings.endSheet(sheet)
+        }
+        settings.close()
+      }
+    }
+  }
 }
 
 private final class PlayerPlaybackTestsBundle {}
@@ -757,6 +947,111 @@ private final class FileDrop: NSObject, NSDraggingInfo {
                               using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
 
   func resetSpringLoading() {}
+}
+
+/// Serves a file over HTTP on the loopback interface, so that `mpv` reads it as a network stream.
+private final class LocalStreamServer {
+  private let listener: NWListener
+  /// The URL the file is served at.
+  let url: URL
+
+  init(serving file: URL) async throws {
+    let body = try Data(contentsOf: file)
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+    let listener = try NWListener(using: parameters)
+    let queue = DispatchQueue(label: "iinaTests-stream")
+    listener.newConnectionHandler = { connection in
+      connection.start(queue: queue)
+      // Whatever range is asked for, the whole file is sent, which mpv reads as a stream it cannot seek in.
+      connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { _, _, _, _ in
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        connection.send(content: Data(header.utf8) + body, completion: .contentProcessed { _ in connection.cancel() })
+      }
+    }
+    let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
+      listener.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+          listener.stateUpdateHandler = nil
+          if let port = listener.port {
+            continuation.resume(returning: port)
+          } else {
+            continuation.resume(throwing: NWError.posix(.EADDRNOTAVAIL))
+          }
+        case .failed(let error):
+          listener.stateUpdateHandler = nil
+          continuation.resume(throwing: error)
+        default:
+          break
+        }
+      }
+      listener.start(queue: queue)
+    }
+    self.listener = listener
+    url = URL(string: "http://127.0.0.1:\(port.rawValue)/\(file.lastPathComponent)")!
+  }
+
+  func stop() {
+    listener.cancel()
+  }
+}
+
+/// Dismisses each modal window the app shows while it lives, keeping the text the window showed.
+@MainActor
+private final class ModalWindowDismisser {
+  /// The text of each window dismissed, in the order they were shown.
+  private(set) var texts: [[String]] = []
+  private var timer: Timer?
+
+  init() {
+    let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.dismiss() }
+    }
+    // While a modal window is shown the main run loop runs only in the modal panel mode.
+    RunLoop.main.add(timer, forMode: .modalPanel)
+    self.timer = timer
+  }
+
+  func stop() {
+    timer?.invalidate()
+  }
+
+  private func dismiss() {
+    guard let window = NSApp.modalWindow else { return }
+    texts.append(Self.texts(of: window))
+    NSApp.stopModal()
+  }
+
+  /// The text `element` and the elements under it show, read through accessibility, which also reaches text an alert does not
+  /// keep in a text field.
+  private static func texts(of element: Any) -> [String] {
+    var own: [String?] = []
+    var children: [Any] = []
+    if let window = element as? NSWindow {
+      own = [window.accessibilityTitle(), window.accessibilityLabel()]
+      children = window.contentView.map { [$0] } ?? []
+    } else if let view = element as? NSView {
+      own = [view.accessibilityValue() as? String, view.accessibilityTitle(), view.accessibilityLabel(),
+             (view as? NSTextField)?.stringValue]
+      children = view.subviews + (view.accessibilityChildren() ?? []).filter { !($0 is NSView) }
+    } else if let other = element as? NSAccessibilityElement {
+      own = [other.accessibilityValue() as? String, other.accessibilityTitle(), other.accessibilityLabel()]
+      children = other.accessibilityChildren() ?? []
+    }
+    return own.compactMap { $0 }.filter { !$0.isEmpty } + children.flatMap { texts(of: $0) }
+  }
+}
+
+/// A value replied on another thread, kept on the main thread.
+@MainActor
+private final class MainReply<Value: Sendable> {
+  private(set) var value: Value?
+
+  /// Keep `value` on the main thread, from any thread.
+  nonisolated func set(_ value: Value) {
+    DispatchQueue.main.async { MainActor.assumeIsolated { self.value = value } }
+  }
 }
 
 private extension PlayerCore {
