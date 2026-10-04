@@ -638,6 +638,71 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A change of the audio track is stored without waiting for mpv, taking the track id mpv reported in the change")
+  func aidChangedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      // A track id mpv does not hold shows that the player stores the id it is given instead of asking mpv.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.aidChanged(7) }
+      #expect(returnedWhileHeld, "Storing a change of the audio track waited for mpv")
+      #expect(player.info.aid == 7)
+      #expect(player.mainWindow.muteButton.isHidden == false)
+    }
+  }
+
+  @Test("A change of the subtitle track is stored without waiting for mpv, taking the track id mpv reported in the change")
+  func sidChangedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      var notified = false
+      player.observe(.iinaSIDChanged) { _ in notified = true }
+      // A track id mpv does not hold shows that the player stores the id it is given instead of asking mpv.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.sidChanged(7) }
+      #expect(returnedWhileHeld, "Storing a change of the subtitle track waited for mpv")
+      #expect(player.info.sid == 7)
+      #expect(notified)
+    }
+  }
+
+  @Test("A change of the chapter is stored without waiting for mpv, taking the chapter mpv reported in the change")
+  func chapterChangedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      var notified = false
+      player.observe(.iinaChapterListChanged) { _ in notified = true }
+      // A chapter the file does not have shows that the player stores the chapter it is given instead of asking mpv.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.chapterChanged(7) }
+      #expect(returnedWhileHeld, "Storing a change of the chapter waited for mpv")
+      #expect(player.info.chapter == 7)
+      #expect(notified)
+    }
+  }
+
+  @Test("A change of the on-top state is applied without waiting for mpv, the window taking the state mpv reported in the change")
+  func ontopChangedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      // An on-top state mpv does not hold shows that the window takes the state it is given instead of asking mpv.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.ontopChanged(true) }
+      #expect(returnedWhileHeld, "Applying a change of the on-top state waited for mpv")
+      try await Self.waitUntil { player.mainWindow.window?.level == .iinaFloating }
+      player.mainWindow.setWindowFloatingOnTop(false, updateOnTopStatus: false)
+    }
+  }
+
+  @Test("Putting the window on top asks mpv to set ontop without waiting for it")
+  func ontopSetDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.mainWindow.isOntop = true }
+      #expect(returnedWhileHeld, "Putting the window on top waited for mpv")
+      #expect(await Self.ontop(player) == true)
+      player.mainWindow.isOntop = false
+    }
+  }
+
+  /// Ask `mpv` whether the window is on top and wait for the answer, which comes after its answers to every request made before.
+  private static func ontop(_ player: PlayerCore) async -> Bool? {
+    await withCheckedContinuation { continuation in
+      player.mpv.getFlagAsync(MPVOption.Window.ontop) { continuation.resume(returning: $0) }
+    }
+  }
+
   @Test("The position is synchronized, while the time is not kept up to date, in a request that returns before mpv handles it")
   func positionSyncDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
