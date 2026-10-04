@@ -587,7 +587,8 @@ struct PlayerPlaybackTests {
     PlayerCore.LoadedFile(width: read.width, height: read.height, duration: read.duration, position: read.position,
                           remaining: read.remaining, path: read.path, mediaTitle: read.mediaTitle, trackList: read.trackList,
                           selectedTracks: read.selectedTracks,
-                          chapters: [MPVChapter(title: "iinaTests", startTime: 1, index: 0)], abLoopA: 1, abLoopB: 2)
+                          chapters: [MPVChapter(title: "iinaTests", startTime: 1, index: 0)], abLoopA: 1, abLoopB: 2,
+                          fullscreen: read.fullscreen, ontop: read.ontop)
   }
 
   @Test("A loaded file's tracks, chapters and A-B loop points are stored as they were read when mpv reported it loaded")
@@ -601,6 +602,26 @@ struct PlayerPlaybackTests {
       #expect(player.info.chapters.map(\.title) == ["iinaTests"])
       #expect(player.info.abLoopStatus == .bSet)
       #expect(player.info.videoTracks.map(\.id) == read.trackList.video.map(\.id))
+    }
+  }
+
+  /// `read` with the window floating on top, which mpv does not hold.
+  private static func onTop(_ read: PlayerCore.LoadedFile) -> PlayerCore.LoadedFile {
+    PlayerCore.LoadedFile(width: read.width, height: read.height, duration: read.duration, position: read.position,
+                          remaining: read.remaining, path: read.path, mediaTitle: read.mediaTitle, trackList: read.trackList,
+                          selectedTracks: read.selectedTracks, chapters: read.chapters, abLoopA: read.abLoopA,
+                          abLoopB: read.abLoopB, fullscreen: read.fullscreen, ontop: true)
+  }
+
+  @Test("A loaded file is stored without waiting for mpv, the window taking the on-top state read when mpv reported it loaded")
+  func fileLoadedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let read = Self.readLoadedFile(of: player)
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.fileLoaded(Self.onTop(read)) }
+      #expect(returnedWhileHeld, "Storing a loaded file waited for mpv")
+      // An on-top state mpv does not hold shows that the window takes the state it is given instead of asking mpv.
+      try await Self.waitUntil { player.mainWindow.window?.level == .iinaFloating }
+      player.mainWindow.setWindowFloatingOnTop(false, updateOnTopStatus: false)
     }
   }
 
@@ -642,6 +663,54 @@ struct PlayerPlaybackTests {
       player.syncPositionIfNeeded { synced = true }
       #expect(synced)
       #expect(player.mpv.replyCallbacks.count == waiting)
+    }
+  }
+
+  @Test("The position sync the JavaScript status waits on stores the position mpv answers while the time is not kept up to date, and asks nothing while it is")
+  func positionSyncWaiting() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { _ in }
+      player.syncUITimer = timer
+      // A position mpv does not hold shows whether the sync stores what mpv answers.
+      player.info.videoPosition = VideoTime(0)
+      player.syncPositionIfNeededWaiting()
+      #expect(player.info.videoPosition?.second == 0)
+      timer.invalidate()
+      player.syncPositionIfNeededWaiting()
+      #expect(abs((player.info.videoPosition?.second ?? 0) - 2) < 0.11)
+    }
+  }
+
+  @Test("The waiting position sync asks nothing of mpv for a player no longer active")
+  func positionSyncWaitingInactive() async throws {
+    try await Self.withPlayer { player, _ in
+      player.mainWindow.close()
+      try await Self.waitUntil { player.info.state == .idle }
+      player.syncUITimer?.invalidate()
+      player.info.videoPosition = VideoTime(1)
+      player.syncPositionIfNeededWaiting()
+      #expect(player.info.videoPosition?.second == 1)
+    }
+  }
+
+  @Test("For a stream read over the network the waiting position sync also stores the duration mpv answers")
+  func positionSyncWaitingNetwork() async throws {
+    try await Self.withPlayer { player, folder in
+      let server = try await LocalStreamServer(serving: folder.appendingPathComponent("a.mp4"))
+      defer { server.stop() }
+      player.addToPlaylist(paths: [server.url.absoluteString])
+      try await Self.waitUntil { player.mpv.getInt(MPVProperty.playlistCount) == 4 }
+      player.playFileInPlaylist(3)
+      try await Self.waitForEntry(3, of: player)
+      #expect(player.info.isNetworkResource)
+      // Once mpv has read the whole stream, the duration it answers stays as it is.
+      try await Self.waitUntil { player.mpv.getFlag(MPVProperty.demuxerCacheIdle) }
+      player.syncUITimer?.invalidate()
+      player.info.videoDuration = VideoTime(-1)
+      player.syncPositionIfNeededWaiting()
+      #expect(player.info.videoDuration?.second == player.mpv.getDouble(MPVProperty.duration))
     }
   }
 
