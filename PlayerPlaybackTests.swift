@@ -909,6 +909,20 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The playlist pane lists mpv's playlist once the read a change notice asks for is answered, the read not waiting for mpv")
+  func playlistPaneUpdated() async throws {
+    try await Self.withPlayer { player, folder in
+      let pane = SidebarPlaylistPane(player: player)
+      try await Self.waitUntil { pane.tableView.numberOfRows == 3 }
+      // The pane reads the playlist when the add reports it changed, so the add returning while held shows the read does not wait.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        player.addToPlaylist(paths: [folder.appendingPathComponent("d.mp4").path])
+      }
+      #expect(returnedWhileHeld, "The playlist pane's read waited for mpv")
+      try await Self.waitUntil { pane.tableView.numberOfRows == 4 }
+    }
+  }
+
   @Test("A file the system asks the app to open just after a command-line launch is not opened, and one asked after it is")
   func systemOpenIgnoredOnce() async throws {
     try await Self.withPlayer { _, folder in
