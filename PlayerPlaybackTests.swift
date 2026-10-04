@@ -533,6 +533,178 @@ struct PlayerPlaybackTests {
       }
     }
   }
+
+  @Test("Files added to the playlist at an index, past its end and at its end are added in requests that return before mpv handles them")
+  func addToPlaylistDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
+      let adds: [(name: String, add: () -> Void)] = [
+        ("at an index", { player.addToPlaylist(paths: [path("d"), path("e")], at: 1) }),
+        ("past the end", { player.addToPlaylist(paths: [path("f")], at: 99) }),
+        ("at the end", { player.addToPlaylist(paths: [path("g")]) }),
+      ]
+      for (name, add) in adds {
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player, add)
+        #expect(returnedWhileHeld, "Adding files \(name) waited for mpv")
+      }
+      try await Self.waitUntil { player.mpv.getInt(MPVProperty.playlistCount) == 7 }
+      await Self.readPlaylist(of: player)
+      #expect(player.info.playlist.map(\.filename) == ["a", "d", "e", "b", "c", "f", "g"].map(path))
+    }
+  }
+
+  @Test("A file opened with Repeat on is opened, and its loop set, without waiting for mpv")
+  func openWithRepeatDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      try await Self.withSettings([.autoRepeat: true, .defaultRepeatMode: Preference.DefaultRepeatMode.playlist.rawValue]) {
+        let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+        var openedWhileHeld: Bool?
+        player.openURLs([folder.appendingPathComponent("c.mp4")], shouldAutoLoad: false) { _ in openedWhileHeld = !hold.hasLetGo }
+        try await Self.waitUntil { openedWhileHeld != nil }
+        hold.release()
+        try await Self.waitUntil { hold.hasLetGo }
+        #expect(openedWhileHeld == true, "Opening a file with Repeat on waited for mpv")
+        try await Self.waitUntil { player.mpv.getString(MPVOption.PlaybackControl.loopPlaylist) == "inf" }
+        #expect(player.mpv.getString(MPVOption.PlaybackControl.loopFile) == "no")
+      }
+    }
+  }
+
+  /// Read the properties of the file the player has loaded, as MPVController does when mpv reports it loaded. The test reads them
+  /// on the main thread, where nothing holds mpv's core.
+  private static func readLoadedFile(of player: PlayerCore) -> PlayerCore.LoadedFile {
+    player.readLoadedFile()
+  }
+
+  /// `read` with one chapter and A-B loop points that mpv does not hold.
+  private static func withChapterAndLoop(_ read: PlayerCore.LoadedFile) -> PlayerCore.LoadedFile {
+    PlayerCore.LoadedFile(width: read.width, height: read.height, duration: read.duration, position: read.position,
+                          remaining: read.remaining, path: read.path, mediaTitle: read.mediaTitle, trackList: read.trackList,
+                          selectedTracks: read.selectedTracks,
+                          chapters: [MPVChapter(title: "iinaTests", startTime: 1, index: 0)], abLoopA: 1, abLoopB: 2)
+  }
+
+  @Test("A loaded file's tracks, chapters and A-B loop points are stored as they were read when mpv reported it loaded")
+  func fileLoadedStoresWhatWasRead() async throws {
+    try await Self.withPlayer { player, _ in
+      let read = Self.readLoadedFile(of: player)
+      #expect(read.trackList.video.map(\.id) == player.info.videoTracks.map(\.id))
+      #expect(read.selectedTracks.vid == player.info.vid)
+      // A chapter and loop points mpv does not hold show that fileLoaded stores what it is given instead of asking mpv.
+      player.fileLoaded(Self.withChapterAndLoop(read))
+      #expect(player.info.chapters.map(\.title) == ["iinaTests"])
+      #expect(player.info.abLoopStatus == .bSet)
+      #expect(player.info.videoTracks.map(\.id) == read.trackList.video.map(\.id))
+    }
+  }
+
+  @Test("A loaded file reported once the player is no longer active is ignored")
+  func fileLoadedWhenInactive() async throws {
+    try await Self.withPlayer { player, _ in
+      let read = Self.readLoadedFile(of: player)
+      player.mainWindow.close()
+      try await Self.waitUntil { player.info.state == .idle }
+      player.fileLoaded(Self.withChapterAndLoop(read))
+      #expect(player.info.state == .idle)
+      #expect(player.info.chapters.isEmpty)
+      #expect(player.info.abLoopStatus == .cleared)
+    }
+  }
+
+  @Test("The position is synchronized, while the time is not kept up to date, in a request that returns before mpv handles it")
+  func positionSyncDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      player.syncUITimer?.invalidate()
+      var synced = false
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.syncPositionIfNeeded { synced = true } }
+      #expect(returnedWhileHeld, "Synchronizing the position waited for mpv")
+      try await Self.waitUntil { synced }
+      #expect(abs((player.info.videoPosition?.second ?? 0) - 2) < 0.11)
+    }
+  }
+
+  @Test("The position is not asked of mpv while the time is kept up to date")
+  func positionSyncWhileTimed() async throws {
+    try await Self.withPlayer { player, _ in
+      let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { _ in }
+      player.syncUITimer = timer
+      defer { timer.invalidate() }
+      var synced = false
+      let waiting = player.mpv.replyCallbacks.count
+      player.syncPositionIfNeeded { synced = true }
+      #expect(synced)
+      #expect(player.mpv.replyCallbacks.count == waiting)
+    }
+  }
+
+  @Test("A time sync without a completion is skipped while an earlier one awaits mpv's answer")
+  func timeSyncPending() async throws {
+    try await Self.withPlayer { player, _ in
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      var synced = false
+      player.syncTime { synced = true }
+      let waiting = player.mpv.replyCallbacks.count
+      player.syncTime()
+      #expect(player.mpv.replyCallbacks.count == waiting)
+      hold.release()
+      try await Self.waitUntil { hold.hasLetGo && synced }
+    }
+  }
+
+  @Test("At the end of the last file the time sync stores the duration as the position")
+  func timeSyncAtEnd() async throws {
+    try await Self.withPlayer { player, _ in
+      player.playFileInPlaylist(2)
+      try await Self.waitForEntry(2, of: player)
+      player.seek(absoluteSecond: 3.5)
+      try await Self.waitForPosition(3.5, of: player)
+      player.mpv.setFlagAsync(MPVOption.PlaybackControl.pause, false)
+      try await Self.waitUntil { player.mpv.getFlag(MPVProperty.eofReached) }
+      var synced = false
+      player.syncTime { synced = true }
+      try await Self.waitUntil { synced }
+      let duration = try #require(player.info.videoDuration?.second)
+      #expect(player.info.videoPosition?.second == duration)
+    }
+  }
+
+  @Test("The remaining time is worked out from the full length once it is known, and read from mpv before")
+  func timeSyncRemaining() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      try await Self.waitUntil { player.info.fullLength != nil }
+      var synced = false
+      player.syncTime { synced = true }
+      try await Self.waitUntil { synced }
+      let fullLength = try #require(player.info.fullLength)
+      #expect(abs((player.info.videoRemaining?.second ?? 0) - (fullLength - 2)) < 0.11)
+      player.info.fullLength = nil
+      synced = false
+      player.syncTime { synced = true }
+      try await Self.waitUntil { synced }
+      #expect(abs((player.info.videoRemaining?.second ?? 0) - player.mpv.getDouble(MPVProperty.timeRemainingFull)) < 0.11)
+    }
+  }
+
+  @Test("A drop none of whose files can be opened, judged by their extensions, is refused, and a playlist file dropped alone opens")
+  func dropRefusedOrPlaylist() async throws {
+    try await Self.withPlayer { player, folder in
+      let playlists = ["x", "y"].map { folder.appendingPathComponent("\($0).m3u") }
+      for playlist in playlists {
+        try "".write(to: playlist, atomically: true, encoding: .utf8)
+      }
+      #expect(!player.openFromPasteboard(FileDrop(playlists)))
+      let cue = folder.appendingPathComponent("b.cue")
+      try "FILE \"b.mp4\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".write(to: cue, atomically: true, encoding: .utf8)
+      #expect(player.openFromPasteboard(FileDrop([cue])))
+      try await Self.waitUntil {
+        player.info.currentURL?.path == cue.path && player.info.state == .paused && !player.info.pausedForLoading
+      }
+    }
+  }
 }
 
 private final class PlayerPlaybackTestsBundle {}

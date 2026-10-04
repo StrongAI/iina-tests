@@ -151,6 +151,18 @@ struct MPVAsyncRequestTests {
     #expect(player.info.playlist.map(\.filename) == ["/iinaTests/a.mp4"])
   }
 
+  @Test("A player that is not active asks mpv nothing to sync the time, and its position sync completes at once")
+  func syncInactive() async {
+    let player = Self.unstartedPlayer()
+    var timeSynced = false
+    player.syncTime { timeSynced = true }
+    var positionSynced = false
+    player.syncPositionIfNeeded { positionSynced = true }
+    #expect(positionSynced)
+    await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+    #expect(!timeSynced)
+  }
+
   @Test("A command mpv runs is answered with success once it has run")
   func commandSucceeds() async {
     let player = Self.startedPlayer()
