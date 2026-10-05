@@ -1223,6 +1223,339 @@ struct PlayerPlaybackTests {
       }
     }
   }
+
+  /// A plugin in `folder` whose script does nothing, in whose context a test evaluates scripts.
+  private static func makePlugin(in folder: URL) throws -> JavascriptPlugin {
+    let root = folder.appendingPathComponent("iinaTests-plugin")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let info: [String: Any] = ["name": "iinaTests", "author": ["name": "iinaTests"], "identifier": "io.iina.tests",
+                               "version": "1.0", "entry": "main.js"]
+    try JSONSerialization.data(withJSONObject: info).write(to: root.appendingPathComponent("Info.json"))
+    try Data().write(to: root.appendingPathComponent("main.js"))
+    return try #require(JavascriptPlugin(filename: root.lastPathComponent, externalURL: root))
+  }
+
+  /// Write a subtitle file `<name>.srt` holding one line in `folder` for each of `names`.
+  /// - Returns: The files written, in the order of `names`.
+  private static func writeSubtitles(_ names: [String], in folder: URL) throws -> [URL] {
+    try names.map { name in
+      let file = folder.appendingPathComponent("\(name).srt")
+      try "1\n00:00:00,000 --> 00:00:04,000\n\(name)\n".write(to: file, atomically: true, encoding: .utf8)
+      return file
+    }
+  }
+
+  @Test("A plugin's status position and duration are answered at once, the position being the one mpv holds while the time is not kept up to date")
+  func statusPositionAndDuration() async throws {
+    try await Self.withPlayer { player, folder in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      player.syncUITimer?.invalidate()
+      let plugin = try Self.makePlugin(in: folder)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      // A position mpv does not hold shows whether the getter answers with the position mpv holds.
+      player.info.videoPosition = VideoTime(0)
+      let position = try #require(instance.js.evaluateScript("iina.core.status.position")).toDouble()
+      #expect(abs(position - 2) < 0.11)
+      #expect(player.info.videoPosition?.second == position)
+      let duration = try #require(instance.js.evaluateScript("iina.core.status.duration")).toDouble()
+      #expect(duration == player.info.videoDuration?.second)
+    }
+  }
+
+  @Test("Jump to returns while mpv's core is held, then shows its prompt filled with the position mpv answers, and a prompt dismissed seeks nowhere")
+  func jumpToDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(percent: 50, forceExact: true)
+      try await Self.waitForPosition(2, of: player)
+      player.syncUITimer?.invalidate()
+      // A position mpv does not hold shows whether the prompt is filled with the position mpv answers.
+      player.info.videoPosition = VideoTime(0)
+      let prompt = ModalWindowDismisser()
+      defer { prompt.stop() }
+      let handler = MainMenuActionHandler(playerCore: player)
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { handler.menuJumpTo(NSMenuItem()) }
+      #expect(returnedWhileHeld, "Jump to waited for mpv")
+      try await Self.waitUntil { !prompt.texts.isEmpty }
+      let position = try #require(player.info.videoPosition)
+      #expect(abs(position.second - 2) < 0.11)
+      #expect(prompt.texts[0].contains(position.stringRepresentationWithPrecision(3)), "The prompt read \(prompt.texts)")
+      await Self.drainMain()
+      #expect(abs(player.mpv.getDouble(MPVProperty.timePos) - 2) < 0.11)
+    }
+  }
+
+  @Test("A time entered in the jump to prompt is sought")
+  func jumpToSeeks() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      let prompt = ModalWindowDismisser(entering: "00:01")
+      defer { prompt.stop() }
+      MainMenuActionHandler(playerCore: player).menuJumpTo(NSMenuItem())
+      try await Self.waitUntil { !prompt.texts.isEmpty }
+      try await Self.waitForPosition(1, of: player)
+    }
+  }
+
+  @Test("The chapter menu is built at once and checks the chapter playing once the position mpv answers is stored, the read not waiting for mpv")
+  func chapterMenuDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let menuController = try #require(AppDelegate.shared.menuController)
+      player.info.chapters = [MPVChapter(title: "One", startTime: 0, index: 0), MPVChapter(title: "Two", startTime: 2, index: 1)]
+      player.seek(absoluteSecond: 3)
+      try await Self.waitForPosition(3, of: player)
+      player.syncUITimer?.invalidate()
+      // A position mpv does not hold, in the first chapter, shows whether the chapter checked is the one mpv answers playback is in.
+      player.info.videoPosition = VideoTime(0)
+      var listedWhileHeld: [Int] = []
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        menuController.updateChapterList(of: player)
+        listedWhileHeld = menuController.chapterMenu.items.map(\.tag)
+      }
+      #expect(returnedWhileHeld, "Building the chapter menu waited for mpv")
+      #expect(listedWhileHeld == [0, 1])
+      let items = menuController.chapterMenu.items
+      try await Self.waitUntil { items.map(\.state) == [.off, .on] }
+    }
+  }
+
+  @Test("Files chosen in the Open panel none of which is played on its own are reported as nothing to open once they are found, and a video chosen opens")
+  func openChosenFiles() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true]) {
+        let subtitle = try Self.writeSubtitles(["a"], in: folder)[0]
+        let dismisser = ModalWindowDismisser()
+        defer { dismisser.stop() }
+        AppDelegate.shared.openChosenFiles([subtitle])
+        // The files are found off the main thread, so nothing is reported when the open returns.
+        #expect(dismisser.texts.isEmpty)
+        let message = NSLocalizedString("alert.nothing_to_open", comment: "nothing_to_open")
+        try await Self.waitUntil { !dismisser.texts.isEmpty }
+        #expect(dismisser.texts.contains { $0.contains(message) }, "The alerts shown read \(dismisser.texts)")
+        let video = folder.appendingPathComponent("c.mp4")
+        AppDelegate.shared.openChosenFiles([video])
+        let players = try await Self.players(showing: [video.path])
+        #expect(dismisser.texts.count == 1)
+        try await Self.close(players)
+      }
+    }
+  }
+
+  @Test("Files named on the command line open each in a new player, the last of which enters music mode once it has opened its file")
+  func commandLineMusicMode() async throws {
+    try await Self.withPlayer { _, folder in
+      let videos = ["a", "c"].map { folder.appendingPathComponent("\($0).mp4") }
+      var status = CommandLineStatus()
+      status.filenames = videos.map(\.path)
+      status.openSeparateWindows = true
+      status.enterMusicMode = true
+      let entered = NoticeRecorder(.iinaMusicModeChanged)
+      defer { entered.stop() }
+      AppDelegate.shared.openFromCommandLine(status)
+      let players = try await Self.players(showing: videos.map(\.path))
+      try await Self.waitUntil { players[1].isInMiniPlayer }
+      #expect(!players[0].isInMiniPlayer)
+      // The player shows the file it opened as it enters music mode.
+      #expect(entered.paths == [videos[1].path])
+      players[1].switchBackFromMiniPlayer()
+      try await Self.close(players)
+    }
+  }
+
+  @Test("Files named on the command line open together in a new player, which enters picture-in-picture once it has opened them")
+  func commandLinePIP() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.windowBehaviorWhenPip: Preference.WindowBehaviorWhenPip.doNothing.rawValue, .pauseWhenPip: false]) {
+        let videos = ["a", "c"].map { folder.appendingPathComponent("\($0).mp4") }
+        var status = CommandLineStatus()
+        status.filenames = videos.map(\.path)
+        status.enterPIP = true
+        // The command line opens in an idle player when there is one, so with one made sure of, each player that may open the
+        // files tells the path of the file it shows as it enters picture-in-picture.
+        _ = PlayerCore.newPlayerCore
+        var entered: [String?] = []
+        let listeners = PlayerCore.playerCores.map { player in
+          let recorder = EventRecorder { data in
+            if data.first as? Bool == true {
+              entered.append(player.info.currentURL?.path)
+            }
+          }
+          return (player, player.events.addListener(recorder, for: .pipChanged))
+        }
+        defer { listeners.forEach { player, id in player.events.removeListener(id, for: .pipChanged) } }
+        AppDelegate.shared.openFromCommandLine(status)
+        let players = try await Self.players(showing: [videos[0].path])
+        try await Self.waitUntil { !entered.isEmpty }
+        #expect(entered == [videos[0].path])
+        // The system may close picture-in-picture without reporting it closed, as on the test machine, where it asks the window to
+        // prepare for closing and reports nothing after, so the window is brought out of it as that report would.
+        players[0].mainWindow.exitPIP()
+        if players[0].mainWindow.pipStatus == .intermediate {
+          players[0].mainWindow.doneExitingPIP()
+        }
+        #expect(players[0].mainWindow.pipStatus == .notInPIP)
+        try await Self.close(players)
+      }
+    }
+  }
+
+  @Test("Standard input named on the command line opens in a new player, which enters music mode at once")
+  func commandLineStdin() async throws {
+    try await Self.withPlayer { _, folder in
+      let data = try Data(contentsOf: folder.appendingPathComponent("a.mp4"))
+      // mpv reads standard input as the stream it opens, so standard input is replaced with a pipe the file is written to.
+      let pipe = Pipe()
+      let standardInput = dup(STDIN_FILENO)
+      dup2(pipe.fileHandleForReading.fileDescriptor, STDIN_FILENO)
+      defer {
+        dup2(standardInput, STDIN_FILENO)
+        Darwin.close(standardInput)
+      }
+      let writer = pipe.fileHandleForWriting
+      DispatchQueue.global().async {
+        try? writer.write(contentsOf: data)
+        try? writer.close()
+      }
+      var status = CommandLineStatus()
+      status.isStdin = true
+      status.enterMusicMode = true
+      #expect(!PlayerCore.playerCores.contains { $0.isInMiniPlayer })
+      AppDelegate.shared.openFromCommandLine(status)
+      let player = try #require(PlayerCore.playerCores.first { $0.isInMiniPlayer })
+      try await Self.waitUntil {
+        player.mpv.getString(MPVProperty.path) == "-" && player.info.state == .paused && !player.info.pausedForLoading
+      }
+      player.switchBackFromMiniPlayer()
+      try await Self.close([player])
+    }
+  }
+
+  @Test("Moving a loop point the A-B loop command has not set asks nothing of mpv")
+  func abLoopPointIgnored() async throws {
+    try await Self.withPlayer { player, _ in
+      #expect(player.info.abLoopStatus == .cleared)
+      player.abLoopA = 2
+      player.abLoopB = 3
+      // mpv answers in the order it is asked, so this answer comes after mpv has set any loop point the moves asked it to.
+      _ = await Self.paused(player)
+      #expect(player.mpv.getString(MPVOption.PlaybackControl.abLoopA) == "no")
+      #expect(player.mpv.getString(MPVOption.PlaybackControl.abLoopB) == "no")
+    }
+  }
+
+  @Test("Changes of loop-playlist are stored as mpv reported them, giving the playlist loop and then no loop")
+  func loopPlaylistChanged() async throws {
+    try await Self.withPlayer { player, _ in
+      var notices = 0
+      player.observe(.iinaLoopStatusChanged) { _ in notices += 1 }
+      player.loopOptionChanged(MPVOption.PlaybackControl.loopPlaylist, "inf")
+      #expect(player.getLoopMode() == .playlist)
+      player.loopOptionChanged(MPVOption.PlaybackControl.loopPlaylist, "no")
+      #expect(player.getLoopMode() == .off)
+      try await Self.waitUntil { notices == 2 }
+    }
+  }
+
+  @Test("Changes of the video and secondary subtitle tracks reported once the player is no longer active are ignored")
+  func trackChangedWhenInactive() async throws {
+    try await Self.withPlayer { player, _ in
+      player.mainWindow.close()
+      try await Self.waitUntil { player.info.state == .idle }
+      var notified = false
+      player.observe(.iinaVIDChanged) { _ in notified = true }
+      player.observe(.iinaSIDChanged) { _ in notified = true }
+      let (vid, secondSid) = (player.info.vid, player.info.secondSid)
+      player.vidChanged(7)
+      player.secondarySidChanged(7)
+      await Self.drainMain()
+      #expect(player.info.vid == vid)
+      #expect(player.info.secondSid == secondSid)
+      #expect(!notified)
+    }
+  }
+
+  @Test("A secondary subtitle track selected in mpv is stored once mpv reports the change, taking the track id it reported")
+  func secondarySidSelected() async throws {
+    try await Self.withPlayer { player, folder in
+      let subtitles = try Self.writeSubtitles(["b", "c"], in: folder)
+      subtitles.forEach { player.loadExternalSubFile($0) }
+      try await Self.waitUntil { player.info.subTracks.count == 2 }
+      // mpv selects each subtitle file it adds, so c.srt's track is the subtitle track and b.srt's can be the secondary one.
+      let track = try #require(player.info.subTracks.first { $0.externalFilename == subtitles[0].mpvStr })
+      player.setTrack(track.id, forType: .secondSub)
+      try await Self.waitUntil { player.info.secondSid == track.id }
+      #expect(player.mpv.getInt(MPVOption.Subtitles.secondarySid) == track.id)
+    }
+  }
+
+  @Test("Reloading the subtitles selects again the reloaded track of the subtitle file selected before")
+  func reloadAllSubsReselects() async throws {
+    try await Self.withPlayer { player, folder in
+      let subtitles = try Self.writeSubtitles(["b", "c"], in: folder)
+      subtitles.forEach { player.loadExternalSubFile($0) }
+      try await Self.waitUntil { player.info.subTracks.count == 2 }
+      let selected = try #require(player.info.subTracks.first { $0.externalFilename == subtitles[0].mpvStr })
+      player.setTrack(selected.id, forType: .sub)
+      try await Self.waitUntil { player.info.sid == selected.id }
+      var stored = false
+      player.reloadAllSubs { stored = true }
+      try await Self.waitUntil { stored }
+      // mpv selects each subtitle track it reloads, c.srt's last, so b.srt's reloaded track is selected only if the player selects
+      // it again once the reloads are done.
+      let reloaded = try #require(player.info.subTracks.first { $0.externalFilename == subtitles[0].mpvStr })
+      try await Self.waitUntil {
+        player.mpv.getInt(MPVOption.TrackSelection.sid) == reloaded.id && player.info.sid == reloaded.id
+      }
+    }
+  }
+
+  @Test("A 3D LUT file dragged alone is accepted, judged by its name")
+  func dragOfLUT() async throws {
+    try await Self.withPlayer { player, folder in
+      let lut = folder.appendingPathComponent("look.cube")
+      #expect(player.acceptFromPasteboard(FileDrop([lut])) == .copy)
+      #expect(player.acceptFromPasteboard(FileDrop([lut]), isPlaylist: true) == .copy)
+    }
+  }
+
+  @Test("Drags onto the video view and the playlist pane are answered by the player from what is dragged: a folder and a link are accepted, and a subtitle file is refused by the playlist")
+  func dragsOntoViews() async throws {
+    try await Self.withPlayer { player, folder in
+      // Named alone, a folder that does not exist is answered as a folder that does.
+      let subfolder = folder.appendingPathComponent("more")
+      let link = try #require(URL(string: "https://iina.io/"))
+      let videoView = player.mainWindow.videoView
+      #expect(videoView.draggingEntered(FileDrop([subfolder])) == .copy)
+      #expect(videoView.hasPlayableFiles)
+      #expect(videoView.draggingEntered(FileDrop(link: link)) == .copy)
+      let pane = SidebarPlaylistPane(player: player)
+      let answer = { (drop: FileDrop) in
+        pane.tableView(pane.tableView, validateDrop: drop, proposedRow: 0, proposedDropOperation: .above)
+      }
+      #expect(answer(FileDrop([subfolder])) == .copy)
+      #expect(answer(FileDrop(link: link)) == .copy)
+      #expect(answer(FileDrop([folder.appendingPathComponent("b.srt")])) == [])
+    }
+  }
+
+  @Test("The playlist pane of a player no longer active reads nothing when the playlist is reported changed")
+  func playlistPaneInactive() async throws {
+    try await Self.withPlayer { player, _ in
+      let pane = SidebarPlaylistPane(player: player)
+      try await Self.waitUntil { pane.tableView.numberOfRows == 3 }
+      player.mainWindow.close()
+      try await Self.waitUntil { player.info.state == .idle }
+      // A held core answers nothing, so a read the pane asked for would be waiting.
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      let waiting = player.mpv.replyCallbacks.count
+      player.postNotification(.iinaPlaylistChanged)
+      await Self.drainMain()
+      #expect(player.mpv.replyCallbacks.count == waiting)
+      #expect(pane.tableView.numberOfRows == 3)
+      hold.release()
+      try await Self.waitUntil { hold.hasLetGo }
+    }
+  }
 }
 
 private final class PlayerPlaybackTestsBundle {}
@@ -1253,6 +1586,13 @@ private final class FileDrop: NSObject, NSDraggingInfo {
     super.init()
     draggingPasteboard.declareTypes([.nsFilenames], owner: nil)
     draggingPasteboard.setPropertyList(urls.map(\.path), forType: .nsFilenames)
+  }
+
+  /// A drag of a link, carrying it as a URL rather than as a file's path.
+  init(link: URL) {
+    super.init()
+    draggingPasteboard.declareTypes([.nsURL], owner: nil)
+    draggingPasteboard.setString(link.absoluteString, forType: .nsURL)
   }
 
   deinit {
@@ -1330,9 +1670,13 @@ private final class LocalStreamServer {
 private final class ModalWindowDismisser {
   /// The text of each window dismissed, in the order they were shown.
   private(set) var texts: [[String]] = []
+  private let input: String?
   private var timer: Timer?
 
-  init() {
+  /// - Parameter input: Text entered in the first editable field of each window, which is then answered with its first button, as
+  ///     a user typing it and pressing OK would. With `nil` each window is dismissed unanswered.
+  init(entering input: String? = nil) {
+    self.input = input
     let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
       MainActor.assumeIsolated { self?.dismiss() }
     }
@@ -1348,7 +1692,21 @@ private final class ModalWindowDismisser {
   private func dismiss() {
     guard let window = NSApp.modalWindow else { return }
     texts.append(Self.texts(of: window))
-    NSApp.stopModal()
+    if let input, let field = Self.editableField(in: window.contentView) {
+      field.stringValue = input
+      NSApp.stopModal(withCode: .alertFirstButtonReturn)
+    } else {
+      NSApp.stopModal()
+    }
+  }
+
+  /// The first editable text field in `view` or the views under it.
+  private static func editableField(in view: NSView?) -> NSTextField? {
+    guard let view else { return nil }
+    if let field = view as? NSTextField, field.isEditable {
+      return field
+    }
+    return view.subviews.lazy.compactMap { editableField(in: $0) }.first
   }
 
   /// The text `element` and the elements under it show, read through accessibility, which also reaches text an alert does not
@@ -1379,6 +1737,44 @@ private final class MainReply<Value: Sendable> {
   /// Keep `value` on the main thread, from any thread.
   nonisolated func set(_ value: Value) {
     DispatchQueue.main.async { MainActor.assumeIsolated { self.value = value } }
+  }
+}
+
+/// Keeps the path of the file each player that posts a notice shows as it posts it, while it lives.
+@MainActor
+private final class NoticeRecorder {
+  /// For each notice posted, in the order posted, the path of the file the player posting it showed.
+  private(set) var paths: [String?] = []
+  private var observer: NSObjectProtocol?
+
+  init(_ name: Notification.Name) {
+    // Without a queue the notice is handled on the thread posting it, while the player is as it was when it posted it.
+    observer = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] notice in
+      MainActor.assumeIsolated {
+        guard let player = notice.object as? PlayerCore else { return }
+        self?.paths.append(player.info.currentURL?.path)
+      }
+    }
+  }
+
+  func stop() {
+    if let observer {
+      NotificationCenter.default.removeObserver(observer)
+    }
+  }
+}
+
+/// Runs a block on the main thread each time a player emits an event it listens for.
+private final class EventRecorder: EventCallable {
+  private let block: @MainActor ([Any]) -> Void
+
+  /// - Parameter block: Run with the data the event is emitted with.
+  init(_ block: @escaping @MainActor ([Any]) -> Void) {
+    self.block = block
+  }
+
+  func call(withArguments args: [Any]) {
+    MainActor.assumeIsolated { block(args) }
   }
 }
 
