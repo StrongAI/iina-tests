@@ -703,6 +703,186 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Selecting a track asks mpv without waiting for it, the track mpv selects being stored when it reports the change")
+  func setTrackDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.waitUntil { player.info.vid == 1 }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.setTrack(0, forType: .video) }
+      #expect(returnedWhileHeld, "Selecting a track waited for mpv")
+      try await Self.waitUntil { player.info.vid == 0 }
+    }
+  }
+
+  @Test("A change of the video track is stored without waiting for mpv, taking the track id mpv reported in the change")
+  func vidChangedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      var notified = false
+      player.observe(.iinaVIDChanged) { _ in notified = true }
+      // A track id mpv does not hold shows that the player stores the id it is given instead of asking mpv.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.vidChanged(7) }
+      #expect(returnedWhileHeld, "Storing a change of the video track waited for mpv")
+      #expect(player.info.vid == 7)
+      #expect(notified)
+    }
+  }
+
+  @Test("A change of the secondary subtitle track is stored without waiting for mpv, taking the track id mpv reported in the change")
+  func secondarySidChangedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      var notified = false
+      player.observe(.iinaSIDChanged) { _ in notified = true }
+      // A track id mpv does not hold shows that the player stores the id it is given instead of asking mpv.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.secondarySidChanged(7) }
+      #expect(returnedWhileHeld, "Storing a change of the secondary subtitle track waited for mpv")
+      #expect(player.info.secondSid == 7)
+      #expect(notified)
+    }
+  }
+
+  @Test("Toggling the loops asks mpv without waiting for it, and the loop mode read before mpv sets the loop is the one asked for")
+  func loopModeDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let toggles: [(name: String, toggle: () -> Void, mode: LoopMode, file: String, playlist: String)] = [
+        ("the playlist loop", { player.togglePlaylistLoop() }, .playlist, "no", "inf"),
+        ("the file loop", { player.toggleFileLoop() }, .file, "inf", "inf"),
+        ("to the loop mode after the file loop", { player.nextLoopMode() }, .playlist, "no", "inf"),
+        ("to the loop mode after the playlist loop", { player.nextLoopMode() }, .off, "no", "no"),
+      ]
+      for (name, toggle, mode, file, playlist) in toggles {
+        let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+        toggle()
+        let returnedWhileHeld = !hold.hasLetGo
+        let modeWhileHeld = player.getLoopMode()
+        hold.release()
+        try await Self.waitUntil { hold.hasLetGo }
+        #expect(returnedWhileHeld, "Toggling \(name) waited for mpv")
+        #expect(modeWhileHeld == mode, "Toggling \(name)")
+        try await Self.waitUntil {
+          player.mpv.getString(MPVOption.PlaybackControl.loopFile) == file
+            && player.mpv.getString(MPVOption.PlaybackControl.loopPlaylist) == playlist
+        }
+      }
+    }
+  }
+
+  @Test("A change of loop-file is stored without waiting for mpv, taking the value mpv reported in the change")
+  func loopOptionChangedDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      var notified = false
+      player.observe(.iinaLoopStatusChanged) { _ in notified = true }
+      // A value mpv does not hold shows that the player stores the value it is given instead of asking mpv.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        player.loopOptionChanged(MPVOption.PlaybackControl.loopFile, "inf")
+      }
+      #expect(returnedWhileHeld, "Storing a change of loop-file waited for mpv")
+      #expect(player.getLoopMode() == .file)
+      #expect(notified)
+    }
+  }
+
+  @Test("The A-B loop command and a move of its A point return before mpv handles them, the loop points mpv answers being stored")
+  func abLoopDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.seek(absoluteSecond: 1)
+      try await Self.waitForPosition(1, of: player)
+      var answered: (a: Double, b: Double)?
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.abLoop { answered = ($0, $1) } }
+      #expect(returnedWhileHeld, "The A-B loop command waited for mpv")
+      try await Self.waitUntil { answered != nil }
+      #expect(player.info.abLoopStatus == .aSet)
+      #expect(abs((answered?.a ?? 0) - 1) < 0.11)
+      #expect(answered?.b == 0)
+      let movedWhileHeld = try await Self.returnsWhileHeld(player) { player.abLoopA = 2 }
+      #expect(movedWhileHeld, "Moving the A loop point waited for mpv")
+      try await Self.waitUntil { player.mpv.getDouble(MPVOption.PlaybackControl.abLoopA) == 2 }
+    }
+  }
+
+  @Test("Reloading the subtitles returns before mpv handles it, the track list mpv answers after the reloads being stored")
+  func reloadAllSubsDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let subtitle = folder.appendingPathComponent("b.srt")
+      try "1\n00:00:00,000 --> 00:00:04,000\nSubtitle\n".write(to: subtitle, atomically: true, encoding: .utf8)
+      player.loadExternalSubFile(subtitle)
+      try await Self.waitUntil { player.info.subTracks.count == 1 }
+      // A track list mpv does not hold shows that the player stores the list mpv answers.
+      player.info.videoTracks = []
+      var stored = false
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.reloadAllSubs { stored = true } }
+      #expect(returnedWhileHeld, "Reloading the subtitles waited for mpv")
+      try await Self.waitUntil { stored }
+      #expect(player.info.videoTracks.count == 1)
+      #expect(player.info.subTracks.count == 1)
+    }
+  }
+
+  @Test("The chapter list is read again without waiting for mpv, the list mpv answers being stored")
+  func reloadChaptersDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      var notified = false
+      player.observe(.iinaChapterListChanged) { _ in notified = true }
+      // A chapter the file does not have shows that the player stores the list mpv answers.
+      player.info.chapters = [MPVChapter(title: "Not in the file", startTime: 1, index: 0)]
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.reloadChapters() }
+      #expect(returnedWhileHeld, "Reading the chapter list again waited for mpv")
+      try await Self.waitUntil { notified }
+      #expect(player.info.chapters.map(\.title) == player.readChapters().map(\.title))
+    }
+  }
+
+  @Test("Playlist edits other than adding files return before mpv handles them, mpv making them in the order they are asked")
+  func playlistEditsDoNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
+      let edits: [(name: String, edit: () -> Void, playlist: [String])] = [
+        ("appending a file", { player.appendToPlaylist(path("d")) }, ["a", "b", "c", "d"]),
+        ("moving an entry", { player.playlistMove(3, to: 0) }, ["d", "a", "b", "c"]),
+        ("removing an entry", { player.playlistRemove(0) }, ["a", "b", "c"]),
+        ("removing entries", {
+          player.appendToPlaylist(path("e"))
+          player.appendToPlaylist(path("f"))
+          player.playlistRemove(IndexSet([3, 4]))
+        }, ["a", "b", "c"]),
+        ("reordering the playlist", { player.playlistReorder(newPlaylist: player.info.playlist.reversed()) }, ["c", "b", "a"]),
+        ("clearing the playlist", { player.clearPlaylist() }, ["b"]),
+      ]
+      for (name, edit, playlist) in edits {
+        await Self.readPlaylist(of: player)
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player, edit)
+        #expect(returnedWhileHeld, "Playlist edit \(name) waited for mpv")
+        await Self.readPlaylist(of: player)
+        #expect(player.info.playlist.map(\.filename) == playlist.map(path), "After \(name)")
+      }
+    }
+  }
+
+  @Test("A drag of a folder is answered from its name, without the main thread reading the folder")
+  func dragAnsweredByName() async throws {
+    try await Self.withPlayer { player, folder in
+      // Read, an empty folder holds nothing that can be opened, so a drag answered from what the folder holds is refused.
+      let empty = folder.appendingPathComponent("empty")
+      try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+      #expect(player.acceptFromPasteboard(FileDrop([empty])) == .copy)
+      #expect(player.acceptFromPasteboard(FileDrop([empty]), isPlaylist: true) == .copy)
+      #expect(player.acceptFromPasteboard(FileDrop([folder.appendingPathComponent("b.srt")]), isPlaylist: true) == [])
+    }
+  }
+
+  @Test("Dropped files are made into URLs off the main thread: the drop returns while the queue doing it is held, before any open has begun")
+  func dropDoesNotReadOnMain() async throws {
+    try await Self.withPlayer { player, folder in
+      let held = DispatchSemaphore(value: 0)
+      player.openQueue.async { held.wait() }
+      let video = folder.appendingPathComponent("c.mp4")
+      #expect(player.openFromPasteboard(FileDrop([video])))
+      // Making the dropped paths into URLs reads the filesystem and is left to the held queue, so no open has begun.
+      #expect(player.opensFindingFiles.isEmpty)
+      held.signal()
+      try await Self.waitUntil {
+        player.info.currentURL?.path == video.path && player.info.state == .paused && !player.info.pausedForLoading
+      }
+    }
+  }
   @Test("The position is synchronized, while the time is not kept up to date, in a request that returns before mpv handles it")
   func positionSyncDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
