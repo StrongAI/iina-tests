@@ -2351,11 +2351,17 @@ struct PlayerPlaybackTests {
     try await waitUntil { player.info.mediaTitle == title }
     let defaults = UserDefaults.standard
     let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    // A change of a setting is told to its observers when the settings are next read, on the thread reading them, and a window takes
+    // a change of some settings with AppKit, so each change is read at once on the main thread.
     func withSetting(_ key: Preference.Key, _ value: Any) {
       defaults.setVolatileDomain(defaults.volatileDomain(forName: UserDefaults.argumentDomain).merging([key.rawValue: value]) { $1 },
                                  forName: UserDefaults.argumentDomain)
+      _ = defaults.object(forKey: key.rawValue)
     }
-    defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+    defer {
+      defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+      _ = defaults.object(forKey: Preference.Key.useLegacyFullScreen.rawValue)
+    }
     func pluginInstance() throws -> JavascriptPluginInstance {
       // A plugin's script is read when its instance is made, so the instance is made before the core is held. The plugin is kept,
       // since its instance holds it weakly and reads it when the instance is let go.
@@ -2588,6 +2594,116 @@ struct PlayerPlaybackTests {
     // The geometry asks for half the screen's width and height, of which the window keeps the file's aspect.
     let sized = try #require(frame)
     #expect(abs(sized.width - screen.width / 2) < 1 || abs(sized.height - screen.height / 2) < 1)
+  }
+
+  /// A read the inspector makes of the player it shows: each must not wait for mpv on the main thread.
+  enum InspectorRequest: String, CaseIterable, Sendable {
+    case info, dynamicInfo, watchedProperties
+  }
+
+  @Test("Each read the inspector makes of mpv is asked in requests that do not wait for mpv, and what mpv answers is shown",
+        arguments: InspectorRequest.allCases)
+  func inspectorDoesNotWait(_ request: InspectorRequest) async throws {
+    try await Self.withPlayer { player, _ in
+      PlayerCore.lastActive = player
+      let inspector = InspectorWindowController()
+      Self.keptObjects.append(inspector)
+      inspector.showWindow(nil)
+      defer { inspector.close() }
+      // The inspector first shows what it read when it was shown.
+      let length = VideoTime(4).stringRepresentation
+      try await Self.waitUntil { inspector.durationField.stringValue == length }
+      let path = try #require(player.info.currentURL).path
+      let ask: () -> Void
+      let shown: () -> Bool
+      switch request {
+      case .info:
+        inspector.pathField.stringValue = ""
+        inspector.vsizeField.stringValue = ""
+        ask = { inspector.updateInfo() }
+        shown = { inspector.pathField.stringValue == path && inspector.vsizeField.stringValue == "64\u{d7}48" }
+      case .dynamicInfo:
+        inspector.vbitrateField.stringValue = ""
+        ask = { inspector.updateInfo(dynamic: true) }
+        shown = { inspector.vbitrateField.stringValue.hasSuffix("bps") }
+      case .watchedProperties:
+        // The path as mpv has it, read before its core is held.
+        let watched = try #require(player.mpv.getString(MPVProperty.path))
+        inspector.watchProperties = [MPVProperty.path]
+        inspector.watchTableView.reloadData()
+        let column = inspector.watchTableView.column(withIdentifier: .value)
+        ask = { inspector.dynamicUpdate() }
+        shown = {
+          let cell = inspector.watchTableView.view(atColumn: column, row: 0, makeIfNecessary: true) as? NSTableCellView
+          return cell?.textField?.stringValue == watched
+        }
+      }
+      // The inspector shows what it reads on the main thread, so the core is held until the main thread has run what the request
+      // gave it.
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      ask()
+      await Self.drainMain()
+      let returnedWhileHeld = !hold.hasLetGo
+      hold.release()
+      try await Self.waitUntil { hold.hasLetGo }
+      #expect(returnedWhileHeld, "The inspector's \(request) waited for mpv")
+      try await Self.waitUntil(shown)
+    }
+  }
+
+  /// A set, command or hook a plugin asks of mpv, or a hook the player adds: each must not wait for mpv on the main thread.
+  enum PluginMpvRequest: String, CaseIterable, Sendable {
+    case jsSetNumber, jsSetString, jsSetFlag, jsSetObject, jsCommand, jsAddHook, addHook
+  }
+
+  @Test("Each set, command or hook a plugin or the player asks of mpv returns before mpv handles it, which then does what was asked",
+        arguments: PluginMpvRequest.allCases)
+  func pluginMpvRequestDoesNotWait(_ request: PluginMpvRequest) async throws {
+    try await Self.withPlayer { player, folder in
+      let mpv: MPVController = player.mpv
+      // A plugin's script is read when its instance is made, so the instance is made before the core is held. The plugin is kept,
+      // since its instance holds it weakly and reads it when the instance is let go.
+      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      func script(_ source: String) -> () -> Void {
+        { _ = instance.js.evaluateScript(source) }
+      }
+      let ask: () -> Void
+      let applied: () -> Bool
+      // Set by the player's hook, which mpv runs on the queue for reading its events.
+      let hooked = Atomic(wrappedValue: false)
+      switch request {
+      case .jsSetNumber:
+        ask = script("iina.mpv.set('speed', 2)")
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 2 }
+      case .jsSetString:
+        ask = script("iina.mpv.set('loop-file', 'inf')")
+        applied = { mpv.getString(MPVOption.PlaybackControl.loopFile) == "inf" }
+      case .jsSetFlag:
+        ask = script("iina.mpv.set('mute', true)")
+        applied = { mpv.getFlag(MPVOption.Audio.mute) }
+      case .jsSetObject:
+        ask = script("iina.mpv.set('user-data/iinaTests', {answer: 'yes'})")
+        applied = { (mpv.getNode("user-data/iinaTests") as? [String: Any])?["answer"] as? String == "yes" }
+      case .jsCommand:
+        ask = script("iina.mpv.command('set', ['speed', '1.5'])")
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 1.5 }
+      case .jsAddHook:
+        // A hook mpv runs when the next entry starts, which marks that it ran.
+        ask = script("iina.mpv.addHook('on_before_start_file', 0, () => { globalThis.iinaTestsHooked = true })")
+        applied = { instance.js.evaluateScript("globalThis.iinaTestsHooked === true")?.toBool() == true }
+      case .addHook:
+        ask = { mpv.addHook(.onBeforeStartFile, hook: MPVHookValue(withBlock: { next in hooked.withLock { $0 = true }; next() })) }
+        applied = { hooked.withLock { $0 } }
+      }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player, ask)
+      #expect(returnedWhileHeld, "Asking for \(request) waited for mpv")
+      if request == .jsAddHook || request == .addHook {
+        player.navigateInPlaylist(nextMedia: true)
+      }
+      try await Self.waitUntil(applied)
+    }
   }
 
   /// Plugins whose instances a test makes, kept for as long as the instances may read them.
