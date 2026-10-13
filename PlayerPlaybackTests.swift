@@ -963,8 +963,8 @@ struct PlayerPlaybackTests {
         AppDelegate.shared.openQueue.async { held.wait() }
         let video = folder.appendingPathComponent("c.mp4")
         AppDelegate.shared.openFiles([video.path])
-        // Making the path into a file URL reads the filesystem and is left to the held queue, so no player has begun opening it.
-        await Self.drainMain()
+        // Making the path into a file URL reads the filesystem and is left to the held queue, so no player has begun opening it when
+        // openFiles returns. Made on main, the URL would be handed at once to a new player, which would be finding its files.
         #expect(PlayerCore.playerCores.allSatisfy { $0.opensFindingFiles.isEmpty })
         held.signal()
         let players = try await Self.players(showing: [video.path])
