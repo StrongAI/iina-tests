@@ -955,6 +955,24 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Files the system asks the app to open are made into file URLs off the main thread, then opened")
+  func systemOpenDoesNotReadOnMain() async throws {
+    try await Self.withPlayer { _, folder in
+      try await Self.withSettings([.alwaysOpenInNewWindow: true]) {
+        let held = DispatchSemaphore(value: 0)
+        AppDelegate.shared.openQueue.async { held.wait() }
+        let video = folder.appendingPathComponent("c.mp4")
+        AppDelegate.shared.openFiles([video.path])
+        // Making the path into a file URL reads the filesystem and is left to the held queue, so no player has begun opening it.
+        await Self.drainMain()
+        #expect(PlayerCore.playerCores.allSatisfy { $0.opensFindingFiles.isEmpty })
+        held.signal()
+        let players = try await Self.players(showing: [video.path])
+        try await Self.close(players)
+      }
+    }
+  }
+
   @Test("The position is synchronized, while the time is not kept up to date, in a request that returns before mpv handles it")
   func positionSyncDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
