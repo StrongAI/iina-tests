@@ -2314,6 +2314,282 @@ struct PlayerPlaybackTests {
     #expect(path == nil)
   }
 
+  /// A site that reads mpv's title, tags, chapters, A-B loop, full screen state, window scale, rotation or configured options, or that
+  /// is reached through one: each takes what mpv reported in place of waiting for mpv on the main thread.
+  enum ReportedValueRequest: String, CaseIterable, Sendable {
+    case mediaTitle, windowTitle, titleBar, jsTitle, nowPlaying, trackListChanged, musicMetadata, miniPlayerTitle
+    case toolBarMusicMode, commandMusicMode, menuMusicMode, miniPlayerBack, miniPlayerCommand, fullscreenChanged
+    case windowScaleChanged, abLoopA, abLoopB, abLoopActive, playbackMenu, jsChapters, rotation, openWithConfiguredOptions
+    case frameFromGeometry
+  }
+
+  @Test("Each read of mpv's title, tags, chapters, A-B loop, full screen state, window scale, rotation or configured options takes what mpv reported and returns before mpv is asked, then does what the site was asked",
+        arguments: ReportedValueRequest.allCases)
+  func reportedValueDoesNotWait(_ request: ReportedValueRequest) async throws {
+    switch request {
+    case .openWithConfiguredOptions, .frameFromGeometry:
+      try await Self.checkConfiguredOptions(request)
+    default:
+      try await Self.withPlayer { player, folder in
+        try await Self.checkReportedValueRequest(request, player: player, folder: folder)
+      }
+    }
+  }
+
+  /// Make `request` while the core of the `mpv` it reads is held, or for the title bar while `Utility.workspaceQueue` is held,
+  /// expecting it to return before `mpv` or the file system answers, then let the core or the queue go and expect the site to have done
+  /// what it was asked.
+  /// - Parameter player: The player playing `b.mp4` of `folder`.
+  private static func checkReportedValueRequest(_ request: ReportedValueRequest, player: PlayerCore, folder: URL) async throws {
+    let mpv: MPVController = player.mpv
+    let window: MainWindowController = player.mainWindow
+    let miniPlayer: MiniPlayerWindowController = player.miniPlayer
+    // A title the file does not have, which mpv reports as the media title once it is forced, so that a site showing it shows the title
+    // mpv reported.
+    let title = "iinaTests-\(UUID().uuidString)"
+    mpv.setString(MPVOption.Miscellaneous.forceMediaTitle, title)
+    try await waitUntil { player.info.mediaTitle == title }
+    let defaults = UserDefaults.standard
+    let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    func withSetting(_ key: Preference.Key, _ value: Any) {
+      defaults.setVolatileDomain(defaults.volatileDomain(forName: UserDefaults.argumentDomain).merging([key.rawValue: value]) { $1 },
+                                 forName: UserDefaults.argumentDomain)
+    }
+    defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+    func pluginInstance() throws -> JavascriptPluginInstance {
+      // A plugin's script is read when its instance is made, so the instance is made before the core is held. The plugin is kept,
+      // since its instance holds it weakly and reads it when the instance is let go.
+      let plugin = try makePlugin(in: folder)
+      keptPlugins.append(plugin)
+      return JavascriptPluginInstance(player: player, plugin: plugin)
+    }
+    let ask: () -> Void
+    let applied: () -> Bool
+    var cleanUp: () async throws -> Void = {}
+    var held = player
+    switch request {
+    case .titleBar:
+      // The name and icon of a local file are read off the main thread, so the title stays as it was until the queue reading them is
+      // let go.
+      let titleBar = try #require(window.titleBarView)
+      let field = try #require(titleBar.titleTextField)
+      field.stringValue = ""
+      let hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+      titleBar.updateTitle()
+      let returnedWhileHeld = !hold.limitPassed && field.stringValue.isEmpty
+      hold.release()
+      #expect(returnedWhileHeld, "Showing the title bar's title waited for the file system")
+      let path = try #require(player.info.currentURL).path
+      try await waitUntil { field.stringValue == FileManager.default.displayName(atPath: path) && titleBar.docIcon.image != nil }
+      return
+    case .mediaTitle:
+      var read = ""
+      ask = { read = player.getMediaTitle() }
+      applied = { read == title }
+    case .windowTitle:
+      // The window shows the media title of a stream read over the network.
+      player.info.isNetworkResource = true
+      cleanUp = {
+        player.info.isNetworkResource = false
+        window.updateTitle()
+      }
+      ask = { window.updateTitle() }
+      applied = { window.window?.title == title && window.titleBarView.titleTextField.stringValue == title }
+    case .jsTitle:
+      let instance = try pluginInstance()
+      var read: String?
+      ask = { read = instance.js.evaluateScript("iina.core.status.title")?.toString() }
+      applied = { read == title }
+    case .nowPlaying, .trackListChanged:
+      // Now Playing is given the title at once while the time is kept up to date.
+      withSetting(.enableNowPlayingArtwork, false)
+      let useSystemMediaControl = RemoteCommandController.useSystemMediaControl
+      RemoteCommandController.useSystemMediaControl = true
+      PlayerCore.lastActive = player
+      if player.syncUITimer?.isValid != true {
+        player.syncUITimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: false) { _ in }
+      }
+      cleanUp = {
+        player.syncUITimer?.invalidate()
+        RemoteCommandController.useSystemMediaControl = useSystemMediaControl
+      }
+      let center = MPNowPlayingInfoCenter.default()
+      center.nowPlayingInfo = [MPMediaItemPropertyTitle: ""]
+      if request == .nowPlaying {
+        ask = { NowPlayingInfoManager.shared.updateInfo(withTitle: true) }
+      } else {
+        let trackList = player.readTrackList(), selectedTracks = player.readSelectedTracks()
+        ask = { player.trackListChanged(trackList, selectedTracks) }
+      }
+      applied = { center.nowPlayingInfo?[MPMediaItemPropertyTitle] as? String == title }
+    case .musicMetadata:
+      var read: (title: String, album: String, artist: String)?
+      ask = { read = player.getMusicMetadata() }
+      // The test files have no tags.
+      applied = { read.map { $0.title == title && $0.album.isEmpty && $0.artist.isEmpty } ?? false }
+    case .miniPlayerTitle:
+      _ = miniPlayer.window
+      miniPlayer.titleLabel.stringValue = ""
+      ask = { miniPlayer.updateTitle() }
+      applied = { miniPlayer.titleLabel.stringValue == title }
+    case .toolBarMusicMode, .commandMusicMode, .menuMusicMode:
+      let button = NSButton()
+      button.tag = Preference.ToolBarButton.musicMode.rawValue
+      ask = request == .toolBarMusicMode ? { window.toolBarButtonAction(button) }
+        : request == .commandMusicMode ? { window.handleIINACommand(.toggleMusicMode) } : { window.menuSwitchToMiniPlayer(.dummy) }
+      applied = { player.isInMiniPlayer && miniPlayer.titleLabel.stringValue == title }
+      cleanUp = {
+        player.switchBackFromMiniPlayer()
+        try await waitUntil { !player.isInMiniPlayer }
+      }
+    case .miniPlayerBack, .miniPlayerCommand:
+      player.switchToMiniPlayer()
+      try await waitUntil { player.isInMiniPlayer }
+      // The window shown again shows the media title of a stream read over the network.
+      player.info.isNetworkResource = true
+      cleanUp = {
+        player.info.isNetworkResource = false
+        window.updateTitle()
+      }
+      ask = request == .miniPlayerBack ? { miniPlayer.backBtnAction(NSButton()) } : { miniPlayer.handleIINACommand(.toggleMusicMode) }
+      applied = { !player.isInMiniPlayer && window.window?.isVisible == true && window.window?.title == title }
+    case .fullscreenChanged:
+      // Legacy full screen is entered in the window itself, without the space AppKit's full screen makes.
+      withSetting(.useLegacyFullScreen, true)
+      ask = { player.fullscreenChanged(true) }
+      applied = { window.fsState.isFullscreen }
+      func inFullScreen() -> Bool {
+        if case .fullscreen = window.fsState { return true }
+        return false
+      }
+      cleanUp = {
+        try await waitUntil(inFullScreen)
+        window.toggleWindowFullScreen()
+        try await waitUntil { window.fsState == .windowed }
+      }
+    case .windowScaleChanged:
+      // The file is 64 by 48 pixels, so the window is at its least size before the scale is asked for and larger after.
+      let before = try #require(window.window).frame
+      ask = { player.windowScaleChanged(10) }
+      applied = { (window.window?.frame.width ?? 0) > before.width + 1 }
+    case .abLoopA, .abLoopB, .abLoopActive, .playbackMenu:
+      // The menu shows the active player, the player of the main window or else the first player.
+      let looping = request == .playbackMenu ? PlayerCore.active : player
+      held = looping
+      // Both loop points are set, which mpv reports.
+      looping.mpv.setDouble(MPVOption.PlaybackControl.abLoopA, 1)
+      looping.mpv.setDouble(MPVOption.PlaybackControl.abLoopB, 2)
+      try await waitUntil { looping.info.abLoopA == 1 && looping.info.abLoopB == 2 }
+      cleanUp = {
+        looping.mpv.setString(MPVOption.PlaybackControl.abLoopA, "no")
+        looping.mpv.setString(MPVOption.PlaybackControl.abLoopB, "no")
+      }
+      switch request {
+      case .abLoopA, .abLoopB:
+        var read = 0.0
+        ask = request == .abLoopA ? { read = player.abLoopA } : { read = player.abLoopB }
+        applied = { read == (request == .abLoopA ? 1 : 2) }
+      case .abLoopActive:
+        var read = false
+        ask = { read = player.isABLoopActive }
+        applied = { read }
+      default:
+        let menuController = try #require(AppDelegate.shared.menuController)
+        menuController.abLoop.state = .off
+        ask = { menuController.menuWillOpen(menuController.playbackMenu) }
+        applied = { menuController.abLoop.state == .on }
+      }
+    case .jsChapters:
+      // The test files have no chapters, so the player is given one, as if mpv had reported it.
+      player.info.chapters = [MPVChapter(title: "iinaTests", startTime: 2, index: 0)]
+      let instance = try pluginInstance()
+      var read: [Any]?
+      ask = { read = instance.js.evaluateScript("iina.core.getChapters()")?.toArray() }
+      applied = { (read?.first as? [String: Any])?["title"] as? String == "iinaTests" }
+    case .rotation:
+      var read = -1
+      ask = { read = window.rotation }
+      applied = { read == player.info.videoParamsRotation }
+    case .openWithConfiguredOptions, .frameFromGeometry:
+      Issue.record("\(request) is checked in a player of its own")
+      return
+    }
+    let returnedWhileHeld = try await returnsWhileHeld(held, ask)
+    #expect(returnedWhileHeld, "Asking for \(request) waited for mpv")
+    try await waitUntil(applied)
+    try await cleanUp()
+  }
+
+  /// Open `b.mp4` of a new folder in a new player whose mpv is configured to ignore paths in watch later files and to size windows by a
+  /// geometry, then ask `request` while the core of its `mpv` is held, expecting it to return before `mpv` answers, let the core go and
+  /// expect the options `mpv` answered to have been used.
+  ///
+  /// For `openWithConfiguredOptions` the core is held from just after `mpv` is initialized until the open has reached the main thread.
+  private static func checkConfiguredOptions(_ request: ReportedValueRequest) async throws {
+    let defaults = UserDefaults.standard
+    let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    let options = [[MPVOption.WatchLater.ignorePathInWatchLaterConfig, "yes"], [MPVOption.Window.geometry, "50%x50%"]]
+    let configured: [String: Any] = [Preference.Key.enableAdvancedSettings.rawValue: true,
+                                     Preference.Key.userOptions.rawValue: options]
+    defaults.setVolatileDomain(arguments.merging(settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+    let folder = try makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let url = folder.appendingPathComponent("b.mp4")
+
+    let player = PlayerCore()
+    // Like PlayerCore.createPlayerCore, label the player before it logs anything, since its log subsystem is named after it.
+    player.label = "iinaTests-playback-\(playerCount)"
+    playerCount += 1
+    player.startMPV()
+    current = player
+    defer { current = nil }
+    // The window is loaded before the core is held, so that the open is all that is asked while it is held.
+    _ = player.mainWindow.window
+    if request == .openWithConfiguredOptions {
+      let hold = try MPVCoreHold(player.mpv, limit: holdLimit)
+      player.openURL(url)
+      // The player is told of the file on the main thread, once the open has made its URL off it.
+      try await waitUntil { player.info.currentURL != nil || hold.hasLetGo }
+      let openedWhileHeld = !hold.hasLetGo
+      hold.release()
+      try await waitUntil { hold.hasLetGo }
+      #expect(openedWhileHeld, "Opening a file in a new player waited for mpv")
+    } else {
+      player.openURL(url)
+    }
+    do {
+      try await waitUntil { player.info.state == .paused && player.mpv.getInt(MPVProperty.playlistCount) == 3 }
+      #expect(player.ignorePathInWatchLaterConfig)
+      #expect(player.info.mpvMd5 == Utility.mpvWatchLaterMd5(url, true))
+      if request == .frameFromGeometry {
+        try await checkFrameFromGeometry(player)
+      }
+    } catch {
+      player.mainWindow.close()
+      throw error
+    }
+    player.mainWindow.close()
+    try await waitUntil { player.info.state == .idle }
+  }
+
+  /// Size the window of `player` by the geometry option while the core of its `mpv` is held, expecting the size to be worked out
+  /// before `mpv` answers, then let the core go and expect the size to be the half of the screen the geometry asks for.
+  private static func checkFrameFromGeometry(_ player: PlayerCore) async throws {
+    let window: MainWindowController = player.mainWindow
+    // The geometry is read when a window sizes itself for the first time, so the window is made to read it again.
+    window.cachedGeometry = nil
+    var frame: NSRect?
+    let returnedWhileHeld = try await returnsWhileHeld(player) {
+      frame = window.windowFrameFromGeometry(newSize: NSSize(width: 64, height: 48))
+    }
+    #expect(returnedWhileHeld, "Sizing the window by the geometry option waited for mpv")
+    let screen = try #require(window.window?.screen).visibleFrame
+    // The geometry asks for half the screen's width and height, of which the window keeps the file's aspect.
+    let sized = try #require(frame)
+    #expect(abs(sized.width - screen.width / 2) < 1 || abs(sized.height - screen.height / 2) < 1)
+  }
+
   /// Plugins whose instances a test makes, kept for as long as the instances may read them.
   private static var keptPlugins: [JavascriptPlugin] = []
 
