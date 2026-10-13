@@ -1618,6 +1618,182 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A request the app, the settings, the system or a plugin makes of a player: each is a site that must not wait for `mpv` on the
+  /// main thread.
+  enum AppRequest: String, CaseIterable, Sendable {
+    case fullScreenState, preferenceOptions, spdif, urlScheme, externalAudio, mouseResetSpeed, menuTogglePause, remotePlaybackRate
+    case jsSpeed, jsChapter, jsAudioDelay, jsSubDelay, jsVolume, jsMute, jsLoadTrack
+  }
+
+  @Test("Each request the app, the settings, the system or a plugin makes of a player asks mpv in a request that returns before mpv handles it",
+        arguments: AppRequest.allCases)
+  func appRequestDoesNotWait(_ request: AppRequest) async throws {
+    try await Self.withPlayer { player, folder in
+      player.syncUITimer?.invalidate()
+      let mpv: MPVController = player.mpv
+      let window: MainWindowController = player.mainWindow
+      // A plugin's script is read when its instance is made, so the instance is made before the core is held. The plugin is kept,
+      // since its instance holds it weakly and reads it when the instance is let go.
+      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      func script(_ source: String) -> () -> Void {
+        { _ = instance.js.evaluateScript(source) }
+      }
+      let ask: () -> Void
+      let applied: () -> Bool
+      var cleanUp: () -> Void = {}
+      var held = player
+      var opened: [PlayerCore] = []
+      switch request {
+      case .fullScreenState:
+        // The state is set as the window sets it once it is in full screen, so the flag mpv then reports is the state of the window.
+        let frame = try #require(window.window).frame
+        ask = { window.fsState = .fullscreen(legacy: false, priorWindowedFrame: frame) }
+        applied = { mpv.getFlag(MPVOption.Window.fullscreen) }
+      case .preferenceOptions:
+        // The settings are changed in the argument domain, and mpv is told of each as it is told when a setting changes.
+        let defaults = UserDefaults.standard
+        let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        let settings: [Preference.Key: Any] = [.subMarginY: 40, .subBlur: 0.5, .subItalic: true, .subLang: "fr",
+                                               .subTextColorString: "1.0/0.0/0.0/1.0",
+                                               .subAlignX: Preference.SubAlignX.left.rawValue]
+        defaults.setVolatileDomain(arguments.merging(settings.map { ($0.key.rawValue, $0.value) }) { $1 },
+                                   forName: UserDefaults.argumentDomain)
+        cleanUp = { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+        let color = mpv.getString(MPVOption.Subtitles.subColor)
+        ask = {
+          for key in settings.keys {
+            mpv.observeValue(forKeyPath: key.rawValue, of: defaults, change: [.oldKey: 0, .newKey: 1], context: nil)
+          }
+        }
+        applied = {
+          mpv.getInt(MPVOption.Subtitles.subMarginY) == 40 && abs(mpv.getDouble(MPVOption.Subtitles.subBlur) - 0.5) < 0.001
+            && mpv.getFlag(MPVOption.Subtitles.subItalic) && mpv.getString(MPVOption.TrackSelection.slang) == "fr"
+            && mpv.getString(MPVOption.Subtitles.subColor) != color && mpv.getString(MPVOption.Subtitles.subAlignX) == "left"
+        }
+      case .spdif:
+        // The settings ask every player, among which the player is put for the request.
+        let codec = PrefCodecViewController()
+        _ = codec.view
+        let buttons: [NSButton] = [codec.spdifAC3Btn, codec.spdifDTSBtn, codec.spdifDTSHDBtn]
+        buttons.forEach { $0.state = .off }
+        codec.spdifAC3Btn.state = .on
+        PlayerCore.playerCores.append(player)
+        cleanUp = {
+          PlayerCore.playerCores.removeAll { $0 === player }
+          buttons.forEach { $0.state = .off }
+          codec.spdifBtnAction(codec.spdifAC3Btn)
+        }
+        ask = { codec.spdifBtnAction(codec.spdifAC3Btn) }
+        applied = { mpv.getString(MPVOption.Audio.audioSpdif) == "ac3" }
+      case .urlScheme:
+        // The link opens its file in a new window, whose player is the idle player whose core is held, and sets an mpv option on it.
+        let target = PlayerCore.newPlayerCore
+        held = target
+        opened = [target]
+        let file = folder.appendingPathComponent("a.mp4")
+        var link = URLComponents()
+        link.scheme = "iina"
+        link.host = "open"
+        link.queryItems = [URLQueryItem(name: "url", value: file.path), URLQueryItem(name: "new_window", value: "1"),
+                           URLQueryItem(name: "mpv_slang", value: "fr")]
+        let event = NSAppleEventDescriptor(eventClass: AEEventClass(kInternetEventClass), eventID: AEEventID(kAEGetURL),
+                                           targetDescriptor: nil, returnID: AEReturnID(kAutoGenerateReturnID),
+                                           transactionID: AETransactionID(kAnyTransactionID))
+        event.setParam(NSAppleEventDescriptor(string: try #require(link.string)), forKeyword: keyDirectObject)
+        ask = { AppDelegate.shared.handleURLEvent(event: event, withReplyEvent: NSAppleEventDescriptor.null()) }
+        applied = {
+          target.info.currentURL?.path == file.path && target.info.state == .paused && !target.info.pausedForLoading
+            && target.mpv.getString(MPVOption.TrackSelection.slang) == "fr"
+        }
+      case .externalAudio, .jsLoadTrack:
+        let audio = try Self.writeSilence("d", in: folder)
+        let tracks = player.info.audioTracks.count
+        ask = request == .externalAudio ? { player.loadExternalAudioFile(audio) }
+          : script("iina.core.audio.loadTrack(\"\(audio.path)\")")
+        applied = { player.info.audioTracks.count > tracks }
+      case .mouseResetSpeed, .menuTogglePause:
+        // Resetting the speed, and pausing or resuming while fast-forwarding, return the speed to normal.
+        mpv.setDouble(MPVOption.PlaybackControl.speed, 2)
+        try await Self.waitUntil { player.info.playSpeed == 2 }
+        if request == .mouseResetSpeed {
+          ask = { window.performMouseAction(.resetSpeed) }
+        } else {
+          window.isFastforwarding = true
+          let handler = MainMenuActionHandler(playerCore: player)
+          ask = { handler.menuTogglePause(NSMenuItem()) }
+        }
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 1 }
+      case .remotePlaybackRate:
+        // The command asks the last active player.
+        let lastActive = PlayerCore.lastActive
+        PlayerCore.lastActive = player
+        cleanUp = { PlayerCore.lastActive = lastActive }
+        ask = { RemoteCommandController.changePlaybackRate(1.5) }
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 1.5 }
+      case .jsSpeed:
+        ask = script("iina.core.setSpeed(2)")
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 2 }
+      case .jsChapter:
+        // The test files have no chapters, so the player is given one starting 2 s in, which playing the chapter seeks to.
+        player.info.chapters = [MPVChapter(title: "iinaTests", startTime: 2, index: 0)]
+        ask = script("iina.core.playChapterWithIndex(0)")
+        applied = { mpv.getDouble(MPVProperty.timePos) >= 1.9 }
+      case .jsAudioDelay:
+        ask = script("iina.core.audio.delay = 0.5")
+        applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0.5 }
+      case .jsSubDelay:
+        ask = script("iina.core.subtitle.delay = 0.5")
+        applied = { mpv.getDouble(MPVOption.Subtitles.subDelay) == 0.5 }
+      case .jsVolume:
+        // A step toward the middle of the range, so that the volume asked for is not clamped.
+        let volume = player.info.volume + (player.info.volume >= 50 ? -10 : 10)
+        ask = script("iina.core.audio.volume = \(volume)")
+        applied = { mpv.getDouble(MPVOption.Audio.volume) == volume }
+      case .jsMute:
+        ask = script("iina.core.audio.muted = true")
+        applied = { mpv.getFlag(MPVOption.Audio.mute) }
+      }
+      defer { cleanUp() }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(held, ask)
+      #expect(returnedWhileHeld, "Asking for \(request) waited for mpv")
+      try await Self.waitUntil(applied)
+      try await Self.close(opened)
+    }
+  }
+
+  /// Plugins whose instances a test makes, kept for as long as the instances may read them.
+  private static var keptPlugins: [JavascriptPlugin] = []
+
+  /// Write `<name>.wav`, a second of silence, in `folder`.
+  /// - Returns: The file written.
+  private static func writeSilence(_ name: String, in folder: URL) throws -> URL {
+    let rate: UInt32 = 8000
+    let samples = Data(count: Int(rate) * 2)
+    var data = Data()
+    func append<T: FixedWidthInteger>(_ value: T) {
+      withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+    }
+    data.append(contentsOf: Array("RIFF".utf8))
+    append(UInt32(36 + samples.count))
+    data.append(contentsOf: Array("WAVEfmt ".utf8))
+    // 16-bit mono PCM.
+    append(UInt32(16))
+    append(UInt16(1))
+    append(UInt16(1))
+    append(rate)
+    append(rate * 2)
+    append(UInt16(2))
+    append(UInt16(16))
+    data.append(contentsOf: Array("data".utf8))
+    append(UInt32(samples.count))
+    data.append(samples)
+    let file = folder.appendingPathComponent("\(name).wav")
+    try data.write(to: file)
+    return file
+  }
+
   @Test("A request the player makes without waiting is answered only once the core MPVCoreHold holds is let go")
   func coreHoldDefersAnswers() async throws {
     try await Self.withPlayer { player, _ in
@@ -1765,12 +1941,12 @@ struct PlayerPlaybackTests {
     }
   }
 
-  /// A plugin in `folder` whose script does nothing, in whose context a test evaluates scripts.
-  private static func makePlugin(in folder: URL) throws -> JavascriptPlugin {
+  /// A plugin in `folder` with `permissions` whose script does nothing, in whose context a test evaluates scripts.
+  private static func makePlugin(in folder: URL, permissions: [String] = []) throws -> JavascriptPlugin {
     let root = folder.appendingPathComponent("iinaTests-plugin")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let info: [String: Any] = ["name": "iinaTests", "author": ["name": "iinaTests"], "identifier": "io.iina.tests",
-                               "version": "1.0", "entry": "main.js"]
+                               "version": "1.0", "entry": "main.js", "permissions": permissions]
     try JSONSerialization.data(withJSONObject: info).write(to: root.appendingPathComponent("Info.json"))
     try Data().write(to: root.appendingPathComponent("main.js"))
     return try #require(JavascriptPlugin(filename: root.lastPathComponent, externalURL: root))
