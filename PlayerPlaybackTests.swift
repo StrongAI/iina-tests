@@ -1167,6 +1167,148 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A setting a player, or a menu item of its window, asks `mpv` for: each is a site that must not wait for `mpv` on the main thread.
+  enum SettingRequest: String, CaseIterable, Sendable {
+    case mute, volume, speed, aspect, rotation, deinterlace, hardwareDecoding, equalizer, audioDelay, subDelay, secondSubDelay
+    case subVisibility, secondSubVisibility, subScale, subPos, secondSubPos, subColor, subFontSize, subBold, subOutlineColor
+    case subOutlineSize, subBackColor, subEncoding, subFont, audioDevice, frameStep, shuffle, externalVideo, chapter
+    case menuSpeed, menuVolume, menuMute, menuAudioDelay, menuResetAudioDelay, menuSubDelay, menuResetSubDelay, menuSubScale
+    case menuDeinterlace, menuAspect, menuRotation, menuSubVisibility, menuSecondSubVisibility, menuStepFrame, menuNextChapter
+    case menuPreviousChapter, menuCycleVideo
+  }
+
+  @Test("Each setting a player or its window's menu asks of mpv is asked in a request that returns before mpv handles it",
+        arguments: SettingRequest.allCases)
+  func settingDoesNotWait(_ request: SettingRequest) async throws {
+    try await Self.withPlayer { player, folder in
+      player.syncUITimer?.invalidate()
+      let mpv: MPVController = player.mpv
+      let handler = MainMenuActionHandler(playerCore: player)
+      func item(_ representedObject: Any? = nil, tag: Int = 0) -> NSMenuItem {
+        let item = NSMenuItem()
+        item.representedObject = representedObject
+        item.tag = tag
+        return item
+      }
+      func color(_ name: String) -> String? { mpv.getString("options/" + name) }
+      let before = (position: mpv.getDouble(MPVProperty.timePos), subColor: color(MPVOption.Subtitles.subColor),
+                    outlineColor: color(MPVOption.Subtitles.subOutlineColor), backColor: color(MPVOption.Subtitles.subBackColor),
+                    videoTracks: player.info.videoTracks.count)
+      let ask: () -> Void
+      let applied: () -> Bool
+      switch request {
+      case .mute, .menuMute:
+        ask = request == .mute ? { player.toggleMute() } : { handler.menuToggleMute(item()) }
+        applied = { mpv.getFlag(MPVOption.Audio.mute) }
+      case .volume, .menuVolume:
+        // A step toward the middle of the range, so that the volume asked for is not clamped.
+        let step = player.info.volume >= 50 ? -10 : 10
+        let volume = player.info.volume + Double(step)
+        ask = request == .volume ? { player.setVolume(volume) } : { handler.menuChangeVolume(item(step)) }
+        applied = { mpv.getDouble(MPVOption.Audio.volume) == volume }
+      case .speed, .menuSpeed:
+        ask = request == .speed ? { player.setSpeed(2) } : { handler.menuChangeSpeed(item(2.0)) }
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 2 }
+      case .aspect, .menuAspect:
+        ask = request == .aspect ? { player.setVideoAspect("16:9") } : { handler.menuChangeAspect(item("16:9")) }
+        applied = { abs(mpv.getDouble(MPVOption.Video.videoAspectOverride) - 16 / 9) < 0.01 }
+      case .rotation, .menuRotation:
+        ask = request == .rotation ? { player.setVideoRotate(90) } : { handler.menuChangeRotation(item(90)) }
+        applied = { mpv.getInt(MPVOption.Video.videoRotate) == 90 }
+      case .deinterlace, .menuDeinterlace:
+        ask = request == .deinterlace ? { player.toggleDeinterlace(true) } : { handler.menuToggleDeinterlace(item()) }
+        applied = { mpv.getFlag(MPVOption.Video.deinterlace) }
+      case .hardwareDecoding:
+        ask = { player.toggleHardwareDecoding(false) }
+        applied = { mpv.getString(MPVOption.Video.hwdec) == "no" }
+      case .equalizer:
+        ask = { player.setVideoEqualizer(forOption: .brightness, value: 10) }
+        applied = { mpv.getInt(MPVOption.Equalizer.brightness) == 10 }
+      case .audioDelay, .menuAudioDelay:
+        ask = request == .audioDelay ? { player.setAudioDelay(0.5) } : { handler.menuChangeAudioDelay(item(0.5)) }
+        applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0.5 }
+      case .menuResetAudioDelay:
+        mpv.setDouble(MPVOption.Audio.audioDelay, 0.5)
+        ask = { handler.menuResetAudioDelay(item()) }
+        applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0 }
+      case .subDelay, .menuSubDelay:
+        ask = request == .subDelay ? { player.setSubDelay(0.5) } : { handler.menuChangeSubDelay(item(0.5)) }
+        applied = { mpv.getDouble(MPVOption.Subtitles.subDelay) == 0.5 }
+      case .menuResetSubDelay:
+        mpv.setDouble(MPVOption.Subtitles.subDelay, 0.5)
+        ask = { handler.menuResetSubDelay(item()) }
+        applied = { mpv.getDouble(MPVOption.Subtitles.subDelay) == 0 }
+      case .secondSubDelay:
+        ask = { player.setSubDelay(0.5, forPrimary: false) }
+        applied = { mpv.getDouble(MPVOption.Subtitles.secondarySubDelay) == 0.5 }
+      case .subVisibility, .menuSubVisibility:
+        ask = request == .subVisibility ? { player.toggleSubVisibility(false) } : { handler.menuToggleSubVisibility(item()) }
+        applied = { !mpv.getFlag(MPVOption.Subtitles.subVisibility) }
+      case .secondSubVisibility, .menuSecondSubVisibility:
+        ask = request == .secondSubVisibility ? { player.toggleSecondSubVisibility(false) }
+          : { handler.menuToggleSecondSubVisibility(item()) }
+        applied = { !mpv.getFlag(MPVOption.Subtitles.secondarySubVisibility) }
+      case .subScale, .menuSubScale:
+        ask = request == .subScale ? { player.setSubScale(1.1) } : { handler.menuChangeSubScale(item(tag: 1)) }
+        applied = { abs(mpv.getDouble(MPVOption.Subtitles.subScale) - 1.1) < 0.001 }
+      case .subPos:
+        ask = { player.setSubPos(80) }
+        applied = { mpv.getInt(MPVOption.Subtitles.subPos) == 80 }
+      case .secondSubPos:
+        ask = { player.setSubPos(80, forPrimary: false) }
+        applied = { mpv.getInt(MPVOption.Subtitles.secondarySubPos) == 80 }
+      case .subColor:
+        ask = { player.setSubTextColor(NSColor.red.mpvColorString) }
+        applied = { color(MPVOption.Subtitles.subColor) != before.subColor }
+      case .subFontSize:
+        ask = { player.setSubTextSize(60) }
+        applied = { mpv.getDouble("options/" + MPVOption.Subtitles.subFontSize) == 60 }
+      case .subBold:
+        ask = { player.setSubTextBold(true) }
+        applied = { mpv.getFlag("options/" + MPVOption.Subtitles.subBold) }
+      case .subOutlineColor:
+        ask = { player.setSubTextBorderColor(NSColor.red.mpvColorString) }
+        applied = { color(MPVOption.Subtitles.subOutlineColor) != before.outlineColor }
+      case .subOutlineSize:
+        ask = { player.setSubTextBorderSize(4) }
+        applied = { mpv.getDouble("options/" + MPVOption.Subtitles.subOutlineSize) == 4 }
+      case .subBackColor:
+        ask = { player.setSubTextBgColor(NSColor.red.mpvColorString) }
+        applied = { color(MPVOption.Subtitles.subBackColor) != before.backColor }
+      case .subEncoding:
+        ask = { player.setSubEncoding("cp1252") }
+        applied = { mpv.getString(MPVOption.Subtitles.subCodepage) == "cp1252" }
+      case .subFont:
+        ask = { player.setSubFont("Helvetica") }
+        applied = { mpv.getString(MPVOption.Subtitles.subFont) == "Helvetica" }
+      case .audioDevice:
+        let device = player.getAudioDevices().last?.name ?? "auto"
+        ask = { player.setAudioDevice(device) }
+        applied = { mpv.getString(MPVProperty.audioDevice) == device }
+      case .frameStep, .menuStepFrame:
+        ask = request == .frameStep ? { player.frameStep(backwards: false) } : { handler.menuStepFrame(item(tag: 0)) }
+        applied = { mpv.getDouble(MPVProperty.timePos) > before.position }
+      case .shuffle:
+        ask = { player.toggleShuffle() }
+        applied = { player.info.isShuffled }
+      case .externalVideo:
+        ask = { player.loadExternalVideoFile(folder.appendingPathComponent("a.mp4")) }
+        applied = { player.info.videoTracks.count > before.videoTracks }
+      case .chapter, .menuNextChapter, .menuPreviousChapter:
+        // The test files have no chapters, so the request changes nothing; only that it does not wait is checked.
+        ask = request == .chapter ? { _ = player.playChapter(0) } : request == .menuNextChapter
+          ? { handler.menuNextChapter(item()) } : { handler.menuPreviousChapter(item()) }
+        applied = { true }
+      case .menuCycleVideo:
+        ask = { handler.menuCycleTrack(item(tag: 0)) }
+        applied = { mpv.getString(MPVOption.TrackSelection.vid) == "no" }
+      }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player, ask)
+      #expect(returnedWhileHeld, "Asking for \(request) waited for mpv")
+      try await Self.waitUntil(applied)
+    }
+  }
+
   @Test("A request the player makes without waiting is answered only once the core MPVCoreHold holds is let go")
   func coreHoldDefersAnswers() async throws {
     try await Self.withPlayer { player, _ in
