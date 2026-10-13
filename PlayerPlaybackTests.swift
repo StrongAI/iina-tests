@@ -1313,6 +1313,311 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// Views made in a test that observe their player without keeping themselves, kept for as long as the player may notify them.
+  private static var keptViews: [NSView] = []
+
+  /// Keep `view` for as long as its player may notify it.
+  private static func kept<View: NSView>(_ view: View) -> View {
+    keptViews.append(view)
+    return view
+  }
+
+  /// The views of type `T` under `view`, in the order of the view tree.
+  private static func views<T: NSView>(_ type: T.Type, under view: NSView) -> [T] {
+    view.subviews.flatMap { subview -> [T] in ((subview as? T).map { [$0] } ?? []) + views(type, under: subview) }
+  }
+
+  /// The controls of type `T` under `view` that send the action named `action`, such as `"scaleAction:"`, to their target.
+  private static func controls<T: NSControl>(_ type: T.Type, sending action: String, under view: NSView) -> [T] {
+    views(type, under: view).filter { $0.action == NSSelectorFromString(action) }
+  }
+
+  /// The slider view under `view` that is updated when the player posts `name`.
+  private static func sliderView(notifiedBy name: Notification.Name, under view: NSView) throws -> SidebarSliderView {
+    try #require(views(SidebarSliderView.self, under: view).first(where: { $0.notificationKey == name }))
+  }
+
+  /// Send the action of `control` to its target, as a click on it does.
+  private static func send(_ control: NSControl) {
+    _ = control.sendAction(control.action, to: control.target)
+  }
+
+  /// A control of a player's window, sidebar or menu that asks `mpv` for a setting, or a view that shows a setting: each is a site
+  /// that must not wait for `mpv` on the main thread.
+  enum ControlRequest: String, CaseIterable, Sendable {
+    case menuAudioDevice, playButton, arrowButton, volumeSlider, muteButton, shuffleButton, subVisibilitySwitch
+    case secondSubVisibilitySwitch, subPosSlider, subScaleReset, subScaleSlider, subFontSizePicker, subBorderSizePicker
+    case subTextColorWell, subBackColorWell, subBorderColorWell, aspectSegment, rotationSegment, hwdecSwitch, speedEdit
+    case speedReset, videoEqualizerReset, videoEqualizerSlider, audioDelayEdit, audioDelayReset, subDelayEdit, subDelayReset
+    case audioDelayShown, subDelayShown, subPosShown, subScaleShown, subTextStyleShown, speedShown, osdChapterShown
+    case menuSubFont, chooseSubFont, subFontButton
+  }
+
+  @Test("Each control of a player's window, sidebar or menu asks mpv in a request that returns before mpv handles it, and each view of a setting shows what mpv has without waiting for it",
+        arguments: ControlRequest.allCases)
+  func controlDoesNotWait(_ request: ControlRequest) async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      let mpv: MPVController = player.mpv
+      let window: MainWindowController = player.mainWindow
+      func item(_ representedObject: Any? = nil) -> NSMenuItem {
+        let item = NSMenuItem()
+        item.representedObject = representedObject
+        return item
+      }
+      func color(_ name: String) -> String? { mpv.getString("options/" + name) }
+      let ask: () -> Void
+      let applied: () -> Bool
+      var cleanUp: () -> Void = {}
+      var held = player
+      switch request {
+      case .menuAudioDevice:
+        // The menu asks the active player, which is the player of the main window or else the first player, so its core is held.
+        let active = PlayerCore.active
+        held = active
+        let device = active.getAudioDevices().last?.name ?? "auto"
+        ask = { AppDelegate.shared.menuSelectAudioDevice(item(device)) }
+        applied = { active.mpv.getString(MPVProperty.audioDevice) == device }
+      case .playButton:
+        // Playing while fast-forwarding returns the speed to normal.
+        mpv.setDouble(MPVOption.PlaybackControl.speed, 2)
+        try await Self.waitUntil { player.info.playSpeed == 2 }
+        window.isFastforwarding = true
+        ask = { window.playButtonAction(NSButton()) }
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 1 }
+      case .arrowButton:
+        // The window is told that the arrow buttons change the speed, as it is when the setting changes, and the right button asks
+        // for the speed after normal.
+        window.observeValue(forKeyPath: Preference.Key.arrowButtonAction.rawValue, of: UserDefaults.standard,
+                            change: [.newKey: Preference.ArrowButtonAction.speed.rawValue], context: nil)
+        window.speedValueIndex = AppData.availableSpeedValues.count / 2 + 1
+        let speed = AppData.availableSpeedValues[window.speedValueIndex]
+        ask = { window.arrowButtonAction(left: false) }
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == speed }
+      case .volumeSlider:
+        // A step toward the middle of the range, so that the volume asked for is not clamped.
+        let volume = player.info.volume + (player.info.volume >= 50 ? -10 : 10)
+        let slider = NSSlider(value: volume, minValue: 0, maxValue: 100, target: nil, action: nil)
+        ask = { window.volumeSliderChanges(slider) }
+        applied = { mpv.getDouble(MPVOption.Audio.volume) == volume }
+      case .muteButton:
+        ask = { window.muteButtonAction(NSButton()) }
+        applied = { mpv.getFlag(MPVOption.Audio.mute) }
+      case .shuffleButton:
+        let pane = Self.kept(SidebarPlaylistPane(player: player))
+        ask = { pane.shuffleBtnAction(NSButton()) }
+        applied = { player.info.isShuffled }
+      case .subVisibilitySwitch, .secondSubVisibilitySwitch:
+        let isPrimary = request == .subVisibilitySwitch
+        let option = isPrimary ? MPVOption.Subtitles.subVisibility : MPVOption.Subtitles.secondarySubVisibility
+        let visible = mpv.getFlag(option)
+        try await Self.waitUntil { (isPrimary ? player.info.isSubVisible : player.info.isSecondSubVisible) == visible }
+        // The switch of the primary subtitles comes first.
+        let switches = Self.controls(NSSwitch.self, sending: "switchAction:", under: Self.kept(SidebarSubtitlesPane(player: player)))
+        try #require(switches.count == 2)
+        let visibilitySwitch = switches[isPrimary ? 0 : 1]
+        ask = { Self.send(visibilitySwitch) }
+        applied = { mpv.getFlag(option) != visible }
+      case .subPosSlider:
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let slider = try #require(Self.controls(NSSlider.self, sending: "positionAction:", under: pane).first)
+        slider.intValue = 80
+        ask = { Self.send(slider) }
+        applied = { mpv.getInt(MPVOption.Subtitles.subPos) == 80 }
+      case .subScaleReset:
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let button = try #require(Self.controls(NSButton.self, sending: "scaleResetButtonAction:", under: pane).first)
+        mpv.setDouble(MPVOption.Subtitles.subScale, 2)
+        ask = { Self.send(button) }
+        applied = { abs(mpv.getDouble(MPVOption.Subtitles.subScale) - 1) < 0.001 }
+      case .subScaleSlider:
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let slider = try #require(Self.controls(NSSlider.self, sending: "scaleAction:", under: pane).first)
+        // The slider shows a scale of 2 at 1.
+        slider.doubleValue = 1
+        ask = { Self.send(slider) }
+        applied = { abs(mpv.getDouble(MPVOption.Subtitles.subScale) - 2) < 0.001 }
+      case .subFontSizePicker:
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let picker = try #require(Self.controls(NSPopUpButton.self, sending: "chooseSubFontSizeAction:", under: pane).first)
+        picker.selectItem(withTitle: "60")
+        ask = { Self.send(picker) }
+        applied = { mpv.getDouble("options/" + MPVOption.Subtitles.subFontSize) == 60 }
+      case .subBorderSizePicker:
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let picker = try #require(Self.controls(NSPopUpButton.self, sending: "chooseSubBorderSizeAction:", under: pane).first)
+        picker.selectItem(withTitle: "4")
+        ask = { Self.send(picker) }
+        applied = { mpv.getDouble("options/" + MPVOption.Subtitles.subOutlineSize) == 4 }
+      case .subTextColorWell, .subBackColorWell, .subBorderColorWell:
+        // The wells of the text, background and border colors are tagged 1, 2 and 3.
+        let tag = request == .subTextColorWell ? 1 : request == .subBackColorWell ? 2 : 3
+        let option = [MPVOption.Subtitles.subColor, MPVOption.Subtitles.subBackColor, MPVOption.Subtitles.subOutlineColor][tag - 1]
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let well = try #require(Self.controls(NSColorWell.self, sending: "colorAction:", under: pane).first(where: { $0.tag == tag }))
+        let before = color(option)
+        well.color = .red
+        ask = { Self.send(well) }
+        applied = { color(option) != before }
+      case .aspectSegment:
+        let pane = Self.kept(SidebarVideoPane(player: player))
+        let segments = try #require(Self.controls(NSSegmentedControl.self, sending: "aspectRatioAction:", under: pane).first)
+        segments.selectedSegment = try #require(AppData.aspectsInPanel.firstIndex(of: "16:9"))
+        ask = { Self.send(segments) }
+        applied = { abs(mpv.getDouble(MPVOption.Video.videoAspectOverride) - 16 / 9) < 0.01 }
+      case .rotationSegment:
+        let pane = Self.kept(SidebarVideoPane(player: player))
+        let segments = try #require(Self.controls(NSSegmentedControl.self, sending: "rotationAction:", under: pane).first)
+        segments.selectedSegment = try #require(AppData.rotations.firstIndex(of: 90))
+        ask = { Self.send(segments) }
+        applied = { mpv.getInt(MPVOption.Video.videoRotate) == 90 }
+      case .hwdecSwitch:
+        let pane = Self.kept(SidebarVideoPane(player: player))
+        let hwdecSwitch = try #require(Self.controls(NSSwitch.self, sending: "hwdecAction:", under: pane).first)
+        hwdecSwitch.state = .off
+        ask = { Self.send(hwdecSwitch) }
+        applied = { mpv.getString(MPVOption.Video.hwdec) == "no" }
+      case .speedEdit:
+        let view = try Self.sliderView(notifiedBy: .iinaSpeedChanged, under: Self.kept(SidebarVideoPane(player: player)))
+        view.input.doubleValue = 2
+        ask = { view.customEditFinishedAction() }
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 2 }
+      case .speedReset:
+        let view = try Self.sliderView(notifiedBy: .iinaSpeedChanged, under: Self.kept(SidebarVideoPane(player: player)))
+        mpv.setDouble(MPVOption.PlaybackControl.speed, 2)
+        ask = { view.resetButtonAction() }
+        applied = { mpv.getDouble(MPVOption.PlaybackControl.speed) == 1 }
+      case .videoEqualizerReset:
+        // The reset button and the slider of the brightness are tagged 1.
+        let pane = Self.kept(SidebarVideoPane(player: player))
+        let button = try #require(Self.controls(NSButton.self, sending: "resetAction:", under: pane).first(where: { $0.tag == 1 }))
+        mpv.setInt(MPVOption.Equalizer.brightness, 10)
+        ask = { Self.send(button) }
+        applied = { mpv.getInt(MPVOption.Equalizer.brightness) == 0 }
+      case .videoEqualizerSlider:
+        let pane = Self.kept(SidebarVideoPane(player: player))
+        let slider = try #require(Self.controls(NSSlider.self, sending: "sliderAction:", under: pane).first(where: { $0.tag == 1 }))
+        slider.intValue = 10
+        ask = { Self.send(slider) }
+        applied = { mpv.getInt(MPVOption.Equalizer.brightness) == 10 }
+      case .audioDelayEdit:
+        let view = try Self.sliderView(notifiedBy: .iinaAudioDelayChanged, under: Self.kept(SidebarAudioPane(player: player)))
+        view.input.doubleValue = 0.5
+        ask = { view.customEditFinishedAction() }
+        applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0.5 }
+      case .audioDelayReset:
+        let view = try Self.sliderView(notifiedBy: .iinaAudioDelayChanged, under: Self.kept(SidebarAudioPane(player: player)))
+        mpv.setDouble(MPVOption.Audio.audioDelay, 0.5)
+        ask = { view.resetButtonAction() }
+        applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0 }
+      case .subDelayEdit:
+        let view = try Self.sliderView(notifiedBy: .iinaSubDelayChanged, under: Self.kept(SidebarSubtitlesPane(player: player)))
+        view.input.doubleValue = 0.5
+        ask = { view.customEditFinishedAction() }
+        applied = { mpv.getDouble(MPVOption.Subtitles.subDelay) == 0.5 }
+      case .subDelayReset:
+        // The reset button of the subtitle delay resets the audio delay.
+        let view = try Self.sliderView(notifiedBy: .iinaSubDelayChanged, under: Self.kept(SidebarSubtitlesPane(player: player)))
+        mpv.setDouble(MPVOption.Audio.audioDelay, 0.5)
+        ask = { view.resetButtonAction() }
+        applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0 }
+      case .audioDelayShown:
+        // The view shows mpv's delay once the player has stored it, then is cleared, so that what it shows next is what the request
+        // shows.
+        let view = try Self.sliderView(notifiedBy: .iinaAudioDelayChanged, under: Self.kept(SidebarAudioPane(player: player)))
+        mpv.setDouble(MPVOption.Audio.audioDelay, 0.5)
+        try await Self.waitUntil { player.info.audioDelay == 0.5 }
+        view.input.doubleValue = 0
+        ask = { view.update() }
+        applied = { view.input.doubleValue == mpv.getDouble(MPVOption.Audio.audioDelay) }
+      case .subDelayShown:
+        let view = try Self.sliderView(notifiedBy: .iinaSubDelayChanged, under: Self.kept(SidebarSubtitlesPane(player: player)))
+        mpv.setDouble(MPVOption.Subtitles.subDelay, 0.5)
+        try await Self.waitUntil { player.info.subDelay == 0.5 }
+        view.input.doubleValue = 0
+        ask = { view.update() }
+        applied = { view.input.doubleValue == mpv.getDouble(MPVOption.Subtitles.subDelay) }
+      case .speedShown:
+        let view = try Self.sliderView(notifiedBy: .iinaSpeedChanged, under: Self.kept(SidebarVideoPane(player: player)))
+        mpv.setDouble(MPVOption.PlaybackControl.speed, 2)
+        try await Self.waitUntil { player.info.playSpeed == 2 }
+        view.input.doubleValue = 1
+        ask = { view.update() }
+        applied = { view.input.doubleValue == mpv.getDouble(MPVOption.PlaybackControl.speed) }
+      case .subPosShown:
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let slider = try #require(Self.controls(NSSlider.self, sending: "positionAction:", under: pane).first)
+        mpv.setInt(MPVOption.Subtitles.subPos, 80)
+        try await Self.waitUntil { player.info.subPos == 80 }
+        slider.intValue = 0
+        ask = { player.postNotification(.iinaSubPositionChanged) }
+        applied = { Int(slider.intValue) == mpv.getInt(MPVOption.Subtitles.subPos) }
+      case .subScaleShown:
+        // mpv does not report the font, which the view shows once mpv answers.
+        let pane = Self.kept(SidebarSubtitlesPane(player: player))
+        let slider = try #require(Self.controls(NSSlider.self, sending: "scaleAction:", under: pane).first)
+        let fontButton = try #require(Self.controls(NSButton.self, sending: "chooseSubFontAction:", under: pane).first)
+        _ = mpv.setString(MPVOption.Subtitles.subFont, "Helvetica")
+        mpv.setDouble(MPVOption.Subtitles.subScale, 2)
+        try await Self.waitUntil { player.info.subScale == 2 && fontButton.title == "Helvetica" }
+        slider.doubleValue = 0
+        fontButton.title = ""
+        ask = { player.postNotification(.iinaSubScaleChanged) }
+        // The slider shows a scale of 1 or more at 1 less.
+        applied = {
+          slider.doubleValue == mpv.getDouble(MPVOption.Subtitles.subScale) - 1
+            && fontButton.title == mpv.getString(MPVOption.Subtitles.subFont)
+        }
+      case .subTextStyleShown:
+        // The text style is shown when the view is made, so the view is made while the core is held.
+        mpv.setDouble(MPVOption.Subtitles.subFontSize, 60)
+        mpv.setDouble(MPVOption.Subtitles.subOutlineSize, 2.5)
+        var pane: NSView?
+        ask = { pane = Self.kept(SidebarSubtitlesPane(player: player)) }
+        applied = {
+          guard let pane,
+                let size = Self.controls(NSPopUpButton.self, sending: "chooseSubFontSizeAction:", under: pane).first,
+                let border = Self.controls(NSPopUpButton.self, sending: "chooseSubBorderSizeAction:", under: pane).first else {
+            return false
+          }
+          return size.titleOfSelectedItem == Int(mpv.getDouble(MPVOption.Subtitles.subFontSize)).description
+            && border.titleOfSelectedItem.flatMap { Double($0) } == mpv.getDouble(MPVOption.Subtitles.subOutlineSize)
+        }
+      case .osdChapterShown:
+        // The file has no chapters, so mpv has none as current, which the OSD of a chapter shows first, by the number of none.
+        let osd = Self.kept(OSDView(mainWindow: window))
+        ask = { osd.updateViews(fromMessage: .chapter("iinaTests"), player: player) }
+        applied = {
+          osd.secondaryLabel.stringValue.hasPrefix("(\(mpv.getInt(MPVProperty.chapter) + 1)/\(player.info.chapters.count))")
+        }
+      case .menuSubFont, .chooseSubFont, .subFontButton:
+        let picker = AppDelegate.shared.fontPicker
+        picker.finishedPicking = nil
+        switch request {
+        case .menuSubFont:
+          let handler = MainMenuActionHandler(playerCore: player)
+          ask = { handler.menuSubFont(item()) }
+        case .subFontButton:
+          let pane = Self.kept(SidebarSubtitlesPane(player: player))
+          let button = try #require(Self.controls(NSButton.self, sending: "chooseSubFontAction:", under: pane).first)
+          ask = { Self.send(button) }
+        default:
+          ask = { player.chooseSubFont() }
+        }
+        // The picker is shown once mpv answers with the font, then closed unpicked.
+        applied = { picker.finishedPicking != nil && picker.window?.isVisible == true }
+        cleanUp = {
+          picker.finishedPicking = nil
+          picker.close()
+        }
+      }
+      defer { cleanUp() }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(held, ask)
+      #expect(returnedWhileHeld, "Asking for \(request) waited for mpv")
+      try await Self.waitUntil(applied)
+    }
+  }
+
   @Test("A request the player makes without waiting is answered only once the core MPVCoreHold holds is let go")
   func coreHoldDefersAnswers() async throws {
     try await Self.withPlayer { player, _ in
