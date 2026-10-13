@@ -1294,10 +1294,14 @@ struct PlayerPlaybackTests {
       case .externalVideo:
         ask = { player.loadExternalVideoFile(folder.appendingPathComponent("a.mp4")) }
         applied = { player.info.videoTracks.count > before.videoTracks }
-      case .chapter, .menuNextChapter, .menuPreviousChapter:
-        // The test files have no chapters, so the request changes nothing; only that it does not wait is checked.
-        ask = request == .chapter ? { _ = player.playChapter(0) } : request == .menuNextChapter
-          ? { handler.menuNextChapter(item()) } : { handler.menuPreviousChapter(item()) }
+      case .chapter:
+        // The test files have no chapters, so the player is given one starting 2 s in, which playing the chapter seeks to.
+        player.info.chapters = [MPVChapter(title: "iinaTests", startTime: 2, index: 0)]
+        ask = { _ = player.playChapter(0) }
+        applied = { mpv.getDouble(MPVProperty.timePos) >= 1.9 }
+      case .menuNextChapter, .menuPreviousChapter:
+        // The test files have no chapters, so mpv changes nothing; only that the request does not wait is checked.
+        ask = request == .menuNextChapter ? { handler.menuNextChapter(item()) } : { handler.menuPreviousChapter(item()) }
         applied = { true }
       case .menuCycleVideo:
         ask = { handler.menuCycleTrack(item(tag: 0)) }
