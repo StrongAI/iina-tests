@@ -127,6 +127,22 @@ struct PlayerPlaybackTests {
     return returnedWhileHeld
   }
 
+  /// Drop `urls` on the player while the core of its `mpv` is held, wait until the player has asked `mpv` for what was dropped, then
+  /// let the core go.
+  /// - Returns: Whether the player asked while the core was held, which a request that waits for `mpv` cannot do.
+  private static func dropRequestsWhileHeld(_ player: PlayerCore, _ urls: [URL]) async throws -> Bool {
+    let hold = try MPVCoreHold(player.mpv, limit: holdLimit)
+    let waiting = player.mpv.replyCallbacks.count
+    #expect(player.openFromPasteboard(FileDrop(urls)))
+    // A held core answers nothing, so a request that does not wait stays registered until the core is let go, while one that waits
+    // keeps the main thread from checking until the hold reaches its limit and lets go.
+    try await waitUntil { player.mpv.replyCallbacks.count > waiting || hold.hasLetGo }
+    let requestedWhileHeld = !hold.hasLetGo
+    hold.release()
+    try await waitUntil { hold.hasLetGo }
+    return requestedWhileHeld
+  }
+
   /// Ask `mpv` whether playback is paused and wait for the answer, which comes after its answers to every request made before.
   private static func paused(_ player: PlayerCore) async -> Bool? {
     await withCheckedContinuation { continuation in
@@ -883,6 +899,62 @@ struct PlayerPlaybackTests {
       }
     }
   }
+
+  @Test("A 3D LUT file and a subtitle file dropped alone are added in requests that return before mpv handles them")
+  func dropsDoNotWait() async throws {
+    // Hardware decoding is off from the start: adding a filter while it is set to auto asks the user first, and turning it off later
+    // reconfigures the video while the core is held.
+    try await Self.withSettings([.hardwareDecoder: Preference.HardwareDecoderOption.disabled.rawValue]) {
+      try await Self.withPlayer { player, folder in
+        player.syncUITimer?.invalidate()
+        let lut = folder.appendingPathComponent("look.cube")
+        // The identity 3D LUT of size 2, red changing fastest.
+        let lattice = (0..<8).map { "\($0 & 1) \(($0 >> 1) & 1) \(($0 >> 2) & 1)" }
+        try (["LUT_3D_SIZE 2"] + lattice).joined(separator: "\n").write(to: lut, atomically: true, encoding: .utf8)
+        let lutAddedWhileHeld = try await Self.dropRequestsWhileHeld(player, [lut])
+        #expect(lutAddedWhileHeld, "Adding the dropped 3D LUT file waited for mpv")
+        try await Self.waitUntil { player.mpv.getFilters(MPVProperty.vf).contains { $0.label == "iina_quickl3d" } }
+        let subtitle = folder.appendingPathComponent("b.srt")
+        try "1\n00:00:00,000 --> 00:00:01,000\nIINA\n".write(to: subtitle, atomically: true, encoding: .utf8)
+        let subtitleAddedWhileHeld = try await Self.dropRequestsWhileHeld(player, [subtitle])
+        #expect(subtitleAddedWhileHeld, "Loading the dropped subtitle file waited for mpv")
+        try await Self.waitUntil { player.info.subTracks.contains { $0.externalFilename == subtitle.path } }
+      }
+    }
+  }
+
+  @Test("A video reconfig mpv reports is handled on the main thread without waiting for mpv, storing the display size read with it")
+  func videoReconfigDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      let width = try #require(player.info.displayWidth)
+      let height = try #require(player.info.displayHeight)
+      let reconfig = PlayerCore.VideoReconfig(dwidth: width * 2, dheight: height * 2,
+                                              videoParamsRotation: player.info.videoParamsRotation,
+                                              rotation: player.info.rotation, coreIdle: false)
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.onVideoReconfig(reconfig) }
+      #expect(returnedWhileHeld, "Handling the video reconfig waited for mpv")
+      #expect(player.info.displayWidth == width * 2)
+      #expect(player.info.displayHeight == height * 2)
+      // A filter that scales the video makes mpv report a reconfig, whose display size is read on the queue for reading mpv events.
+      // The test file is 4:3, so its display size is the size it is scaled to.
+      player.mpv.command(.vf, args: ["add", "scale=320:240"])
+      try await Self.waitUntil { player.info.displayWidth == 320 && player.info.displayHeight == 240 }
+    }
+  }
+
+  @Test("The mpv options given on the command line are set in requests that return before mpv handles them")
+  func commandLineOptionsDoNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      var status = CommandLineStatus()
+      status.mpvArguments = [(MPVOption.PlaybackControl.speed, "1.5"), (MPVOption.Audio.volume, "40")]
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { status.applyMPVArguments(to: player) }
+      #expect(returnedWhileHeld, "Setting the command-line options waited for mpv")
+      try await Self.waitUntil { player.info.playSpeed == 1.5 && player.info.volume == 40 }
+    }
+  }
+
   @Test("The position is synchronized, while the time is not kept up to date, in a request that returns before mpv handles it")
   func positionSyncDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
@@ -1480,7 +1552,11 @@ struct PlayerPlaybackTests {
       let subtitles = try Self.writeSubtitles(["b", "c"], in: folder)
       subtitles.forEach { player.loadExternalSubFile($0) }
       try await Self.waitUntil { player.info.subTracks.count == 2 }
-      // mpv selects each subtitle file it adds, so c.srt's track is the subtitle track and b.srt's can be the secondary one.
+      // mpv adds each subtitle file on a thread of its own and selects the file it adds, so either file's track can be the subtitle
+      // track. c.srt's is made the subtitle track, so that b.srt's can be the secondary one.
+      let primary = try #require(player.info.subTracks.first { $0.externalFilename == subtitles[1].mpvStr })
+      player.setTrack(primary.id, forType: .sub)
+      try await Self.waitUntil { player.info.sid == primary.id }
       let track = try #require(player.info.subTracks.first { $0.externalFilename == subtitles[0].mpvStr })
       player.setTrack(track.id, forType: .secondSub)
       try await Self.waitUntil { player.info.secondSid == track.id }
