@@ -2139,6 +2139,181 @@ struct PlayerPlaybackTests {
     return (returnedWhileHeld, recorder.requests)
   }
 
+  /// A site that reads the audio devices or the audio device, or checks whether a config file exists.
+  enum DeviceOrFileRequest: String, CaseIterable, Sendable {
+    case audioDevices, audioDeviceListChanged, currentAoChanged, configuredAudioDevice, audioDeviceMenu, prefAudioDevices
+    case settingsAudioDevices, prefNewConfigFile, settingsNewConfigFile
+  }
+
+  @Test("Each read of the audio devices, the audio device or a new config file's name returns before mpv or the file system is asked, then does what the site was asked",
+        arguments: DeviceOrFileRequest.allCases)
+  func deviceOrFileRequestDoesNotWait(_ request: DeviceOrFileRequest) async throws {
+    switch request {
+    case .prefNewConfigFile, .settingsNewConfigFile:
+      try await Self.checkNewConfigFile(request)
+    default:
+      try await Self.withPlayer { player, _ in
+        try await Self.checkAudioDeviceRequest(request, player: player)
+      }
+    }
+  }
+
+  /// Make `request` while the core of the `mpv` it reads is held, expecting it to return before `mpv` answers, then let the core go
+  /// and expect the site to have done what it was asked.
+  /// - Parameter player: The player playing `b.mp4`.
+  private static func checkAudioDeviceRequest(_ request: DeviceOrFileRequest, player: PlayerCore) async throws {
+    let mpv: MPVController = player.mpv
+    // A device that no audio output driver has. mpv takes it as the audio device to use without opening it while nothing plays.
+    let missing = "coreaudio/iinaTests"
+    // The menu and the settings ask the active player, which is the player of the main window or else the first player.
+    let active = PlayerCore.active
+    // The sites read the devices and the device mpv reported in place of asking mpv.
+    try await waitUntil { !player.info.audioDeviceList.isEmpty && player.info.audioDevice != nil }
+    try await waitUntil { !active.info.audioDeviceList.isEmpty && active.info.audioDevice != nil }
+    func popUps(in view: NSView) -> [NSPopUpButton] {
+      var found = view.subviews.flatMap { popUps(in: $0) }
+      if let popUp = view as? NSPopUpButton {
+        found.insert(popUp, at: 0)
+      }
+      return found
+    }
+    func names(_ popUp: NSPopUpButton?) -> [String]? {
+      popUp?.itemArray.compactMap { ($0.representedObject as? MPVAudioDevice)?.name }
+    }
+    let ask: () -> Void
+    let applied: () -> Bool
+    var cleanUp: () -> Void = {}
+    var held = player
+    switch request {
+    case .audioDevices:
+      var devices: [MPVAudioDevice] = []
+      ask = { devices = player.getAudioDevices() }
+      // mpv always lists the device that follows the system's choice.
+      applied = { devices.contains { $0.name == "auto" } }
+    case .audioDeviceListChanged:
+      mpv.setString(MPVProperty.audioDevice, missing)
+      try await waitUntil { player.info.audioDevice == missing }
+      let list = player.info.audioDeviceList
+      ask = { player.audioDeviceListChanged(list) }
+      applied = { mpv.getString(MPVProperty.audioDevice) == "auto" }
+    case .currentAoChanged:
+      // A device mpv lists for the open driver, asked for as the same device of the driver that is not open.
+      let device = try #require(player.getAudioDevices().first(where: { $0.driver == "coreaudio" }),
+                                "mpv lists no Core Audio device")
+      let other = MPVAudioDevice(device, "avfoundation").name
+      mpv.setString(MPVProperty.audioDevice, other)
+      try await waitUntil { player.info.audioDevice == other }
+      ask = { player.currentAoChanged("coreaudio") }
+      applied = { mpv.getString(MPVProperty.audioDevice) == device.name }
+    case .configuredAudioDevice:
+      let defaults = UserDefaults.standard
+      let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+      defaults.setVolatileDomain(arguments.merging([Preference.Key.audioDevice.rawValue: missing]) { $1 },
+                                 forName: UserDefaults.argumentDomain)
+      cleanUp = { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+      mpv.setString(MPVProperty.audioDevice, missing)
+      try await waitUntil { player.info.audioDevice == missing }
+      ask = { player.checkConfiguredAudioDevice() }
+      applied = { mpv.getString(MPVProperty.audioDevice) == "auto" }
+    case .audioDeviceMenu:
+      held = active
+      let menuController = try #require(AppDelegate.shared.menuController)
+      let menu: NSMenu = menuController.audioDeviceMenu
+      ask = { menuController.menuWillOpen(menu) }
+      applied = {
+        let devices = active.getAudioDevices()
+        return menu.items.compactMap { $0.representedObject as? String } == devices.map(\.name)
+          && menu.items.filter { $0.state == .on }.compactMap { $0.representedObject as? String }
+            == devices.filter { $0.name == active.info.audioDevice }.map(\.name)
+      }
+    case .prefAudioDevices:
+      held = active
+      let codec = PrefCodecViewController()
+      _ = codec.view
+      // The settings list the devices again when the audio driver setting changes.
+      ask = {
+        codec.observeValue(forKeyPath: Preference.Key.audioDriverEnableAVFoundation.rawValue, of: UserDefaults.standard,
+                           change: [:], context: nil)
+      }
+      applied = { names(codec.audioDevicePopUp) == active.getAudioDevices().map(\.name) }
+    default:
+      held = active
+      let page = SettingsPageAudio()
+      keptObjects.append(page)
+      var built = NSView()
+      ask = { built = page.getView() }
+      applied = {
+        let popUp = popUps(in: built).first { $0.itemArray.first?.representedObject is MPVAudioDevice }
+        return names(popUp) == active.getAudioDevices().map(\.name)
+      }
+    }
+    defer { cleanUp() }
+    let returnedWhileHeld = try await returnsWhileHeld(held, ask)
+    #expect(returnedWhileHeld, "Asking for \(request) waited for mpv")
+    try await waitUntil(applied)
+  }
+
+  /// Ask `request` for the path of a new config file of a free name and then of a taken one while `Utility.workspaceQueue` is held,
+  /// expecting it to return before the file system is read, then let the queue go and expect the path of the free name to be handed
+  /// over, and the file of the taken name to be shown in Finder once the panel asking whether to show it is answered, the panel's
+  /// answer returning before LaunchServices is asked.
+  private static func checkNewConfigFile(_ request: DeviceOrFileRequest) async throws {
+    let name = "iinaTests-\(UUID().uuidString)"
+    let taken = Utility.userInputConfDirURL.appendingPathComponent("\(name)-taken.conf")
+    try Data().write(to: taken)
+    defer { try? FileManager.default.removeItem(at: taken) }
+    // The panel asking whether to show the file of a taken name is a sheet on the window of the site.
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.titled], backing: .buffered,
+                          defer: false)
+    window.isReleasedWhenClosed = false
+    let ask: (String, @escaping (String) -> Void) -> Void
+    if request == .prefNewConfigFile {
+      let controller = PrefKeyBindingViewController()
+      keptObjects.append(controller)
+      window.contentViewController = controller
+      ask = { controller.newConfigFilePath(forName: $0, then: $1) }
+    } else {
+      let editor = ConfigEditor()
+      keptObjects.append(editor)
+      window.contentView = editor.view
+      ask = { editor.newConfigFilePath(forName: $0, then: $1) }
+    }
+    window.orderFront(nil)
+    defer { window.close() }
+    let recorder = WorkspaceRecorder()
+    let make = Utility.makeWorkspaceRequest
+    Utility.makeWorkspaceRequest = recorder.record
+    defer { Utility.makeWorkspaceRequest = make }
+
+    var path: String?
+    var hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    ask(name) { path = $0 }
+    let freeReturned = !hold.limitPassed && path == nil
+    hold.release()
+    #expect(freeReturned, "Asking \(request) for a new config file of a free name waited for the file system")
+    try await waitUntil { path != nil }
+    #expect(path == Utility.userInputConfDirURL.appendingPathComponent("\(name).conf").path)
+
+    path = nil
+    hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    ask("\(name)-taken") { path = $0 }
+    let takenReturned = !hold.limitPassed && window.attachedSheet == nil
+    hold.release()
+    #expect(takenReturned, "Asking \(request) for a new config file of a taken name waited for the file system")
+    try await waitUntil { window.attachedSheet != nil }
+    let sheet = try #require(window.attachedSheet)
+    hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    window.endSheet(sheet, returnCode: .alertFirstButtonReturn)
+    // What answering the panel does on the main thread is done before the requests are looked at.
+    await drainMain()
+    let answerReturned = !hold.limitPassed && recorder.requests.isEmpty
+    hold.release()
+    #expect(answerReturned, "Answering \(request)'s panel to show the config file of a taken name waited for LaunchServices")
+    await withCheckedContinuation { continuation in Utility.workspaceQueue.async { continuation.resume() } }
+    #expect(recorder.requests == [.revealInFinder([URL(fileURLWithPath: taken.path)])])
+    #expect(path == nil)
+  }
+
   /// Plugins whose instances a test makes, kept for as long as the instances may read them.
   private static var keptPlugins: [JavascriptPlugin] = []
 
