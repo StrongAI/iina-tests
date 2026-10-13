@@ -9,6 +9,7 @@ import AppKit
 import MediaPlayer
 import Network
 import Testing
+import WebKit
 @testable import IINA
 
 /// Each test makes its own player, opens the middle file of its own folder of three copies of `fragmented.mp4` (4 s, a keyframe
@@ -1763,6 +1764,381 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A site that asks LaunchServices to open a link or a file, to show files in Finder or to make IINA the default app: each must
+  /// not wait for LaunchServices on the main thread.
+  enum LaunchServicesRequest: String, CaseIterable, Sendable {
+    case historyShowInFinder, aboutCommit, aboutContributors, aboutTranslators, menuScreenshotFolder, menuHelp, menuGithub
+    case menuWebsite, assrtRegister, jsShowInFinder, guideWebsite, guideLink, jsOpenLink, jsOpenFile, menuShowInFinder
+    case prefLogFolder, prefAdvancedHelp, prefToneMappingHelp, prefTargetPeakHelp, prefAlgorithmHelp, prefGainAdjustmentHelp
+    case prefGaplessAudioHelp, prefAudioDriverHelp, prefShowConfFile, prefKeyBindingsHelp, prefYtdlHelp, prefPluginWebsite
+    case prefPluginEmail, prefShowPlugin, prefOpenSubHelp, prefAssrtHelp, prefSubOverrideHelp, prefDisableAnimationsHelp
+    case prefSetAsDefault, prefExtChrome, prefExtFirefox, screenshotReveal, screenshotEdit, settingsHelpLink, settingsLogFolder
+    case settingsShowConfFile, settingsShowPlugin, settingsPluginLink, settingsAssrtHelp, settingsSetAsDefault
+    case settingsExtChrome, settingsExtFirefox, playlistShowInFinder, playlistOpenInBrowser, titlebarShowFolder
+
+    /// Whether the site is reached through a player.
+    var needsPlayer: Bool {
+      [.jsShowInFinder, .jsOpenLink, .jsOpenFile, .menuShowInFinder, .playlistShowInFinder, .playlistOpenInBrowser,
+       .titlebarShowFolder].contains(self)
+    }
+  }
+
+  @Test("Each request of LaunchServices the app, its windows, the settings or a plugin makes returns before LaunchServices is asked, which is then asked for what the site was asked for",
+        arguments: LaunchServicesRequest.allCases)
+  func workspaceRequestDoesNotWait(_ request: LaunchServicesRequest) async throws {
+    if request.needsPlayer {
+      try await Self.withPlayer { player, folder in
+        try await Self.checkWorkspaceRequest(request, player: player, folder: folder)
+      }
+    } else {
+      let folder = try Self.makeFolder()
+      defer { try? FileManager.default.removeItem(at: folder) }
+      try await Self.checkWorkspaceRequest(request, player: nil, folder: folder)
+    }
+  }
+
+  /// Objects made in a test that observe settings, notices or their parent without keeping themselves, kept for as long as they may
+  /// be notified.
+  private static var keptObjects: [AnyObject] = []
+
+  /// Make `request` while `Utility.workspaceQueue` is held, expecting it to return before LaunchServices is asked, then let the queue
+  /// go and expect LaunchServices to be asked for what the site was asked for.
+  /// - Parameter player: The player playing `b.mp4` of `folder`, for a request that `needsPlayer`.
+  private static func checkWorkspaceRequest(_ request: LaunchServicesRequest, player: PlayerCore?, folder: URL) async throws {
+    let file = folder.appendingPathComponent("a.mp4")
+    let link = try #require(URL(string: "https://iina.io/"))
+    func url(_ string: String) throws -> URL {
+      try #require(URL(string: string))
+    }
+    func makeTestPlugin() throws -> JavascriptPlugin {
+      // Kept, since the instances, views and windows showing a plugin hold it without keeping it.
+      let plugin = try makePlugin(in: folder, permissions: ["file-system"],
+                                  author: ["name": "iinaTests", "url": link.absoluteString, "email": "tests@iina.io"])
+      keptPlugins.append(plugin)
+      return plugin
+    }
+    func script(_ source: String) throws -> () -> Void {
+      // A plugin's script is read when its instance is made, so the instance is made before the queue is held.
+      let player = try #require(player)
+      let instance = JavascriptPluginInstance(player: player, plugin: try makeTestPlugin())
+      return { _ = instance.js.evaluateScript(source) }
+    }
+    // With every kind of media checked IINA is made the default app of each content type once, MP4 videos and MP3 audio among them.
+    let bundleID = try #require(Bundle.main.bundleIdentifier)
+    func setsDefaultApp(_ requests: [Utility.WorkspaceRequest]) -> Bool {
+      let types = requests.compactMap { request -> String? in
+        guard case let .setDefaultApp(type, id) = request, id == bundleID else { return nil }
+        return type
+      }
+      return types.count == requests.count && Set(types).count == types.count
+        && Set(types).isSuperset(of: ["public.mpeg-4", "public.mp3"])
+    }
+    let ask: () -> Void
+    var expected: [Utility.WorkspaceRequest] = []
+    var asked: (([Utility.WorkspaceRequest]) -> Bool)?
+    var cleanUp: () -> Void = {}
+    switch request {
+    case .historyShowInFinder:
+      // The files shown are those of the selected entries that exist, so an entry whose file is missing is also selected.
+      let entries = [file, folder.appendingPathComponent("missing.mp4")].map {
+        PlaybackHistory(url: $0, duration: 4, title: nil, mpvMd5: $0.path)
+      }
+      let controller = AppDelegate.shared.historyWindow
+      let history = HistoryController.shared.history
+      HistoryController.shared.history = entries
+      cleanUp = {
+        HistoryController.shared.history = history
+        controller.reloadData()
+      }
+      controller.reloadData()
+      let outlineView = controller.outlineView
+      outlineView.selectRowIndexes(IndexSet(integersIn: 0..<outlineView.numberOfRows), byExtendingSelection: false)
+      ask = { controller.showInFinderAction(nil) }
+      expected = [.revealInFinder([file])]
+    case .aboutCommit:
+      let commit = try #require(InfoDictionary.shared.buildCommit)
+      let controller = AppDelegate.shared.aboutWindow
+      ask = { controller.openCommitLink() }
+      expected = [.open(try url("https://github.com/iina/iina/commit/\(commit)"))]
+    case .aboutContributors:
+      let controller = AppDelegate.shared.aboutWindow
+      ask = { controller.contributorsBtnAction(controller) }
+      expected = [.open(try url(AppData.contributorsLink))]
+    case .aboutTranslators:
+      let controller = AppDelegate.shared.aboutWindow
+      ask = { controller.translatorsBtnAction(controller) }
+      expected = [.open(try url(AppData.crowdinMembersLink))]
+    case .menuScreenshotFolder:
+      let path = NSString(string: try #require(Preference.string(for: .screenshotFolder))).expandingTildeInPath
+      ask = { AppDelegate.shared.menuOpenScreenshotFolder(NSMenuItem()) }
+      expected = [.open(URL(fileURLWithPath: path, isDirectory: true))]
+    case .menuHelp:
+      ask = { AppDelegate.shared.helpAction(NSMenuItem()) }
+      expected = [.open(try url(AppData.wikiLink))]
+    case .menuGithub:
+      ask = { AppDelegate.shared.githubAction(NSMenuItem()) }
+      expected = [.open(try url(AppData.githubLink))]
+    case .menuWebsite:
+      ask = { AppDelegate.shared.websiteAction(NSMenuItem()) }
+      expected = [.open(try url(AppData.websiteLink))]
+    case .assrtRegister:
+      // A user without a token of their own who chooses to register is shown the register page, then asked for their token, which
+      // the prompt being dismissed leaves unset.
+      let fetcher = Assrt.Fetcher()
+      fetcher.usesUserToken = false
+      let prompts = ModalWindowDismisser(answering: [.alertFirstButtonReturn])
+      cleanUp = { prompts.stop() }
+      ask = { _ = fetcher.checkToken() }
+      expected = [.open(try url(AppData.assrtRegisterLink))]
+    case .jsShowInFinder:
+      ask = try script("iina.file.showInFinder(\"\(file.path)\")")
+      expected = [.revealInFinder([URL(fileURLWithPath: file.path)])]
+    case .jsOpenLink:
+      ask = try script("iina.utils.open(\"\(link.absoluteString)\")")
+      expected = [.open(link)]
+    case .jsOpenFile:
+      ask = try script("iina.utils.open(\"\(file.path)\")")
+      expected = [.open(URL(fileURLWithPath: file.path))]
+    case .guideWebsite:
+      let controller = AppDelegate.shared.guideWindow
+      ask = { controller.visitIINAWebsite(controller) }
+      expected = [.open(try url(AppData.websiteLink))]
+    case .guideLink:
+      // A link to a page other than the highlights is opened in the browser.
+      let controller = AppDelegate.shared.guideWindow
+      let webView = WKWebView()
+      let action = NavigationAction(link)
+      ask = { controller.webView(webView, decidePolicyFor: action, decisionHandler: { _ in }) }
+      expected = [.open(link)]
+    case .menuShowInFinder:
+      let player = try #require(player)
+      let handler = MainMenuActionHandler(playerCore: player)
+      ask = { handler.menuShowCurrentFileInFinder(NSMenuItem()) }
+      expected = [.revealInFinder([try #require(player.info.currentURL)])]
+    case .prefLogFolder:
+      let controller = PrefAdvancedViewController()
+      ask = { controller.openLogDir(controller) }
+      expected = [.open(Logger.logDirectory)]
+    case .prefAdvancedHelp:
+      let controller = PrefAdvancedViewController()
+      ask = { controller.helpBtnAction(controller) }
+      expected = [.open(try url(AppData.wikiLink).appendingPathComponent("MPV-Options-and-Properties"))]
+    case .prefToneMappingHelp, .prefTargetPeakHelp, .prefAlgorithmHelp, .prefGainAdjustmentHelp, .prefGaplessAudioHelp,
+         .prefAudioDriverHelp:
+      let controller = PrefCodecViewController()
+      let help: String
+      switch request {
+      case .prefToneMappingHelp:
+        ask = { controller.toneMappingHelpAction(controller) }
+        help = AppData.toneMappingHelpLink
+      case .prefTargetPeakHelp:
+        ask = { controller.targetPeakHelpAction(controller) }
+        help = AppData.mpvManualLink.appending("/#options-target-peak")
+      case .prefAlgorithmHelp:
+        ask = { controller.algorithmHelpAction(controller) }
+        help = AppData.mpvManualLink.appending("/#options-tone-mapping")
+      case .prefGainAdjustmentHelp:
+        ask = { controller.gainAdjustmentHelpAction(controller) }
+        help = AppData.mpvManualLink.appending("/#options-replaygain")
+      case .prefGaplessAudioHelp:
+        ask = { controller.gaplessAudioHelpAction(controller) }
+        help = AppData.mpvManualLink.appending("/#options-gapless-audio")
+      default:
+        ask = { controller.audioDriverHelpAction(controller) }
+        help = AppData.mpvManualLink.appending("/#audio-output-drivers-coreaudio")
+      }
+      expected = [.open(try url(help))]
+    case .prefShowConfFile:
+      let conf = folder.appendingPathComponent("iinaTests.conf")
+      try Data().write(to: conf)
+      let controller = PrefKeyBindingViewController()
+      controller.currentConfFilePath = conf.path
+      ask = { controller.showConfFileAction(controller) }
+      expected = [.revealInFinder([URL(fileURLWithPath: conf.path)])]
+    case .prefKeyBindingsHelp:
+      let controller = PrefKeyBindingViewController()
+      ask = { controller.openKeyBindingsHelpAction(controller) }
+      expected = [.open(try url(AppData.wikiLink.appending("/Manage-Key-Bindings")))]
+    case .prefYtdlHelp:
+      let controller = PrefNetworkViewController()
+      ask = { controller.ytdlHelpAction(controller) }
+      expected = [.open(try url(AppData.ytdlHelpLink))]
+    case .prefPluginWebsite, .prefPluginEmail, .prefShowPlugin:
+      let plugin = try makeTestPlugin()
+      let controller = PrefPluginViewController()
+      controller.currentPlugin = plugin
+      switch request {
+      case .prefPluginWebsite:
+        ask = { controller.websiteBtnAction(NSButton()) }
+        expected = [.open(link)]
+      case .prefPluginEmail:
+        ask = { controller.emailBtnAction(NSButton()) }
+        expected = [.open(try url("mailto:tests@iina.io"))]
+      default:
+        ask = { controller.showPlugin(controller) }
+        expected = [.revealInFinder([plugin.root])]
+      }
+    case .prefOpenSubHelp, .prefAssrtHelp, .prefSubOverrideHelp:
+      let controller = PrefSubViewController()
+      switch request {
+      case .prefOpenSubHelp:
+        ask = { controller.openSubHelpBtnAction(controller) }
+        expected = [.open(try url(AppData.wikiLink.appending("/Download-Online-Subtitles#opensubtitles")))]
+      case .prefAssrtHelp:
+        ask = { controller.assrtHelpBtnAction(controller) }
+        expected = [.open(try url(AppData.wikiLink.appending("/Download-Online-Subtitles#assrt")))]
+      default:
+        ask = { controller.subOverrideHelpBtnAction(controller) }
+        expected = [.open(try url("https://mpv.io/manual/stable/#options-sub-ass-override"))]
+      }
+    case .prefDisableAnimationsHelp:
+      let controller = PrefUIViewController()
+      ask = { controller.disableAnimationsHelpAction(controller) }
+      expected = [.open(try url(AppData.disableAnimationsHelpLink))]
+    case .prefSetAsDefault:
+      // The settings set IINA as the default app from a sheet on their window.
+      let controller = PrefUtilsViewController()
+      let window = NSWindow(contentViewController: controller)
+      [controller.setAsDefaultVideoCheckBox, controller.setAsDefaultAudioCheckBox,
+       controller.setAsDefaultPlaylistCheckBox].forEach { $0?.state = .on }
+      window.beginSheet(try #require(controller.setAsDefaultSheet), completionHandler: nil)
+      // The alert the settings show once they are done is a sheet on their window too.
+      cleanUp = { window.sheets.forEach { window.endSheet($0) } }
+      ask = { controller.setAsDefaultOKBtnAction(controller) }
+      asked = setsDefaultApp
+    case .prefExtChrome, .prefExtFirefox:
+      let controller = PrefUtilsViewController()
+      if request == .prefExtChrome {
+        ask = { controller.extChromeBtnAction(controller) }
+        expected = [.open(try url(AppData.chromeExtensionLink))]
+      } else {
+        ask = { controller.extFirefoxBtnAction(controller) }
+        expected = [.open(try url(AppData.firefoxExtensionLink))]
+      }
+    case .screenshotReveal, .screenshotEdit:
+      let osd = ScreenshootOSDView()
+      osd.setImage(NSImage(), size: .zero, fileURL: file)
+      if request == .screenshotReveal {
+        ask = { osd.revealBtnAction(osd) }
+        expected = [.revealInFinder([file])]
+      } else {
+        ask = { osd.editBtnAction(osd) }
+        expected = [.open(file)]
+      }
+    case .settingsHelpLink:
+      let item = SettingsItem.General().withHelpLink(AppData.wikiLink)
+      ask = { _ = NSApp.sendAction(NSSelectorFromString("openHelpLink:"), to: item, from: nil) }
+      expected = [.open(try url(AppData.wikiLink))]
+    case .settingsLogFolder:
+      let page = SettingsPageAdvanced()
+      keptObjects.append(page)
+      ask = { _ = NSApp.sendAction(NSSelectorFromString("openLogFolder"), to: page, from: nil) }
+      expected = [.open(Logger.logDirectory)]
+    case .settingsShowConfFile:
+      let editor = ConfigEditor()
+      keptObjects.append(editor)
+      let path = try #require(editor.currentConfFilePath)
+      ask = { editor.showConfFileAction(editor) }
+      expected = [.revealInFinder([URL(fileURLWithPath: path)])]
+    case .settingsShowPlugin:
+      let plugin = try makeTestPlugin()
+      let page = SettingsPagePlugin()
+      let list = PluginListView(page: page)
+      keptObjects += [page, list]
+      let current = PluginListView.currentPlugin
+      PluginListView.currentPlugin = plugin
+      cleanUp = { PluginListView.currentPlugin = current }
+      ask = { list.showPluginInFinderAction(list) }
+      expected = [.revealInFinder([plugin.root])]
+    case .settingsPluginLink:
+      // A page of a plugin's about tab that links to an external page has it opened in the browser.
+      let parent = NSWindow()
+      let details = PluginDetailsWindow(plugin: try makeTestPlugin(), window: parent)
+      keptObjects += [parent, details]
+      let webView = WKWebView()
+      let action = NavigationAction(link)
+      ask = { details.webView(webView, decidePolicyFor: action, decisionHandler: { _ in }) }
+      expected = [.open(link)]
+    case .settingsAssrtHelp:
+      let view = SubtitleSourceView()
+      keptObjects.append(view)
+      ask = { _ = NSApp.sendAction(NSSelectorFromString("assrtHelpBtnAction:"), to: view, from: nil) }
+      expected = [.open(try url(AppData.wikiLink.appending("/Download-Online-Subtitles#assrt")))]
+    case .settingsSetAsDefault:
+      // The settings set IINA as the default app from a sheet on their window, with every kind of media checked at first.
+      let window = NSWindow()
+      let sheet = SetAsDefaultSheetWindow()
+      sheet.contextWindow = window
+      window.beginSheet(sheet, completionHandler: nil)
+      // The alert the settings show once they are done is a sheet on their window too.
+      cleanUp = { window.sheets.forEach { window.endSheet($0) } }
+      ask = { sheet.okBtnAction(sheet) }
+      asked = setsDefaultApp
+    case .settingsExtChrome, .settingsExtFirefox:
+      let view = BrowserExtensionView()
+      if request == .settingsExtChrome {
+        ask = { view.extChromeBtnAction(view) }
+        expected = [.openInApp(try url(AppData.chromeExtensionLink), bundleID: "com.google.Chrome")]
+      } else {
+        ask = { view.extFirefoxBtnAction(view) }
+        expected = [.openInApp(try url(AppData.firefoxExtensionLink), bundleID: "org.mozilla.firefox")]
+      }
+    case .playlistShowInFinder, .playlistOpenInBrowser:
+      let player = try #require(player)
+      try await waitUntil { player.info.playlist.count == 3 }
+      let pane = kept(SidebarPlaylistPane(player: player))
+      if request == .playlistShowInFinder {
+        pane.selectedRows = IndexSet([0, 2])
+        ask = { pane.contextMenuShowInFinder(NSMenuItem()) }
+        expected = [.revealInFinder([0, 2].map { URL(fileURLWithPath: player.info.playlist[$0].filename) })]
+      } else {
+        // Only an entry read over the network is opened in the browser, so a link is added to the playlist after its files.
+        player.addToPlaylist(paths: [link.absoluteString])
+        try await waitUntil { player.info.playlist.count == 4 }
+        try #require(player.info.playlist[3].isNetworkResource)
+        pane.selectedRows = IndexSet([3])
+        ask = { pane.contextOpenInBrowser(NSMenuItem()) }
+        expected = [.open(link)]
+      }
+    case .titlebarShowFolder:
+      // Each item of the menu of the path of the file shown in the title shows the folder it names in Finder.
+      let player = try #require(player)
+      let titlebar = kept(Titlebar(mainWindow: player.mainWindow))
+      let item = NSMenuItem()
+      item.representedObject = folder
+      ask = { _ = NSApp.sendAction(NSSelectorFromString("revealInFinder:"), to: titlebar, from: item) }
+      expected = [.showFolderInFinder(folder.path)]
+    }
+    defer { cleanUp() }
+    let (returnedWhileHeld, made) = await workspaceRequestsWhileHeld(ask)
+    #expect(returnedWhileHeld, "Asking for \(request) waited for LaunchServices")
+    if let asked {
+      #expect(asked(made), "Asking for \(request) asked LaunchServices for \(made)")
+    } else {
+      #expect(made == expected)
+    }
+    // What the site does on the main thread once LaunchServices has answered is done before the test cleans up after it.
+    await drainMain()
+  }
+
+  /// Make `request` while `Utility.workspaceQueue` is held, the LaunchServices requests being recorded in place of being made, then
+  /// let the queue go and wait until it has done what it was asked.
+  /// - Returns: Whether `request` returned while the queue was held, before any LaunchServices request had been made, and the
+  ///     LaunchServices requests made.
+  private static func workspaceRequestsWhileHeld(_ request: () -> Void) async -> (Bool, [Utility.WorkspaceRequest]) {
+    let recorder = WorkspaceRecorder()
+    let make = Utility.makeWorkspaceRequest
+    Utility.makeWorkspaceRequest = recorder.record
+    defer { Utility.makeWorkspaceRequest = make }
+    let hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    request()
+    let returnedWhileHeld = !hold.limitPassed && recorder.requests.isEmpty
+    hold.release()
+    // The queue runs what it was asked in order, so it has done what the request asked once it reaches this.
+    await withCheckedContinuation { continuation in Utility.workspaceQueue.async { continuation.resume() } }
+    return (returnedWhileHeld, recorder.requests)
+  }
+
   /// Plugins whose instances a test makes, kept for as long as the instances may read them.
   private static var keptPlugins: [JavascriptPlugin] = []
 
@@ -1941,11 +2317,12 @@ struct PlayerPlaybackTests {
     }
   }
 
-  /// A plugin in `folder` with `permissions` whose script does nothing, in whose context a test evaluates scripts.
-  private static func makePlugin(in folder: URL, permissions: [String] = []) throws -> JavascriptPlugin {
+  /// A plugin in `folder` with `permissions` and `author` whose script does nothing, in whose context a test evaluates scripts.
+  private static func makePlugin(in folder: URL, permissions: [String] = [],
+                                 author: [String: String] = ["name": "iinaTests"]) throws -> JavascriptPlugin {
     let root = folder.appendingPathComponent("iinaTests-plugin")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    let info: [String: Any] = ["name": "iinaTests", "author": ["name": "iinaTests"], "identifier": "io.iina.tests",
+    let info: [String: Any] = ["name": "iinaTests", "author": author, "identifier": "io.iina.tests",
                                "version": "1.0", "entry": "main.js", "permissions": permissions]
     try JSONSerialization.data(withJSONObject: info).write(to: root.appendingPathComponent("Info.json"))
     try Data().write(to: root.appendingPathComponent("main.js"))
@@ -2392,12 +2769,17 @@ private final class ModalWindowDismisser {
   /// The text of each window dismissed, in the order they were shown.
   private(set) var texts: [[String]] = []
   private let input: String?
+  private var answers: [NSApplication.ModalResponse]
   private var timer: Timer?
 
-  /// - Parameter input: Text entered in the first editable field of each window, which is then answered with its first button, as
-  ///     a user typing it and pressing OK would. With `nil` each window is dismissed unanswered.
-  init(entering input: String? = nil) {
+  /// - Parameters:
+  ///   - input: Text entered in the first editable field of each window, which is then answered with its first button, as a user
+  ///     typing it and pressing OK would. With `nil` each window is dismissed unanswered.
+  ///   - answers: The responses the first windows shown are answered with, in the order they are shown, the windows after them
+  ///     being dismissed as `input` says.
+  init(entering input: String? = nil, answering answers: [NSApplication.ModalResponse] = []) {
     self.input = input
+    self.answers = answers
     let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
       MainActor.assumeIsolated { self?.dismiss() }
     }
@@ -2413,7 +2795,9 @@ private final class ModalWindowDismisser {
   private func dismiss() {
     guard let window = NSApp.modalWindow else { return }
     texts.append(Self.texts(of: window))
-    if let input, let field = Self.editableField(in: window.contentView) {
+    if !answers.isEmpty {
+      NSApp.stopModal(withCode: answers.removeFirst())
+    } else if let input, let field = Self.editableField(in: window.contentView) {
       field.stringValue = input
       NSApp.stopModal(withCode: .alertFirstButtonReturn)
     } else {
@@ -2497,6 +2881,72 @@ private final class EventRecorder: EventCallable {
   func call(withArguments args: [Any]) {
     MainActor.assumeIsolated { block(args) }
   }
+}
+
+/// A hold on a serial queue: once made, the queue runs nothing else until the hold is released or its limit passes.
+private final class QueueHold: @unchecked Sendable {
+  private let reached = DispatchSemaphore(value: 0)
+  private let released = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var passed = false
+
+  /// Hold `queue`, returning once the queue has reached the hold.
+  init(_ queue: DispatchQueue, limit: DispatchTimeInterval) {
+    queue.async {
+      self.reached.signal()
+      if self.released.wait(timeout: .now() + limit) == .timedOut {
+        self.lock.lock()
+        self.passed = true
+        self.lock.unlock()
+      }
+    }
+    reached.wait()
+  }
+
+  /// Whether the limit passed before the hold was released, the queue having gone on.
+  var limitPassed: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return passed
+  }
+
+  func release() {
+    released.signal()
+  }
+}
+
+/// Records the LaunchServices requests made, in place of making them.
+private final class WorkspaceRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var made: [Utility.WorkspaceRequest] = []
+
+  /// The requests recorded, in the order they were made.
+  var requests: [Utility.WorkspaceRequest] {
+    lock.lock()
+    defer { lock.unlock() }
+    return made
+  }
+
+  /// Record `request`, from any thread.
+  /// - Returns: That LaunchServices did what was asked.
+  func record(_ request: Utility.WorkspaceRequest) -> Bool {
+    lock.lock()
+    made.append(request)
+    lock.unlock()
+    return true
+  }
+}
+
+/// A navigation to `url`, of which a web view asks its navigation delegate whether to allow it.
+private final class NavigationAction: WKNavigationAction {
+  private let url: URL
+
+  init(_ url: URL) {
+    self.url = url
+    super.init()
+  }
+
+  override var request: URLRequest { URLRequest(url: url) }
 }
 
 private extension PlayerCore {
