@@ -2706,6 +2706,23 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A started file's date last opened is written off the main thread, the start returning while the queue writing it is held")
+  func fileStartedWritesOffMain() async throws {
+    try await Self.withPlayer { player, folder in
+      let path = folder.appendingPathComponent("b.mp4").path
+      let name = "com.apple.lastuseddate#PS"
+      removexattr(path, name, 0)
+      func written() -> Bool { getxattr(path, name, nil, 0, 0, 0) > 0 }
+      let hold = QueueHold(player.backgroundQueue, limit: Self.holdLimit)
+      player.fileStarted(path: path)
+      let returnedWhileHeld = !hold.limitPassed && !written()
+      hold.release()
+      #expect(returnedWhileHeld, "Starting a file wrote its date last opened on the main thread")
+      try await Self.waitUntil(written)
+      #expect(player.info.currentURL == URL(fileURLWithPath: path))
+    }
+  }
+
   /// Plugins whose instances a test makes, kept for as long as the instances may read them.
   private static var keptPlugins: [JavascriptPlugin] = []
 
