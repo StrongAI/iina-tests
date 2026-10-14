@@ -2723,6 +2723,58 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// Run `request`, which asks for the thumbnails of the player's file, while the core of the player's `mpv` and the queue the player
+  /// checks the file system for thumbnails on are held, the thumbnails being asked of FFmpeg rather than read from a cache.
+  /// - Returns: Whether `request` returned while both were held, before FFmpeg was asked for the thumbnails, which a request that
+  ///   waits for `mpv` or reads the file system on the calling thread cannot do. FFmpeg has been asked once both are let go.
+  private static func thumbnailsAskedOffMain(_ player: PlayerCore, _ request: () -> Void) async throws -> Bool {
+    let queue = try #require(player.ffmpegController.value(forKey: "queue") as? OperationQueue)
+    player.ffmpegController.cancelThumbnailGeneration()
+    queue.isSuspended = true
+    defer {
+      player.ffmpegController.cancelThumbnailGeneration()
+      queue.isSuspended = false
+    }
+    func asked() -> Bool { queue.operations.contains { !$0.isCancelled } }
+    // A cache name no cache file has, so that the thumbnails are asked of FFmpeg.
+    player.info.mpvMd5 = UUID().uuidString
+    let hold = QueueHold(player.thumbnailQueue, limit: holdLimit)
+    var askedWhileHeld = true
+    let returnedWhileHeld = try await returnsWhileHeld(player) {
+      request()
+      askedWhileHeld = asked()
+    }
+    let checkedOffMain = returnedWhileHeld && !hold.limitPassed && !askedWhileHeld
+    hold.release()
+    try await waitUntil(asked)
+    return checkedOffMain
+  }
+
+  @Test("A file's thumbnails are asked for without the main thread reading the file system: its volume and cache are checked on the player's thumbnail queue, then FFmpeg is asked")
+  func thumbnailsCheckedOffMain() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSettings([.enableThumbnailPreview: true, .enableThumbnailForRemoteFiles: false]) {
+        let checkedOffMain = try await Self.thumbnailsAskedOffMain(player) { player.generateThumbnails() }
+        #expect(checkedOffMain, "Asking for a file's thumbnails read the file system on the main thread")
+      }
+    }
+  }
+
+  @Test("A video size change the window handles first asks for the thumbnails without waiting for mpv or the file system")
+  func videoSizeChangeAsksThumbnailsOffMain() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSettings([.enableThumbnailPreview: true, .enableThumbnailForRemoteFiles: false]) {
+        // The window asks for the thumbnails when it first loads video, as it does for a player that is not loading an entry.
+        player.mainWindow.isVideoLoaded = false
+        let checkedOffMain = try await Self.thumbnailsAskedOffMain(player) {
+          player.mainWindow.handleVideoSizeChange(keepWindowSize: true)
+        }
+        #expect(checkedOffMain, "Handling a video size change waited for mpv or read the file system on the main thread")
+        #expect(player.mainWindow.isVideoLoaded)
+      }
+    }
+  }
+
   /// Plugins whose instances a test makes, kept for as long as the instances may read them.
   private static var keptPlugins: [JavascriptPlugin] = []
 
