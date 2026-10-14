@@ -1824,6 +1824,103 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// Run `body` with the player's `mpv` saving the playback position on quit, writing watch later configurations into a new folder,
+  /// then restore the last played file and position, which the player stores in the app's settings.
+  private static func withSavedPosition(_ player: PlayerCore, _ body: (URL) async throws -> Void) async throws {
+    let defaults = UserDefaults.standard
+    let keys = [Preference.Key.iinaLastPlayedFilePath.rawValue, Preference.Key.iinaLastPlayedFilePosition.rawValue]
+    let stored = keys.map { defaults.object(forKey: $0) }
+    defer { zip(keys, stored).forEach { defaults.set($1, forKey: $0) } }
+    let caches = try #require(FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first)
+    let folder = caches.appendingPathComponent("iinaTests-watch-later-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let watchLaterDirectory = try #require(player.mpv.getString("watch-later-directory"))
+    player.mpv.setString("watch-later-directory", folder.path)
+    player.mpv.setFlag(MPVOption.WatchLater.savePositionOnQuit, true)
+    defer {
+      player.mpv.setFlag(MPVOption.WatchLater.savePositionOnQuit, false)
+      player.mpv.setString("watch-later-directory", watchLaterDirectory)
+    }
+    try await body(folder)
+  }
+
+  @Test("Stopping returns before mpv handles it, then mpv writes the file's watch later configuration and stops, the file being stored as the last played")
+  func stopDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSavedPosition(player) { watchLater in
+        let file = try #require(player.info.currentURL)
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.stop() }
+        #expect(returnedWhileHeld, "Stopping waited for mpv")
+        try await Self.waitUntil { player.info.state == .idle }
+        let written = try FileManager.default.contentsOfDirectory(atPath: watchLater.path)
+        // mpv writes the file's configuration, and entries for the folders it was opened from.
+        #expect(!written.isEmpty, "mpv wrote no watch later configuration before stopping")
+        #expect(Preference.url(for: .iinaLastPlayedFilePath) == file)
+      }
+    }
+  }
+
+  @Test("Storing the playback position returns before mpv answers whether it saves the position on quit, then stores the file played")
+  func savePlaybackPositionDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSavedPosition(player) { _ in
+        let file = try #require(player.info.currentURL)
+        UserDefaults.standard.removeObject(forKey: Preference.Key.iinaLastPlayedFilePath.rawValue)
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.savePlaybackPosition() }
+        #expect(returnedWhileHeld, "Storing the playback position waited for mpv")
+        try await Self.waitUntil { Preference.url(for: .iinaLastPlayedFilePath) == file }
+      }
+    }
+  }
+
+  /// A site that stops a player: each must not wait for `mpv` on the main thread.
+  enum StopRequest: String, CaseIterable, Sendable {
+    case menuStop, windowClose, miniPlayerClose, jsStop, remoteStop
+  }
+
+  @Test("Each site that stops a player returns before mpv handles the stop, after which the player stops",
+        arguments: StopRequest.allCases)
+  func stopRequestDoesNotWait(_ request: StopRequest) async throws {
+    try await Self.withPlayer { player, folder in
+      let ask: () -> Void
+      var cleanUp: () -> Void = {}
+      switch request {
+      case .menuStop:
+        let handler = MainMenuActionHandler(playerCore: player)
+        ask = { handler.menuStop(NSMenuItem()) }
+      case .windowClose:
+        let window = try #require(player.mainWindow.window)
+        ask = { window.close() }
+      case .miniPlayerClose:
+        player.switchToMiniPlayer()
+        try await Self.waitUntil { player.isInMiniPlayer && player.miniPlayer.window?.isVisible == true }
+        let window = try #require(player.miniPlayer.window)
+        ask = { window.close() }
+      case .jsStop:
+        // The plugin is kept, since its instance holds it weakly and reads it when the instance is let go.
+        let plugin = try Self.makePlugin(in: folder)
+        Self.keptPlugins.append(plugin)
+        let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+        ask = { _ = instance.js.evaluateScript("iina.core.stop()") }
+      case .remoteStop:
+        // The command asks the last active player, and a key binding for STOP is run in place of stopping.
+        let lastActive = PlayerCore.lastActive
+        let binding = PlayerCore.keyBindings.removeValue(forKey: "STOP")
+        PlayerCore.lastActive = player
+        cleanUp = {
+          PlayerCore.lastActive = lastActive
+          PlayerCore.keyBindings["STOP"] = binding
+        }
+        ask = { RemoteCommandController.stop() }
+      }
+      defer { cleanUp() }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player, ask)
+      #expect(returnedWhileHeld, "Stopping by \(request) waited for mpv")
+      try await Self.waitUntil { player.info.state == .idle && player.mpv.getFlag(MPVProperty.idleActive) }
+    }
+  }
+
   /// A site that asks LaunchServices to open a link or a file, to show files in Finder or to make IINA the default app: each must
   /// not wait for LaunchServices on the main thread.
   enum LaunchServicesRequest: String, CaseIterable, Sendable {
