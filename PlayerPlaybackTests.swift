@@ -2775,6 +2775,19 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A video size change the player is told of sizes the window and asks for the thumbnails without waiting for mpv or the file system")
+  func videoSizeNoticeAsksThumbnailsOffMain() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSettings([.enableThumbnailPreview: true, .enableThumbnailForRemoteFiles: false]) {
+        // The window asks for the thumbnails when it first loads video, as it does for a player that is not loading an entry.
+        player.mainWindow.isVideoLoaded = false
+        let checkedOffMain = try await Self.thumbnailsAskedOffMain(player) { player.notifyWindowVideoSizeChanged() }
+        #expect(checkedOffMain, "A video size change the player was told of waited for mpv or read the file system on the main thread")
+        #expect(player.mainWindow.isVideoLoaded)
+      }
+    }
+  }
+
   /// Plugins whose instances a test makes, kept for as long as the instances may read them.
   private static var keptPlugins: [JavascriptPlugin] = []
 
