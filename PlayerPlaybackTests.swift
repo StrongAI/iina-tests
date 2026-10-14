@@ -6,8 +6,11 @@
 //
 
 import AppKit
+import JavaScriptCore
+import Just
 import MediaPlayer
 import Network
+import PromiseKit
 import Testing
 import WebKit
 @testable import IINA
@@ -3496,6 +3499,348 @@ struct PlayerPlaybackTests {
       try await Self.waitUntil { hold.hasLetGo }
     }
   }
+
+  @Test("A plugin's exec looks up its binary and starts its process on the plugin's queue, returning while the queue is held, then rejects a binary it cannot find and runs one it can")
+  func pluginExecDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+      let marker = folder.appendingPathComponent("exec-marker")
+      let hold = QueueHold(instance.queue, limit: Self.holdLimit)
+      _ = instance.js.evaluateScript("""
+        globalThis.missing = null;
+        globalThis.status = null;
+        iina.utils.exec("\(folder.path)/missing", []).catch(code => { globalThis.missing = code; });
+        iina.utils.exec("/usr/bin/touch", ["\(marker.path)"]).then(result => { globalThis.status = result.status; });
+        """)
+      // A binary looked up on the script's thread would be rejected at once, the rejection being handled once the script has run,
+      // and one started on it would have run in this time.
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let lookedUpWhileHeld = hold.limitPassed || !holds("globalThis.missing === null")
+        || FileManager.default.fileExists(atPath: marker.path)
+      hold.release()
+      #expect(!lookedUpWhileHeld, "A plugin's exec looked up its binary or started its process on the script's thread")
+      try await Self.waitUntil { holds("globalThis.missing !== null && globalThis.status !== null") }
+      #expect(holds("globalThis.missing === -1"))
+      #expect(holds("globalThis.status === 0"))
+      #expect(FileManager.default.fileExists(atPath: marker.path))
+    }
+  }
+
+  /// Run `body` with each Keychain request recorded by a `KeychainRecorder` in place of being made.
+  private static func withKeychainRecorded(_ body: (KeychainRecorder) async throws -> Void) async throws {
+    let keychain = KeychainRecorder()
+    let make = KeychainAccess.makeRequest
+    KeychainAccess.makeRequest = keychain.answer
+    defer { KeychainAccess.makeRequest = make }
+    try await body(keychain)
+  }
+
+  /// Run `body` with the Open Subtitles requests sent to an `OpenSubServer`, logging out of any session it logs in to before the
+  /// server stops.
+  private static func withOpenSubServer(_ body: (OpenSubServer) async throws -> Void) async throws {
+    let server = try await OpenSubServer()
+    let client = OpenSubClient.shared
+    let baseURL = client.apiBaseURL
+    client.apiBaseURL = server.baseURL
+    defer {
+      client.apiBaseURL = baseURL
+      server.stop()
+    }
+    try #require(!client.loggedIn, "Open Subtitles was logged in to before the test")
+    do {
+      try await body(server)
+    } catch {
+      await logOut(of: client)
+      throw error
+    }
+    await logOut(of: client)
+  }
+
+  /// Log out of the Open Subtitles session of `client`, if it has one, and wait until it has.
+  private static func logOut(of client: OpenSubClient) async {
+    guard client.loggedIn else { return }
+    await withCheckedContinuation { continuation in
+      client.logout().done { _ in continuation.resume() }.catch { _ in continuation.resume() }
+    }
+  }
+
+  @Test("An Open Subtitles login reads the configured account's password on the Keychain's queue, returning while the queue is held")
+  func openSubLoginReadsKeychainOffMain() async throws {
+    try await Self.withSettings([.openSubUsername: "iinaTests"]) {
+      try await Self.withKeychainRecorded { keychain in
+        try #require(!OpenSubClient.shared.loggedIn, "Open Subtitles was logged in to before the test")
+        let hold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
+        let login = OpenSub.Fetcher.shared.login()
+        let returnedWhileHeld = !hold.limitPassed && keychain.requests.isEmpty
+        hold.release()
+        #expect(returnedWhileHeld, "An Open Subtitles login read the Keychain on the calling thread")
+        // The account has no password stored, so the login ends once the password is read.
+        await withCheckedContinuation { continuation in
+          login.done { continuation.resume() }.catch { _ in continuation.resume() }
+        }
+        #expect(keychain.requests == [.read(username: "iinaTests", service: .openSubAccount, server: nil, port: nil)])
+      }
+    }
+  }
+
+  @Test("An Open Subtitles search reads the account's password on the Keychain's queue and hashes the file on its own queue, returning while both queues and mpv's core are held")
+  func openSubFetchDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      try await Self.withSettings([.openSubUsername: "iinaTests", .subLang: "en"]) {
+        try await Self.withKeychainRecorded { keychain in
+          try await Self.withOpenSubServer { server in
+            // A file too small for Open Subtitles to hash, so that the search stops once the file is read.
+            let file = folder.appendingPathComponent("small.mp4")
+            try Data(count: 1024).write(to: file)
+            let keychainHold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
+            let hashHold = QueueHold(OpenSub.Fetcher.hashQueue, limit: Self.holdLimit)
+            let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+            let search = OpenSub.Fetcher.shared.fetch(from: file, withProviderID: OnlineSubtitle.Providers.openSub.id,
+                                                      playerCore: player)
+            let returnedWhileHeld = !coreHold.hasLetGo && !keychainHold.limitPassed && keychain.requests.isEmpty
+            coreHold.release()
+            try await Self.waitUntil { coreHold.hasLetGo }
+            keychainHold.release()
+            #expect(returnedWhileHeld, "An Open Subtitles search read the Keychain or waited for mpv on the calling thread")
+            var outcome: Error?
+            var settled = false
+            search.done { _ in settled = true }.catch { error in
+              outcome = error
+              settled = true
+            }
+            // The languages are asked of the server once the password is read, after which the file is hashed on its queue.
+            try await Self.waitUntil { server.requests.contains("GET /api/v1/infos/languages") }
+            try await Task.sleep(for: Self.heldAnswerWindow)
+            let hashedWhileHeld = hashHold.limitPassed || settled
+            hashHold.release()
+            #expect(!hashedWhileHeld, "An Open Subtitles search hashed the file on another queue than its hash queue")
+            try await Self.waitUntil { settled }
+            let error = try #require(outcome)
+            if case OpenSub.Error.fileTooSmall = error {} else {
+              Issue.record("The search ended with \(error) rather than the file being too small to hash")
+            }
+            #expect(keychain.requests == [.read(username: "iinaTests", service: .openSubAccount, server: nil, port: nil)])
+          }
+        }
+      }
+    }
+  }
+
+  @Test("The settings' Open Subtitles login stores the password on the Keychain's queue once the account has logged in, then stores the username")
+  func openSubSettingsLoginStoresPasswordOffMain() async throws {
+    try await Self.withSettings([.openSubUsername: ""]) {
+      try await Self.withKeychainRecorded { keychain in
+        try await Self.withOpenSubServer { server in
+          // The username is stored in the app's own settings, which the argument domain the test settings are in hides, so it is
+          // read from there and put back as it was.
+          let defaults = UserDefaults.standard
+          let domain = try #require(Bundle.main.bundleIdentifier)
+          let key = Preference.Key.openSubUsername.rawValue
+          func storedUsername() -> String? { defaults.persistentDomain(forName: domain)?[key] as? String }
+          let username = storedUsername()
+          defer {
+            if let username {
+              defaults.set(username, forKey: key)
+            } else {
+              defaults.removeObject(forKey: key)
+            }
+          }
+          let controller = PrefSubViewController()
+          // Its view observes plugin changes without keeping the controller.
+          Self.keptObjects.append(controller)
+          _ = controller.view
+          let hold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
+          // The username asked for is entered and the prompt answered, the password being left empty.
+          let prompts = ModalWindowDismisser(entering: "iinaTests")
+          controller.openSubLoginAction(controller)
+          prompts.stop()
+          // Once the account has logged in, the password would be stored at once on the main thread.
+          try await Self.waitUntil { server.requests.contains("POST /api/v1/login") }
+          try await Task.sleep(for: Self.heldAnswerWindow)
+          let storedWhileHeld = hold.limitPassed || !keychain.requests.isEmpty || storedUsername() == "iinaTests"
+          hold.release()
+          #expect(!storedWhileHeld, "The settings' Open Subtitles login stored the password on the main thread")
+          try await Self.waitUntil { storedUsername() == "iinaTests" }
+          #expect(keychain.requests == [
+            .write(username: "iinaTests", password: "", service: .openSubAccount, server: nil, port: nil)
+          ])
+        }
+      }
+    }
+  }
+
+  /// Write `<identifier>-<version>.iinaplgz` in `folder`, the package of a plugin with `identifier`, `version` and the other keys of
+  /// `info`, whose script sets `globalThis.version` to its version.
+  private static func makePluginPackage(in folder: URL, identifier: String, version: String,
+                                        info: [String: Any] = [:]) throws -> URL {
+    let source = folder.appendingPathComponent("\(identifier)-\(version)")
+    try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+    let required: [String: Any] = ["name": "iinaTests", "author": ["name": "iinaTests"], "identifier": identifier,
+                                   "version": version, "entry": "main.js"]
+    let infoFile = source.appendingPathComponent("Info.json")
+    let script = source.appendingPathComponent("main.js")
+    try JSONSerialization.data(withJSONObject: required.merging(info) { $1 }).write(to: infoFile)
+    try "globalThis.version = \"\(version)\";".write(to: script, atomically: true, encoding: .utf8)
+    let package = folder.appendingPathComponent("\(identifier)-\(version).iinaplgz")
+    let zip = Process()
+    zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+    zip.arguments = ["-j", "-q", package.path, infoFile.path, script.path]
+    try zip.run()
+    zip.waitUntilExit()
+    try #require(zip.terminationStatus == 0)
+    return package
+  }
+
+  /// The installed plugin with `identifier`, if there is one.
+  private static func installedPlugin(_ identifier: String) -> JavascriptPlugin? {
+    JavascriptPlugin.plugins.first { $0.identifier == identifier }
+  }
+
+  /// Uninstall the installed plugin with `identifier`, if there is one, leaving none of its settings behind.
+  private static func uninstallPlugin(_ identifier: String) {
+    if let plugin = installedPlugin(identifier) {
+      plugin.enabled = false
+      plugin.remove()
+    }
+    UserDefaults.standard.removeObject(forKey: "PluginEnabled.\(identifier)")
+  }
+
+  /// Run `install`, which installs a plugin through `manager`, while `JavascriptPlugin.installQueue` is held, then let the queue go
+  /// and wait until the install has ended.
+  /// - Returns: Whether the plugin with `identifier` was not installed, nor the install ended, while the queue was held, which an
+  ///     install that unpacks or reads the plugin on the main thread cannot do, and what the install reported.
+  private static func installWhileHeld(_ identifier: String,
+                                       _ install: @escaping (@escaping (PluginManager.Result) -> Void) async -> Void)
+    async throws -> (Bool, PluginManager.Result?) {
+    let reported = Box<PluginManager.Result>()
+    let ended = Box<Bool>()
+    let hold = QueueHold(JavascriptPlugin.installQueue, limit: holdLimit)
+    let task = Task {
+      await install { reported.value = $0 }
+      ended.value = true
+    }
+    try await Task.sleep(for: heldAnswerWindow)
+    let installedWhileHeld = hold.limitPassed || ended.value != nil || installedPlugin(identifier) != nil
+    hold.release()
+    await task.value
+    return (!installedWhileHeld, reported.value)
+  }
+
+  @Test("Installing a plugin package unpacks and reads it on the plugin install queue, returning while the queue is held, then installs and enables the plugin")
+  func pluginPackageInstallDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.package"
+    Self.uninstallPlugin(identifier)
+    defer { Self.uninstallPlugin(identifier) }
+    let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
+    let manager = PluginManager(window: NSWindow())
+    let (offMain, reported) = try await Self.installWhileHeld(identifier) { report in
+      await manager.install(localPackageURL: package, handler: report)
+    }
+    #expect(offMain, "Installing a plugin package unpacked or read it on the main thread")
+    #expect(reported == .installed)
+    let plugin = try #require(Self.installedPlugin(identifier))
+    #expect(plugin.root.path == Utility.pluginsURL.appendingPathComponent("\(identifier).iinaplugin").path)
+    #expect(plugin.version == "1.0")
+    #expect(plugin.enabled)
+  }
+
+  @Test("Installing a plugin from GitHub finds, downloads and unpacks it on the plugin install queue, returning while the queue is held, then installs and enables the plugin")
+  func pluginGitHubInstallDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.github"
+    Self.uninstallPlugin(identifier)
+    defer { Self.uninstallPlugin(identifier) }
+    let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0",
+                                             info: ["ghRepo": "iinaTests/github", "ghVersion": 1])
+    let release = "https://api.github.com/repos/iinaTests/github/releases/latest"
+    let download = "https://github.com/iinaTests/github/releases/download/1.0/iinaTests.iinaplgz"
+    let assets: [String: Any] = ["assets": [["name": "iinaTests.iinaplgz", "browser_download_url": download]]]
+    let github = GitHubRecorder([release: try JSONSerialization.data(withJSONObject: assets),
+                                 download: try Data(contentsOf: package)])
+    let get = JavascriptPlugin.getFromGitHub
+    JavascriptPlugin.getFromGitHub = github.answer
+    defer { JavascriptPlugin.getFromGitHub = get }
+    let manager = PluginManager(window: NSWindow())
+    let (offMain, reported) = try await Self.installWhileHeld(identifier) { report in
+      await manager.install(gitHubString: "iinaTests/github", handler: report)
+    }
+    #expect(offMain, "Installing a plugin from GitHub asked GitHub or unpacked the plugin on the main thread")
+    #expect(reported == .installed)
+    #expect(github.requests == [release, download])
+    let plugin = try #require(Self.installedPlugin(identifier))
+    #expect(plugin.root.path == Utility.pluginsURL.appendingPathComponent("\(identifier).iinaplugin").path)
+    #expect(plugin.githubRepo == "iinaTests/github")
+    #expect(plugin.enabled)
+  }
+
+  /// Wait until `window` shows a sheet, then answer it with `response`.
+  private static func answerSheet(of window: NSWindow, with response: NSApplication.ModalResponse) async throws {
+    try await waitUntil { window.attachedSheet != nil }
+    let sheet = try #require(window.attachedSheet)
+    window.endSheet(sheet, returnCode: response)
+  }
+
+  @Test("Updating a plugin from GitHub downloads and unpacks the update, moves it to the old plugin's place and reads its script on the plugin install queue, returning while the queue is held, then loads it in each player")
+  func pluginUpdateDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let identifier = "io.iina.tests.update"
+      // Plugins are loaded in the players of the app, among which the test's player is listed while it runs.
+      PlayerCore.playerCores.append(player)
+      defer { PlayerCore.playerCores.removeAll { $0 === player } }
+      Self.uninstallPlugin(identifier)
+      defer { Self.uninstallPlugin(identifier) }
+      let window = NSWindow()
+      let manager = PluginManager(window: window)
+      let installed = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0",
+                                                 info: ["ghRepo": "iinaTests/update", "ghVersion": 1])
+      await manager.install(localPackageURL: installed)
+      let plugin = try #require(Self.installedPlugin(identifier))
+      let position = try #require(JavascriptPlugin.plugins.firstIndex(of: plugin))
+      let update = try Self.makePluginPackage(in: folder, identifier: identifier, version: "2.0",
+                                              info: ["ghRepo": "iinaTests/update", "ghVersion": 2])
+      let latest = "https://raw.githubusercontent.com/iinaTests/update/main/Info.json"
+      let release = "https://api.github.com/repos/iinaTests/update/releases/latest"
+      let download = "https://github.com/iinaTests/update/releases/download/2.0/iinaTests.iinaplgz"
+      let assets: [String: Any] = ["assets": [["name": "iinaTests.iinaplgz", "browser_download_url": download]]]
+      let github = GitHubRecorder([
+        latest: try JSONSerialization.data(withJSONObject: ["ghVersion": 2, "version": "2.0"] as [String: Any]),
+        release: try JSONSerialization.data(withJSONObject: assets),
+        download: try Data(contentsOf: update),
+      ])
+      let get = JavascriptPlugin.getFromGitHub
+      JavascriptPlugin.getFromGitHub = github.answer
+      defer { JavascriptPlugin.getFromGitHub = get }
+      let updated = Box<(PluginManager.Result, JavascriptPlugin?)>()
+      let hold = QueueHold(JavascriptPlugin.installQueue, limit: Self.holdLimit)
+      let task = Task { updated.value = await manager.update(plugin) }
+      // The update found is installed once the user agrees, after which it is downloaded on the held queue.
+      try await Self.answerSheet(of: window, with: .alertFirstButtonReturn)
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let updatedWhileHeld = hold.limitPassed || updated.value != nil || github.requests != [latest]
+        || Self.installedPlugin(identifier) !== plugin
+      hold.release()
+      await task.value
+      #expect(!updatedWhileHeld, "Updating a plugin asked GitHub, unpacked the update or moved it on the main thread")
+      let (result, newPlugin) = try #require(updated.value)
+      #expect(result == .installed)
+      #expect(github.requests == [latest, release, download])
+      let installedUpdate = try #require(newPlugin)
+      #expect(Self.installedPlugin(identifier) === installedUpdate)
+      #expect(JavascriptPlugin.plugins.firstIndex(of: installedUpdate) == position)
+      #expect(installedUpdate.version == "2.0")
+      #expect(installedUpdate.root.path == Utility.pluginsURL.appendingPathComponent("\(identifier).iinaplugin").path)
+      #expect(installedUpdate.entryScripts.isEmpty)
+      // The player's instance of the plugin is made again from the update's script.
+      let instance = try #require(player.plugins.first { $0.plugin === installedUpdate })
+      #expect(instance.js.evaluateScript("globalThis.version === \"2.0\"").toBool())
+    }
+  }
 }
 
 private final class PlayerPlaybackTestsBundle {}
@@ -3513,6 +3858,12 @@ private final class PlaylistChangeRecord: @unchecked Sendable {
   func classes(for player: PlayerCore) -> [qos_class_t] {
     lock.withLock { classes[ObjectIdentifier(player)] ?? [] }
   }
+}
+
+/// A value kept on the main thread.
+@MainActor
+private final class Box<Value> {
+  var value: Value?
 }
 
 /// A drop of files on a view, carrying their paths on a pasteboard of its own as a drag from Finder does.
@@ -3776,6 +4127,164 @@ private final class WorkspaceRecorder: @unchecked Sendable {
     made.append(request)
     lock.unlock()
     return true
+  }
+}
+
+/// Records the Keychain requests made, in place of making them, answering as a Keychain with no password stored.
+private final class KeychainRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var made: [KeychainAccess.Request] = []
+
+  /// The requests recorded, in the order they were made.
+  var requests: [KeychainAccess.Request] {
+    lock.lock()
+    defer { lock.unlock() }
+    return made
+  }
+
+  /// Record `request`, from any thread.
+  /// - Returns: Nothing for a write. A read throws, finding no password.
+  func answer(_ request: KeychainAccess.Request) throws -> (username: String, password: String)? {
+    lock.lock()
+    made.append(request)
+    lock.unlock()
+    if case .read = request {
+      throw KeychainAccess.KeychainError.noResult
+    }
+    return nil
+  }
+}
+
+/// Answers the GitHub requests of installing and updating a plugin in place of GitHub, recording them.
+private final class GitHubRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var made: [String] = []
+  private let answers: [String: Data]
+
+  /// - Parameter answers: The content answered for each URL. Any other URL is answered as not found.
+  init(_ answers: [String: Data]) {
+    self.answers = answers
+  }
+
+  /// The URLs asked, in the order they were asked.
+  var requests: [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return made
+  }
+
+  /// Record a request of `url` and answer it, from any thread.
+  func answer(_ url: String) -> HTTPResult {
+    lock.lock()
+    made.append(url)
+    lock.unlock()
+    let content = answers[url]
+    let response = HTTPURLResponse(url: URL(string: url)!, statusCode: content == nil ? 404 : 200, httpVersion: nil,
+                                   headerFields: nil)
+    return HTTPResult(data: content, response: response, error: nil, task: nil)
+  }
+}
+
+/// A local HTTP server answering, in place of Open Subtitles, the methods of its REST API that the tests call.
+private final class OpenSubServer {
+  /// The method and path of each request received, in the order received.
+  private final class Log: @unchecked Sendable {
+    private let lock = NSLock()
+    private var received: [String] = []
+
+    var requests: [String] {
+      lock.lock()
+      defer { lock.unlock() }
+      return received
+    }
+
+    func append(_ request: String) {
+      lock.lock()
+      received.append(request)
+      lock.unlock()
+    }
+  }
+
+  /// The JSON answered for each method and path.
+  private static let answers: [String: String] = [
+    "GET /api/v1/infos/languages": #"{"data": [{"language_code": "en", "language_name": "English"}]}"#,
+    "POST /api/v1/login": #"{"user": {"allowed_downloads": 20, "allowed_translations": 1, "ext_installed": false, "level": "Sub leecher", "user_id": 1, "vip": false}, "token": "iinaTests", "status": 200}"#,
+    "DELETE /api/v1/logout": #"{"message": "token successfully destroyed", "status": 200}"#,
+  ]
+
+  private let listener: NWListener
+  private let log: Log
+  /// The URL the REST API methods are under, for `OpenSubClient.apiBaseURL`.
+  let baseURL: URL
+
+  /// The method and path of each request received, such as `GET /api/v1/infos/languages`, in the order received.
+  var requests: [String] { log.requests }
+
+  init() async throws {
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+    let listener = try NWListener(using: parameters)
+    let queue = DispatchQueue(label: "iinaTests-opensub")
+    let log = Log()
+    listener.newConnectionHandler = { connection in
+      connection.start(queue: queue)
+      Self.receive(on: connection, after: Data(), log: log)
+    }
+    let port: NWEndpoint.Port = try await withCheckedThrowingContinuation { continuation in
+      listener.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+          listener.stateUpdateHandler = nil
+          if let port = listener.port {
+            continuation.resume(returning: port)
+          } else {
+            continuation.resume(throwing: NWError.posix(.EADDRNOTAVAIL))
+          }
+        case .failed(let error):
+          listener.stateUpdateHandler = nil
+          continuation.resume(throwing: error)
+        default:
+          break
+        }
+      }
+      listener.start(queue: queue)
+    }
+    self.listener = listener
+    self.log = log
+    baseURL = URL(string: "http://127.0.0.1:\(port.rawValue)/api/v1/")!
+  }
+
+  func stop() {
+    listener.cancel()
+  }
+
+  /// Read a request from `connection`, of which `received` has been read, and answer it once its head and body are read.
+  private static func receive(on connection: NWConnection, after received: Data, log: Log) {
+    connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
+      let request = received + (data ?? Data())
+      func readMore() {
+        if isComplete || error != nil {
+          connection.cancel()
+        } else {
+          receive(on: connection, after: request, log: log)
+        }
+      }
+      guard let headEnd = request.range(of: Data("\r\n\r\n".utf8)) else { return readMore() }
+      let lines = String(decoding: request[..<headEnd.lowerBound], as: UTF8.self).components(separatedBy: "\r\n")
+      let length = lines.dropFirst().compactMap { line -> Int? in
+        let field = line.split(separator: ":", maxSplits: 1)
+        guard field.count == 2, field[0].lowercased() == "content-length" else { return nil }
+        return Int(field[1].trimmingCharacters(in: .whitespaces))
+      }.first ?? 0
+      guard request.count - headEnd.upperBound >= length else { return readMore() }
+      let method = lines[0].split(separator: " ").prefix(2).joined(separator: " ")
+      log.append(method)
+      let content = Data((answers[method] ?? "{}").utf8)
+      let status = answers[method] == nil ? "404 Not Found" : "200 OK"
+      let head = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(content.count)\r\n"
+        + "Connection: close\r\n\r\n"
+      connection.send(content: Data(head.utf8) + content, completion: .contentProcessed { _ in connection.cancel() })
+    }
   }
 }
 
