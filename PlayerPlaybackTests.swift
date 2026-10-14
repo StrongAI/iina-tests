@@ -944,6 +944,50 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A video reconfig keeping the display size, one carrying no size as mpv quits, and one reported while no file is loaded store no size")
+  func videoReconfigKeepsSize() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      let width = try #require(player.info.displayWidth)
+      let height = try #require(player.info.displayHeight)
+      let rotation = player.info.rotation
+      let videoParamsRotation = player.info.videoParamsRotation
+      func reconfig(_ dwidth: Int, _ dheight: Int, videoParamsRotation: Int, coreIdle: Bool) -> PlayerCore.VideoReconfig {
+        PlayerCore.VideoReconfig(dwidth: dwidth, dheight: dheight, videoParamsRotation: videoParamsRotation, rotation: rotation,
+                                 coreIdle: coreIdle)
+      }
+      // The display size the player has: the rotations given are stored, and the size stays.
+      player.onVideoReconfig(reconfig(width, height, videoParamsRotation: videoParamsRotation + 180, coreIdle: false))
+      #expect(player.info.videoParamsRotation == videoParamsRotation + 180)
+      #expect(player.info.displayWidth == width && player.info.displayHeight == height)
+      // No display size, with the core idle, as mpv quits.
+      player.onVideoReconfig(reconfig(0, 0, videoParamsRotation: videoParamsRotation, coreIdle: true))
+      #expect(player.info.displayWidth == width && player.info.displayHeight == height)
+      // A changed display size once no file is loaded.
+      player.mainWindow.close()
+      try await Self.waitUntil { player.info.state == .idle }
+      let stored = (width: player.info.displayWidth, height: player.info.displayHeight)
+      player.onVideoReconfig(reconfig(width * 2, height * 2, videoParamsRotation: videoParamsRotation, coreIdle: false))
+      #expect(player.info.displayWidth == stored.width && player.info.displayHeight == stored.height)
+    }
+  }
+
+  @Test("The window stores and sets no window scale while the player has no video width, and stores the scale of its frame once it has one")
+  func windowScaleNeedsVideoWidth() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      let videoWidth = try #require(player.info.videoWidth)
+      player.info.videoWidth = nil
+      player.info.cachedWindowScale = 0.25
+      player.mainWindow.updateWindowParametersForMPV()
+      #expect(player.info.cachedWindowScale == 0.25)
+      player.info.videoWidth = videoWidth
+      player.mainWindow.updateWindowParametersForMPV()
+      let frame = try #require(player.mainWindow.window).frame
+      #expect(player.info.cachedWindowScale == Double(frame.width) / Double(videoWidth))
+    }
+  }
+
   @Test("The mpv options given on the command line are set in requests that return before mpv handles them")
   func commandLineOptionsDoNotWait() async throws {
     try await Self.withPlayer { player, _ in
