@@ -1351,7 +1351,7 @@ struct PlayerPlaybackTests {
     case subTextColorWell, subBackColorWell, subBorderColorWell, aspectSegment, rotationSegment, hwdecSwitch, speedEdit
     case speedReset, videoEqualizerReset, videoEqualizerSlider, audioDelayEdit, audioDelayReset, subDelayEdit, subDelayReset
     case audioDelayShown, subDelayShown, subPosShown, subScaleShown, subTextStyleShown, speedShown, osdChapterShown
-    case menuSubFont, chooseSubFont, subFontButton
+    case menuSubFont, chooseSubFont, subFontButton, loopButton, loopShown
   }
 
   @Test("Each control of a player's window, sidebar or menu asks mpv in a request that returns before mpv handles it, and each view of a setting shows what mpv has without waiting for it",
@@ -1408,6 +1408,22 @@ struct PlayerPlaybackTests {
         let pane = Self.kept(SidebarPlaylistPane(player: player))
         ask = { pane.shuffleBtnAction(NSButton()) }
         applied = { player.info.isShuffled }
+      case .loopButton:
+        // No loop is set, so the loop mode the button moves to loops the file.
+        try #require(player.getLoopMode() == .off)
+        let pane = Self.kept(SidebarPlaylistPane(player: player))
+        ask = { pane.loopBtnAction(NSButton()) }
+        applied = { mpv.getString(MPVOption.PlaybackControl.loopFile) == "inf" }
+      case .loopShown:
+        // The button shows the file loop mpv reports. It is then cleared, and shows again the loop mode the player stored.
+        let pane = Self.kept(SidebarPlaylistPane(player: player))
+        let button = try #require(Self.controls(NSButton.self, sending: "loopBtnAction:", under: pane).first)
+        _ = mpv.setString(MPVOption.PlaybackControl.loopFile, "inf")
+        try await Self.waitUntil { player.getLoopMode() == .file && button.contentTintColor != nil }
+        button.contentTintColor = nil
+        button.image = nil
+        ask = { pane.updateLoopBtnStatus() }
+        applied = { button.contentTintColor != nil && button.image != nil }
       case .subVisibilitySwitch, .secondSubVisibilitySwitch:
         let isPrimary = request == .subVisibilitySwitch
         let option = isPrimary ? MPVOption.Subtitles.subVisibility : MPVOption.Subtitles.secondarySubVisibility
@@ -2725,9 +2741,13 @@ struct PlayerPlaybackTests {
 
   /// Run `request`, which asks for the thumbnails of the player's file, while the core of the player's `mpv` and the queue the player
   /// checks the file system for thumbnails on are held, the thumbnails being asked of FFmpeg rather than read from a cache.
-  /// - Returns: Whether `request` returned while both were held, before FFmpeg was asked for the thumbnails, which a request that
-  ///   waits for `mpv` or reads the file system on the calling thread cannot do. FFmpeg has been asked once both are let go.
-  private static func thumbnailsAskedOffMain(_ player: PlayerCore, _ request: () -> Void) async throws -> Bool {
+  /// - Parameter settled: Holds once what `request` leaves to the main thread until `mpv` answers has run. It is waited for once the
+  ///   core is let go, while the queue is still held.
+  /// - Returns: Whether `request` returned while both were held, and FFmpeg had not been asked for the thumbnails once `settled`
+  ///   held, which a request that waits for `mpv` or reads the file system on the main thread cannot do. FFmpeg has been asked once
+  ///   both are let go.
+  private static func thumbnailsAskedOffMain(_ player: PlayerCore, settled: () -> Bool = { true },
+                                             _ request: () -> Void) async throws -> Bool {
     let queue = try #require(player.ffmpegController.value(forKey: "queue") as? OperationQueue)
     player.ffmpegController.cancelThumbnailGeneration()
     queue.isSuspended = true
@@ -2744,7 +2764,8 @@ struct PlayerPlaybackTests {
       request()
       askedWhileHeld = asked()
     }
-    let checkedOffMain = returnedWhileHeld && !hold.limitPassed && !askedWhileHeld
+    try await waitUntil(settled)
+    let checkedOffMain = returnedWhileHeld && !hold.limitPassed && !askedWhileHeld && !asked()
     hold.release()
     try await waitUntil(asked)
     return checkedOffMain
@@ -2783,6 +2804,37 @@ struct PlayerPlaybackTests {
         player.mainWindow.isVideoLoaded = false
         let checkedOffMain = try await Self.thumbnailsAskedOffMain(player) { player.notifyWindowVideoSizeChanged() }
         #expect(checkedOffMain, "A video size change the player was told of waited for mpv or read the file system on the main thread")
+        #expect(player.mainWindow.isVideoLoaded)
+      }
+    }
+  }
+
+  /// `read` with no video track selected, as for a file played without its video.
+  private static func withoutVideo(_ read: PlayerCore.LoadedFile) -> PlayerCore.LoadedFile {
+    let tracks = read.selectedTracks
+    return PlayerCore.LoadedFile(width: read.width, height: read.height, duration: read.duration, position: read.position,
+                                 remaining: read.remaining, path: read.path, mediaTitle: read.mediaTitle,
+                                 trackList: read.trackList,
+                                 selectedTracks: PlayerCore.SelectedTracks(aid: tracks.aid, vid: 0, sid: tracks.sid,
+                                                                           secondSid: tracks.secondSid),
+                                 chapters: read.chapters, abLoopA: read.abLoopA, abLoopB: read.abLoopB,
+                                 fullscreen: read.fullscreen, ontop: read.ontop)
+  }
+
+  @Test("A loaded file with no video selected sizes the window and asks for the thumbnails without waiting for mpv or the file system")
+  func fileLoadedWithoutVideoAsksThumbnailsOffMain() async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSettings([.enableThumbnailPreview: true, .enableThumbnailForRemoteFiles: false,
+                                   .autoSwitchToMusicMode: false]) {
+        let read = Self.readLoadedFile(of: player)
+        // The window has not loaded video, so it sizes itself for the file. The file having just loaded, the player asks for the
+        // thumbnails itself, once mpv has answered whether playback is paused and the play state is decided.
+        player.mainWindow.isVideoLoaded = false
+        let checkedOffMain = try await Self.thumbnailsAskedOffMain(player, settled: { player.info.state != .loaded }) {
+          player.fileLoaded(Self.withoutVideo(read))
+        }
+        #expect(checkedOffMain, "Storing a loaded file with no video waited for mpv or read the file system on the main thread")
+        #expect(player.info.vid == 0)
         #expect(player.mainWindow.isVideoLoaded)
       }
     }
