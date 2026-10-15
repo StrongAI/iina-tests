@@ -1003,6 +1003,43 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Shuffling for the command line's shuffle hook asks mpv to shuffle and play the first entry in requests that return before mpv handles them, letting mpv go on from the hook once it has")
+  func shuffleHookDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      // Playing another entry first shows that the first entry was played.
+      player.playFileInPlaylist(2)
+      try await Self.waitForEntry(2, of: player)
+      var wentOn = false
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        player.shuffleForStartFile { DispatchQueue.main.async { wentOn = true } }
+      }
+      #expect(returnedWhileHeld, "Shuffling for the shuffle hook waited for mpv")
+      #expect(player.info.isShuffled)
+      try await Self.waitUntil { wentOn }
+      #expect(player.mpv.getInt(MPVProperty.playlistPos) == 0)
+    }
+  }
+
+  @Test("A playback restart mpv reports is handled on the main thread without waiting for mpv, the filters IINA labels being stored from the lists mpv answers")
+  func playbackRestartedDoesNotWait() async throws {
+    // Hardware decoding is off from the start: adding a filter while it is set to auto asks the user first.
+    try await Self.withSettings([.hardwareDecoder: Preference.HardwareDecoderOption.disabled.rawValue]) {
+      try await Self.withPlayer { player, _ in
+        player.syncUITimer?.invalidate()
+        player.setFlip(true)
+        try await Self.waitUntil {
+          player.mpv.getFilters(MPVProperty.vf).contains { $0.label == Constants.FilterName.flip } && player.info.flipFilter != nil
+        }
+        // A flip filter the player does not know of shows that the player stores the filter list mpv answers.
+        player.info.flipFilter = nil
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.playbackRestarted() }
+        #expect(returnedWhileHeld, "Handling a playback restart waited for mpv")
+        try await Self.waitUntil { player.info.flipFilter?.label == Constants.FilterName.flip }
+      }
+    }
+  }
+
   @Test("Files the system asks the app to open are made into file URLs off the main thread, then opened")
   func systemOpenDoesNotReadOnMain() async throws {
     try await Self.withPlayer { _, folder in
@@ -1222,7 +1259,8 @@ struct PlayerPlaybackTests {
     case subOutlineSize, subBackColor, subEncoding, subFont, audioDevice, frameStep, shuffle, externalVideo, chapter
     case menuSpeed, menuVolume, menuMute, menuAudioDelay, menuResetAudioDelay, menuSubDelay, menuResetSubDelay, menuSubScale
     case menuDeinterlace, menuAspect, menuRotation, menuSubVisibility, menuSecondSubVisibility, menuStepFrame, menuNextChapter
-    case menuPreviousChapter, menuCycleVideo
+    case menuPreviousChapter, menuCycleVideo, menuChapter, menuTrack, menuSubEncoding, menuSnapshot, chosenSub, externalSub
+    case externalSubDelayed
   }
 
   @Test("Each setting a player or its window's menu asks of mpv is asked in a request that returns before mpv handles it",
@@ -1354,6 +1392,36 @@ struct PlayerPlaybackTests {
       case .menuCycleVideo:
         ask = { handler.menuCycleTrack(item(tag: 0)) }
         applied = { mpv.getString(MPVOption.TrackSelection.vid) == "no" }
+      case .menuChapter:
+        // The test files have no chapters, so the player is given one starting 2 s in, which choosing it in the menu seeks to.
+        player.info.chapters = [MPVChapter(title: "iinaTests", startTime: 2, index: 0)]
+        ask = { handler.menuChapterSwitch(item(tag: 0)) }
+        applied = { mpv.getDouble(MPVProperty.timePos) >= 1.9 }
+      case .menuTrack:
+        // The video track is turned off first, so choosing it in the menu shows as mpv selecting it again.
+        let track = try #require(player.info.videoTracks.first)
+        mpv.setString(MPVOption.TrackSelection.vid, "no")
+        try await Self.waitUntil { player.info.vid == 0 }
+        ask = { handler.menuChangeTrack(item(track)) }
+        applied = { mpv.getString(MPVOption.TrackSelection.vid) == String(track.id) }
+      case .menuSubEncoding:
+        ask = { handler.menuSetSubEncoding(item("cp1252")) }
+        applied = { mpv.getString(MPVOption.Subtitles.subCodepage) == "cp1252" }
+      case .menuSnapshot:
+        mpv.setString(MPVOption.Screenshot.screenshotDir, folder.path)
+        let files = try FileManager.default.contentsOfDirectory(atPath: folder.path).count
+        ask = { handler.menuSnapshot(item()) }
+        applied = { (try? FileManager.default.contentsOfDirectory(atPath: folder.path).count) ?? files > files }
+      case .chosenSub, .externalSub, .externalSubDelayed:
+        let subtitle = folder.appendingPathComponent("b.srt")
+        try "1\n00:00:00,000 --> 00:00:04,000\nSubtitle\n".write(to: subtitle, atomically: true, encoding: .utf8)
+        switch request {
+        case .chosenSub: ask = { player.mainWindow.chosenSubFromMenu(item(FileInfo(subtitle))) }
+        // Loading a subtitle chosen in an open panel delays showing it, as the menu and the sidebar ask.
+        case .externalSubDelayed: ask = { player.loadExternalSubFile(subtitle, delay: true) }
+        default: ask = { player.loadExternalSubFile(subtitle) }
+        }
+        applied = { player.info.subTracks.contains { $0.externalFilename == subtitle.path } }
       }
       let returnedWhileHeld = try await Self.returnsWhileHeld(player, ask)
       #expect(returnedWhileHeld, "Asking for \(request) waited for mpv")
@@ -1686,7 +1754,7 @@ struct PlayerPlaybackTests {
   /// main thread.
   enum AppRequest: String, CaseIterable, Sendable {
     case fullScreenState, preferenceOptions, spdif, urlScheme, externalAudio, mouseResetSpeed, menuTogglePause, remotePlaybackRate
-    case jsSpeed, jsChapter, jsAudioDelay, jsSubDelay, jsVolume, jsMute, jsLoadTrack
+    case jsSpeed, jsChapter, jsAudioDelay, jsSubDelay, jsVolume, jsMute, jsLoadTrack, jsTrack
   }
 
   @Test("Each request the app, the settings, the system or a plugin makes of a player asks mpv in a request that returns before mpv handles it",
@@ -1818,6 +1886,13 @@ struct PlayerPlaybackTests {
       case .jsMute:
         ask = script("iina.core.audio.muted = true")
         applied = { mpv.getFlag(MPVOption.Audio.mute) }
+      case .jsTrack:
+        // The video track is turned off first, so a plugin choosing it shows as mpv selecting it again.
+        let track = try #require(player.info.videoTracks.first)
+        mpv.setString(MPVOption.TrackSelection.vid, "no")
+        try await Self.waitUntil { player.info.vid == 0 }
+        ask = script("iina.core.video.id = \(track.id)")
+        applied = { mpv.getString(MPVOption.TrackSelection.vid) == String(track.id) }
       }
       defer { cleanUp() }
       let returnedWhileHeld = try await Self.returnsWhileHeld(held, ask)
@@ -2873,7 +2948,9 @@ struct PlayerPlaybackTests {
       let name = "com.apple.lastuseddate#PS"
       removexattr(path, name, 0)
       func written() -> Bool { getxattr(path, name, nil, 0, 0, 0) > 0 }
-      let hold = QueueHold(player.backgroundQueue, limit: Self.holdLimit)
+      // The background queue may be finishing the open's search for files to load, which posts notifications observed on the main
+      // queue, so the hold is awaited rather than waited for.
+      let hold = await QueueHold.reached(player.backgroundQueue, limit: Self.holdLimit)
       player.fileStarted(path: path)
       let returnedWhileHeld = !hold.limitPassed && !written()
       hold.release()
@@ -3668,6 +3745,19 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { icon != nil }
   }
 
+  @Test("Adding a URL given in the playlist's add URL panel asks mpv in a request that returns before mpv handles it, then adds the URL at the end")
+  func playlistAddURLDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let url = "https://example.com/iinatest.mp4"
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { pane.addURL(url) }
+      #expect(returnedWhileHeld, "Adding a URL to the playlist waited for mpv")
+      await Self.readPlaylist(of: player)
+      #expect(player.info.$playlist.withLock { $0.last?.filename } == url)
+    }
+  }
+
   @Test("Adding chosen files to the playlist searches their folders on the player's open queue, returning while the queue is held, then adds the playable files at the end")
   func playlistAddFilesDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
@@ -3858,7 +3948,8 @@ struct PlayerPlaybackTests {
         let crop = MPVFilter.crop(w: 16, h: 16, x: 0, y: 0)
         let croppedByFilterWhileHeld = try await Self.returnsWhileHeld(player) { player.setCrop(fromFilter: crop) }
         #expect(croppedByFilterWhileHeld, "Cropping the video with a crop filter waited for mpv")
-        try await Self.waitUntil { labels().contains(Constants.FilterName.crop) && player.info.cropFilter === crop }
+        // A refresh of the paused frame after the filter is added can replace info.cropFilter with the filter as mpv lists it, an equal object.
+        try await Self.waitUntil { labels().contains(Constants.FilterName.crop) && player.info.cropFilter == crop }
         let cropRemovedWhileHeld = try await Self.returnsWhileHeld(player) { player.removeCropFilter() }
         #expect(cropRemovedWhileHeld, "Removing the crop filter waited for mpv")
         try await Self.waitUntil { !labels().contains(Constants.FilterName.crop) }
@@ -4587,7 +4678,30 @@ private final class QueueHold: @unchecked Sendable {
   private var passed = false
 
   /// Hold `queue`, returning once the queue has reached the hold.
-  init(_ queue: DispatchQueue, limit: DispatchTimeInterval) {
+  convenience init(_ queue: DispatchQueue, limit: DispatchTimeInterval) {
+    self.init(holding: queue, limit: limit)
+    // The run loop goes on running the work queued on this thread until the queue reaches the hold, since the work the queue is
+    // finishing may wait for this thread, as a notification posted from the queue waits for its main queue observers.
+    while reached.wait(timeout: .now()) == .timedOut {
+      RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+    }
+  }
+
+  /// Hold `queue`, returning once the queue has reached the hold without blocking the calling thread meanwhile. A queue whose work
+  /// posts a notification waits for the notification's main queue observers, which a main thread blocked in the synchronous
+  /// initializer cannot run, a run loop run from within the main queue's work not running the main queue again.
+  static func reached(_ queue: DispatchQueue, limit: DispatchTimeInterval) async -> QueueHold {
+    let hold = QueueHold(holding: queue, limit: limit)
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        hold.reached.wait()
+        continuation.resume()
+      }
+    }
+    return hold
+  }
+
+  private init(holding queue: DispatchQueue, limit: DispatchTimeInterval) {
     queue.async {
       self.reached.signal()
       if self.released.wait(timeout: .now() + limit) == .timedOut {
@@ -4595,11 +4709,6 @@ private final class QueueHold: @unchecked Sendable {
         self.passed = true
         self.lock.unlock()
       }
-    }
-    // The run loop goes on running the work queued on this thread until the queue reaches the hold, since the work the queue is
-    // finishing may wait for this thread, as a notification posted from the queue waits for its main queue observers.
-    while reached.wait(timeout: .now()) == .timedOut {
-      RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
     }
   }
 
