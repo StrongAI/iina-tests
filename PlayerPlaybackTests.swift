@@ -3481,6 +3481,55 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Drags of a folder onto the welcome window and the video view are answered from its name, a 3D LUT file dropped on the welcome window is added while mpv's core is held, and a file dropped on the video view is made into a URL on the player's open queue, the drop returning while the queue is held")
+  func viewDropsDoNotWait() async throws {
+    // Hardware decoding is off from the start: adding a filter while it is set to auto asks the user first.
+    try await Self.withSettings([.hardwareDecoder: Preference.HardwareDecoderOption.disabled.rawValue]) {
+      try await Self.withPlayer { player, folder in
+        player.syncUITimer?.invalidate()
+        let controller: InitialWindowController = player.initialWindow
+        // The window is made when it is first shown.
+        controller.showWindow(nil)
+        let contentView = try #require(controller.window?.contentView as? InitialWindowContentView)
+        defer { controller.close() }
+        // Read, an empty folder holds nothing that can be opened, so a drag answered from what the folder holds is refused.
+        let empty = folder.appendingPathComponent("empty")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        #expect(contentView.draggingEntered(FileDrop([empty])) == .copy)
+        let videoView = player.mainWindow.videoView
+        #expect(videoView.draggingEntered(FileDrop([empty])) == .copy)
+        #expect(videoView.hasPlayableFiles)
+        let lut = folder.appendingPathComponent("look.cube")
+        // The identity 3D LUT of size 2, red changing fastest.
+        let lattice = (0..<8).map { "\($0 & 1) \(($0 >> 1) & 1) \(($0 >> 2) & 1)" }
+        try (["LUT_3D_SIZE 2"] + lattice).joined(separator: "\n").write(to: lut, atomically: true, encoding: .utf8)
+        let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+        let waiting = player.mpv.replyCallbacks.count
+        #expect(contentView.performDragOperation(FileDrop([lut])))
+        // A held core answers nothing, so a request that does not wait stays registered until the core is let go, while one that
+        // waits keeps the main thread from checking until the hold reaches its limit and lets go.
+        try await Self.waitUntil { player.mpv.replyCallbacks.count > waiting || coreHold.hasLetGo }
+        let addedWhileHeld = !coreHold.hasLetGo
+        coreHold.release()
+        try await Self.waitUntil { coreHold.hasLetGo }
+        #expect(addedWhileHeld, "Adding the 3D LUT file dropped on the welcome window waited for mpv")
+        try await Self.waitUntil { player.mpv.getFilters(MPVProperty.vf).contains { $0.label == "iina_quickl3d" } }
+        let file = folder.appendingPathComponent("c.mp4")
+        let queueHold = QueueHold(player.openQueue, limit: Self.holdLimit)
+        let accepted = player.mainWindow.videoView.performDragOperation(FileDrop([file]))
+        // An open is recorded on the main thread as it starts, so an open recorded while the queue is held made its URL on the main
+        // thread.
+        let openedWhileHeld = queueHold.limitPassed || !player.opensFindingFiles.isEmpty
+        queueHold.release()
+        #expect(accepted)
+        #expect(!openedWhileHeld, "The file dropped on the video view was made into a URL on the main thread")
+        try await Self.waitUntil {
+          player.info.currentURL?.path == file.path && player.info.state == .paused && !player.info.pausedForLoading
+        }
+      }
+    }
+  }
+
   @Test("The playlist pane of a player no longer active reads nothing when the playlist is reported changed")
   func playlistPaneInactive() async throws {
     try await Self.withPlayer { player, _ in
@@ -3555,6 +3604,218 @@ struct PlayerPlaybackTests {
           .write(username: "new-user", password: "new-password", service: service, server: nil, port: nil),
           .read(username: "stored-user", service: service, server: nil, port: nil)
         ])
+      }
+    }
+  }
+
+  @Test("The welcome window finds whether the last played file exists, which recent documents to list and the icons it shows on its file queue, returning while the queue is held, then shows the last played file")
+  func initialWindowDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let file = folder.appendingPathComponent("last.mp4")
+      try Data().write(to: file)
+      try await Self.withSettings([.recordRecentFiles: true, .resumeLastPosition: true,
+                                   .iinaLastPlayedFilePath: file.path, .iinaLastPlayedFilePosition: 75.0]) {
+        let controller: InitialWindowController = player.initialWindow
+        let hold = QueueHold(InitialWindowController.fileQueue, limit: Self.holdLimit)
+        controller.showWindow(nil)
+        // A last played file looked at on the main thread would be shown by the time the window is.
+        let lookedWhileHeld = hold.limitPassed || !controller.lastFileNameLabel.stringValue.isEmpty
+        hold.release()
+        #expect(!lookedWhileHeld, "The welcome window looked at the last played file on the main thread")
+        try await Self.waitUntil { !controller.lastFileContainerView.isHidden }
+        #expect(controller.lastFileNameLabel.stringValue == "last.mp4")
+        #expect(!controller.recentDocuments.contains { $0.resolvingSymlinksInPath() == file.resolvingSymlinksInPath() })
+        controller.close()
+      }
+    }
+  }
+
+  @Test("Pasting files into the playlist searches their folders on the player's open queue, returning while the queue is held, then adds the playable files")
+  func playlistPasteDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let subfolder = folder.appendingPathComponent("more")
+      try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true)
+      try Data().write(to: subfolder.appendingPathComponent("d.mp4"))
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let count = player.info.$playlist.withLock { $0.count }
+      // Adding to the playlist turns shuffling off at once, so shuffling still on shows that nothing was added yet.
+      player.info.isShuffled = true
+      let hold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      // The drop is kept until the paste has read its pasteboard, which it releases when it goes.
+      let drop = FileDrop([subfolder])
+      let accepted = withExtendedLifetime(drop) { pane.pasteFromPasteboard(row: count, from: drop.draggingPasteboard) }
+      let addedWhileHeld = hold.limitPassed || !player.info.isShuffled
+      hold.release()
+      #expect(accepted)
+      #expect(!addedWhileHeld, "Pasting files into the playlist searched their folders on the main thread")
+      try await Self.waitUntil { player.info.$playlist.withLock { $0.count } == count + 1 }
+      #expect(!player.info.isShuffled)
+    }
+  }
+
+  @Test("The icon of a file's type is looked up on the icon queue, the lookup returning while the queue is held, then handed back on the main thread")
+  func fileTypeIconDoesNotWait() async throws {
+    let hold = QueueHold(Utility.iconQueue, limit: Self.holdLimit)
+    var icon: NSImage?
+    Utility.icon(for: URL(fileURLWithPath: "/iinaTests/a.mp4")) { icon = $0 }
+    let lookedUpWhileHeld = hold.limitPassed || icon != nil
+    hold.release()
+    #expect(!lookedUpWhileHeld, "The icon of a file's type was looked up on the main thread")
+    try await Self.waitUntil { icon != nil }
+  }
+
+  @Test("Adding chosen files to the playlist searches their folders on the player's open queue, returning while the queue is held, then adds the playable files at the end")
+  func playlistAddFilesDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      // A folder chosen in the open panel comes as a URL of a folder.
+      let subfolder = folder.appendingPathComponent("more", isDirectory: true)
+      try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true)
+      let file = subfolder.appendingPathComponent("d.mp4")
+      try Data().write(to: file)
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let count = player.info.$playlist.withLock { $0.count }
+      // Adding to the playlist turns shuffling off at once, so shuffling still on shows that nothing was added yet.
+      player.info.isShuffled = true
+      let hold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      pane.addFiles([subfolder])
+      let addedWhileHeld = hold.limitPassed || !player.info.isShuffled
+      hold.release()
+      #expect(!addedWhileHeld, "Adding chosen files to the playlist searched their folders on the main thread")
+      try await Self.waitUntil { player.info.$playlist.withLock { $0.count } == count + 1 }
+      #expect(player.info.$playlist.withLock { $0.last?.filename } == file.path)
+    }
+  }
+
+  @Test("Playing a playlist item in a new window makes its URL on the new window's player's open queue, returning while the queue is held, then opens it")
+  func playlistPlayInNewWindowDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let file = folder.appendingPathComponent("a.mp4")
+      let row = try #require(player.info.$playlist.withLock { $0.firstIndex { $0.filename == file.path } })
+      pane.selectedRows = IndexSet([row])
+      // The new window's player is the idle player the action is handed, whose open queue is held.
+      let target = PlayerCore.newPlayerCore
+      let hold = QueueHold(target.openQueue, limit: Self.holdLimit)
+      pane.contextMenuPlayInNewWindow(NSMenuItem())
+      // An open is recorded on the main thread as it starts, so an open recorded while the queue is held made its URL on the main
+      // thread.
+      let openedWhileHeld = hold.limitPassed || !target.opensFindingFiles.isEmpty
+      hold.release()
+      #expect(!openedWhileHeld, "Playing a playlist item in a new window made its URL on the main thread")
+      let players = try await Self.players(showing: [file.path])
+      #expect(players.first === target)
+      try await Self.close(players)
+    }
+  }
+
+  @Test("Deleting a playlist item's file moves it to the Trash on the player's open queue, returning while the queue is held, then removes its row while mpv's core is held")
+  func playlistDeleteFileDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      player.syncUITimer?.invalidate()
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let file = folder.appendingPathComponent("c.mp4")
+      let row = try #require(player.info.$playlist.withLock { $0.firstIndex { $0.filename == file.path } })
+      let count = player.info.$playlist.withLock { $0.count }
+      pane.selectedRows = IndexSet([row])
+      // Removing a row turns shuffling off at once, so shuffling still on shows that no row was removed yet.
+      player.info.isShuffled = true
+      let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      let queueHold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      pane.contextMenuDeleteFile(NSMenuItem())
+      let trashedWhileHeld = queueHold.limitPassed || !FileManager.default.fileExists(atPath: file.path)
+      queueHold.release()
+      // Once the file is in the Trash its row is removed on the main thread, while the core is still held.
+      try await Self.waitUntil { !player.info.isShuffled }
+      let removedWhileHeld = !coreHold.hasLetGo
+      coreHold.release()
+      try await Self.waitUntil { coreHold.hasLetGo }
+      #expect(!trashedWhileHeld, "Deleting a playlist item's file moved it to the Trash on the main thread")
+      #expect(removedWhileHeld, "Removing the row of a deleted file waited for mpv")
+      #expect(!FileManager.default.fileExists(atPath: file.path))
+      try await Self.waitUntil { player.info.$playlist.withLock { $0.count } == count - 1 }
+      #expect(!player.info.$playlist.withLock { $0.contains { $0.filename == file.path } })
+    }
+  }
+
+  @Test("Adding a subtitle to a playlist item finds the item's folder on the player's open queue, returning while the queue is held, then shows the open panel in that folder")
+  func playlistAddSubtitleDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let file = folder.appendingPathComponent("a.mp4")
+      let row = try #require(player.info.$playlist.withLock { $0.firstIndex { $0.filename == file.path } })
+      pane.selectedRows = IndexSet([row])
+      let windows = Set(NSApp.windows.map { ObjectIdentifier($0) })
+      @MainActor func panel() -> NSOpenPanel? {
+        NSApp.windows.lazy.compactMap { $0 as? NSOpenPanel }.first { !windows.contains(ObjectIdentifier($0)) }
+      }
+      let hold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      pane.contextMenuAddSubtitle(NSMenuItem())
+      let shownWhileHeld = hold.limitPassed || panel() != nil
+      hold.release()
+      #expect(!shownWhileHeld, "Adding a subtitle to a playlist item found its folder on the main thread")
+      try await Self.waitUntil { panel()?.isVisible == true }
+      let openPanel = try #require(panel())
+      #expect(openPanel.directoryURL?.resolvingSymlinksInPath().path == folder.resolvingSymlinksInPath().path)
+      openPanel.cancel(nil)
+    }
+  }
+
+  @Test("The menu of the folders of the shown file finds their names and icons on the titlebar's path queue, returning while the queue is held, then shows them")
+  func titlebarPathMenuDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let file = folder.appendingPathComponent("b.mp4")
+      let window = try #require(player.mainWindow.window)
+      try await Self.waitUntil { window.representedFilename == file.path }
+      let titlebar = try #require(player.mainWindow.titleBarView as Titlebar?)
+      let menus = MenuRecorder()
+      defer { menus.stop() }
+      let hold = QueueHold(Titlebar.pathQueue, limit: Self.holdLimit)
+      titlebar.showPathMenu()
+      let shownWhileHeld = hold.limitPassed || !menus.titles.isEmpty
+      hold.release()
+      #expect(!shownWhileHeld, "The menu of the folders of the shown file found their names and icons on the main thread")
+      try await Self.waitUntil { !menus.titles.isEmpty }
+      let titles = try #require(menus.titles.first)
+      // One item for the file and each folder it is in, but not the root.
+      #expect(titles.count == file.pathComponents.count - 1)
+      #expect(titles.first == FileManager.default.displayName(atPath: file.path))
+    }
+  }
+
+  @Test("Logging a line writes it to the log file, and closing the log file closes it, on the logger's file queue, each returning while the queue is held")
+  func logFileDoesNotWait() async throws {
+    let enabled = Logger.enabled
+    Logger.enabled = true
+    defer { Logger.enabled = enabled }
+    let file = Logger.logDirectory.appendingPathComponent("iina.log")
+    func written(_ line: String) -> Bool {
+      (try? String(contentsOf: file, encoding: .utf8))?.contains(line) == true
+    }
+    // At the error level, so that the line is logged whatever level the settings log at.
+    let line = "iinaTests-log-\(UUID().uuidString)"
+    let writeHold = QueueHold(Logger.fileQueue, limit: Self.holdLimit)
+    Logger.log(line, level: .error)
+    let writtenWhileHeld = writeHold.limitPassed || written(line)
+    writeHold.release()
+    #expect(!writtenWhileHeld, "Logging a line wrote it to the log file on the main thread")
+    try await Self.waitUntil { written(line) }
+    #expect(Self.isOpen(file))
+    // The log file stays closed for the rest of the run, the lines logged after it written only to the console.
+    let closeHold = QueueHold(Logger.fileQueue, limit: Self.holdLimit)
+    Logger.closeLogFile()
+    let closedWhileHeld = closeHold.limitPassed || !Self.isOpen(file)
+    closeHold.release()
+    #expect(!closedWhileHeld, "Closing the log file closed it on the main thread")
+    try await Self.waitUntil { !Self.isOpen(file) }
+  }
+
+  /// Whether this process has the file at `url` open.
+  private static func isOpen(_ url: URL) -> Bool {
+    let path = url.resolvingSymlinksInPath().path
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    return (0..<getdtablesize()).contains { descriptor in
+      buffer.withUnsafeMutableBufferPointer { pointer in
+        fcntl(descriptor, F_GETPATH, pointer.baseAddress!) != -1 && String(cString: pointer.baseAddress!) == path
       }
     }
   }
@@ -4093,6 +4354,43 @@ private final class NoticeRecorder {
   }
 }
 
+/// Keeps the titles of the items of each menu shown while it lives, ending the tracking of each as soon as it is shown.
+@MainActor
+private final class MenuRecorder {
+  /// For each menu shown, in the order shown, the titles of its items.
+  private(set) var titles: [[String]] = []
+  private var tracked: NSMenu?
+  private var timer: Timer?
+  private var observers: [NSObjectProtocol] = []
+
+  init() {
+    let center = NotificationCenter.default
+    observers.append(center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { [weak self] notice in
+      MainActor.assumeIsolated {
+        guard let self, let menu = notice.object as? NSMenu else { return }
+        self.titles.append(menu.items.map { $0.title })
+        self.tracked = menu
+      }
+    })
+    observers.append(center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: nil) { [weak self] _ in
+      MainActor.assumeIsolated { self?.tracked = nil }
+    })
+    // A shown menu tracks the mouse, the main run loop running in its event tracking mode, until its tracking is ended.
+    let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.tracked?.cancelTrackingWithoutAnimation() }
+    }
+    RunLoop.main.add(timer, forMode: .eventTracking)
+    self.timer = timer
+  }
+
+  func stop() {
+    timer?.invalidate()
+    for observer in observers {
+      NotificationCenter.default.removeObserver(observer)
+    }
+  }
+}
+
 /// Runs a block on the main thread each time a player emits an event it listens for.
 private final class EventRecorder: EventCallable {
   private let block: @MainActor ([Any]) -> Void
@@ -4124,7 +4422,11 @@ private final class QueueHold: @unchecked Sendable {
         self.lock.unlock()
       }
     }
-    reached.wait()
+    // The run loop goes on running the work queued on this thread until the queue reaches the hold, since the work the queue is
+    // finishing may wait for this thread, as a notification posted from the queue waits for its main queue observers.
+    while reached.wait(timeout: .now()) == .timedOut {
+      RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+    }
   }
 
   /// Whether the limit passed before the hold was released, the queue having gone on.
