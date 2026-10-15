@@ -3529,9 +3529,40 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A plugin's keychainWrite and keychainRead ask the Keychain on its queue, returning promises while the queue is held, then settle with what the Keychain answered")
+  func pluginKeychainDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      let service = KeychainAccess.ServiceName("\(plugin.identifier) - account")
+      try await Self.withKeychainRecorded(stored: [service.rawValue: ("stored-user", "stored-password")]) { keychain in
+        let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+        func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+        let hold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
+        _ = instance.js.evaluateScript("""
+          globalThis.written = null;
+          globalThis.read = null;
+          iina.utils.keychainWrite("account", "new-user", "new-password").then(result => { globalThis.written = result; });
+          iina.utils.keychainRead("account", "stored-user").then(result => { globalThis.read = result; });
+          """)
+        let askedWhileHeld = hold.limitPassed || !keychain.requests.isEmpty
+        hold.release()
+        #expect(!askedWhileHeld, "A plugin's keychainWrite or keychainRead asked the Keychain on the script's thread")
+        try await Self.waitUntil { holds("globalThis.written !== null && globalThis.read !== null") }
+        #expect(holds("globalThis.written === true"))
+        #expect(holds("globalThis.read === 'stored-password'"))
+        #expect(keychain.requests == [
+          .write(username: "new-user", password: "new-password", service: service, server: nil, port: nil),
+          .read(username: "stored-user", service: service, server: nil, port: nil)
+        ])
+      }
+    }
+  }
+
   /// Run `body` with each Keychain request recorded by a `KeychainRecorder` in place of being made.
-  private static func withKeychainRecorded(_ body: (KeychainRecorder) async throws -> Void) async throws {
-    let keychain = KeychainRecorder()
+  private static func withKeychainRecorded(stored: [String: (username: String, password: String)] = [:],
+                                           _ body: (KeychainRecorder) async throws -> Void) async throws {
+    let keychain = KeychainRecorder(stored: stored)
     let make = KeychainAccess.makeRequest
     KeychainAccess.makeRequest = keychain.answer
     defer { KeychainAccess.makeRequest = make }
@@ -4134,6 +4165,12 @@ private final class WorkspaceRecorder: @unchecked Sendable {
 private final class KeychainRecorder: @unchecked Sendable {
   private let lock = NSLock()
   private var made: [KeychainAccess.Request] = []
+  /// The account and password a read of each service finds, by the service's name.
+  private let stored: [String: (username: String, password: String)]
+
+  init(stored: [String: (username: String, password: String)] = [:]) {
+    self.stored = stored
+  }
 
   /// The requests recorded, in the order they were made.
   var requests: [KeychainAccess.Request] {
@@ -4143,13 +4180,17 @@ private final class KeychainRecorder: @unchecked Sendable {
   }
 
   /// Record `request`, from any thread.
-  /// - Returns: Nothing for a write. A read throws, finding no password.
+  /// - Returns: Nothing for a write. A read finds the account and password stored for its service, and otherwise throws, finding
+  ///   no password.
   func answer(_ request: KeychainAccess.Request) throws -> (username: String, password: String)? {
     lock.lock()
     made.append(request)
     lock.unlock()
-    if case .read = request {
-      throw KeychainAccess.KeychainError.noResult
+    if case .read(_, let service, _, _) = request {
+      guard let item = stored[service.rawValue] else {
+        throw KeychainAccess.KeychainError.noResult
+      }
+      return item
     }
     return nil
   }
