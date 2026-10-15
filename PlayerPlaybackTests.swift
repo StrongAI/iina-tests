@@ -3712,6 +3712,17 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// Make `Utility.trashItem` move files into the folder `Trash` of `folder` in place of the Trash, so that the Trash of the account
+  /// running the tests is left untouched.
+  /// - Returns: The folder files are moved into, and a function that restores `Utility.trashItem`.
+  private static func useTestTrash(in folder: URL) throws -> (URL, () -> Void) {
+    let trash = folder.appendingPathComponent("Trash")
+    try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+    let trashItem = Utility.trashItem
+    Utility.trashItem = { try FileManager.default.moveItem(at: $0, to: trash.appendingPathComponent($0.lastPathComponent)) }
+    return (trash, { Utility.trashItem = trashItem })
+  }
+
   @Test("Deleting a playlist item's file moves it to the Trash on the player's open queue, returning while the queue is held, then removes its row while mpv's core is held")
   func playlistDeleteFileDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
@@ -3723,6 +3734,8 @@ struct PlayerPlaybackTests {
       pane.selectedRows = IndexSet([row])
       // Removing a row turns shuffling off at once, so shuffling still on shows that no row was removed yet.
       player.info.isShuffled = true
+      let (trash, restoreTrashItem) = try Self.useTestTrash(in: folder)
+      defer { restoreTrashItem() }
       let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
       let queueHold = QueueHold(player.openQueue, limit: Self.holdLimit)
       pane.contextMenuDeleteFile(NSMenuItem())
@@ -3738,6 +3751,8 @@ struct PlayerPlaybackTests {
       #expect(!FileManager.default.fileExists(atPath: file.path))
       try await Self.waitUntil { player.info.$playlist.withLock { $0.count } == count - 1 }
       #expect(!player.info.$playlist.withLock { $0.contains { $0.filename == file.path } })
+      #expect(FileManager.default.fileExists(atPath: trash.appendingPathComponent(file.lastPathComponent).path),
+              "The deleted file was not moved to the Trash")
     }
   }
 
@@ -3811,6 +3826,161 @@ struct PlayerPlaybackTests {
     closeHold.release()
     #expect(!closedWhileHeld, "Closing the log file closed it on the main thread")
     try await Self.waitUntil { !Self.isOpen(file) }
+  }
+
+  @Test("Flipping, mirroring and cropping the video and removing a video filter by label, string or position return while mpv's core is held, then change mpv's video filters")
+  func videoFilterChangesDoNotWait() async throws {
+    // Hardware decoding is off from the start: adding a filter while it is set to auto asks the user first.
+    try await Self.withSettings([.hardwareDecoder: Preference.HardwareDecoderOption.disabled.rawValue]) {
+      try await Self.withPlayer { player, _ in
+        player.syncUITimer?.invalidate()
+        let labels = { player.mpv.getFilters(MPVProperty.vf).compactMap { $0.label } }
+        let flippedWhileHeld = try await Self.returnsWhileHeld(player) { player.setFlip(true) }
+        #expect(flippedWhileHeld, "Flipping the video waited for mpv")
+        try await Self.waitUntil { labels().contains(Constants.FilterName.flip) && player.info.flipFilter != nil }
+        let unflippedWhileHeld = try await Self.returnsWhileHeld(player) { player.setFlip(false) }
+        #expect(unflippedWhileHeld, "Turning flipping off waited for mpv")
+        #expect(player.info.flipFilter == nil)
+        try await Self.waitUntil { !labels().contains(Constants.FilterName.flip) }
+        let mirroredWhileHeld = try await Self.returnsWhileHeld(player) { player.setMirror(true) }
+        #expect(mirroredWhileHeld, "Mirroring the video waited for mpv")
+        try await Self.waitUntil { labels().contains(Constants.FilterName.mirror) && player.info.mirrorFilter != nil }
+        let unmirroredWhileHeld = try await Self.returnsWhileHeld(player) { player.setMirror(false) }
+        #expect(unmirroredWhileHeld, "Turning mirroring off waited for mpv")
+        #expect(player.info.mirrorFilter == nil)
+        try await Self.waitUntil { !labels().contains(Constants.FilterName.mirror) }
+        let croppedWhileHeld = try await Self.returnsWhileHeld(player) { player.setCrop(fromString: "1:1") }
+        #expect(croppedWhileHeld, "Cropping the video to an aspect waited for mpv")
+        try await Self.waitUntil { labels().contains(Constants.FilterName.crop) }
+        let uncroppedWhileHeld = try await Self.returnsWhileHeld(player) { player.setCrop(fromString: "None") }
+        #expect(uncroppedWhileHeld, "Turning cropping off waited for mpv")
+        try await Self.waitUntil { !labels().contains(Constants.FilterName.crop) }
+        let crop = MPVFilter.crop(w: 16, h: 16, x: 0, y: 0)
+        let croppedByFilterWhileHeld = try await Self.returnsWhileHeld(player) { player.setCrop(fromFilter: crop) }
+        #expect(croppedByFilterWhileHeld, "Cropping the video with a crop filter waited for mpv")
+        try await Self.waitUntil { labels().contains(Constants.FilterName.crop) && player.info.cropFilter === crop }
+        let cropRemovedWhileHeld = try await Self.returnsWhileHeld(player) { player.removeCropFilter() }
+        #expect(cropRemovedWhileHeld, "Removing the crop filter waited for mpv")
+        try await Self.waitUntil { !labels().contains(Constants.FilterName.crop) }
+        // A labeled filter removed by the string of its label, then by its position in the list.
+        let filter = MPVFilter.flip()
+        filter.label = "iinatest"
+        player.addVideoFilter(filter) { _ in }
+        try await Self.waitUntil { labels().contains("iinatest") }
+        let removedByStringWhileHeld = try await Self.returnsWhileHeld(player) { player.removeVideoFilter("@iinatest") }
+        #expect(removedByStringWhileHeld, "Removing a video filter given as a string waited for mpv")
+        try await Self.waitUntil { !labels().contains("iinatest") }
+        player.addVideoFilter(filter) { _ in }
+        try await Self.waitUntil { labels().contains("iinatest") }
+        let index = try #require(player.mpv.getFilters(MPVProperty.vf).firstIndex { $0.label == "iinatest" })
+        let removedByIndexWhileHeld = try await Self.returnsWhileHeld(player) { player.removeVideoFilter(filter, index) }
+        #expect(removedByIndexWhileHeld, "Removing a video filter by its position waited for mpv")
+        try await Self.waitUntil { !labels().contains("iinatest") }
+      }
+    }
+  }
+
+  @Test("Setting the equalizer and adding and removing an audio filter by label, string or position return while mpv's core is held, then change mpv's audio filters")
+  func audioFilterChangesDoNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      let labels = { player.mpv.getFilters(MPVProperty.af).compactMap { $0.label } }
+      let equalizedWhileHeld = try await Self.returnsWhileHeld(player) { player.setAudioEq(fromGains: Array(repeating: 1, count: 10)) }
+      #expect(equalizedWhileHeld, "Setting the equalizer waited for mpv")
+      try await Self.waitUntil { labels().contains(Constants.FilterName.audioEq) }
+      let equalizerRemovedWhileHeld = try await Self.returnsWhileHeld(player) {
+        player.removeAudioFilter("@" + Constants.FilterName.audioEq)
+      }
+      #expect(equalizerRemovedWhileHeld, "Removing an audio filter given as a string waited for mpv")
+      try await Self.waitUntil { !labels().contains(Constants.FilterName.audioEq) }
+      let filter = MPVFilter(name: "scaletempo", label: "iinatest", params: nil)
+      let addedWhileHeld = try await Self.returnsWhileHeld(player) { player.addAudioFilter(filter) }
+      #expect(addedWhileHeld, "Adding an audio filter waited for mpv")
+      try await Self.waitUntil { labels().contains("iinatest") }
+      let removedWhileHeld = try await Self.returnsWhileHeld(player) { player.removeAudioFilter(filter) }
+      #expect(removedWhileHeld, "Removing an audio filter given as a filter waited for mpv")
+      try await Self.waitUntil { !labels().contains("iinatest") }
+      player.addAudioFilter(filter)
+      try await Self.waitUntil { labels().contains("iinatest") }
+      let index = try #require(player.mpv.getFilters(MPVProperty.af).firstIndex { $0.label == "iinatest" })
+      let removedByIndexWhileHeld = try await Self.returnsWhileHeld(player) { player.removeAudioFilter(filter, index) }
+      #expect(removedByIndexWhileHeld, "Removing an audio filter by its position waited for mpv")
+      try await Self.waitUntil { !labels().contains("iinatest") }
+    }
+  }
+
+  @Test("Cropping and removing a logo in interactive mode, turning logo removal off and toggling a saved video filter from the menus return while mpv's core is held, then change mpv's video filters")
+  func filterActionsDoNotWait() async throws {
+    // Hardware decoding is off from the start: adding a filter while it is set to auto asks the user first.
+    try await Self.withSettings([.hardwareDecoder: Preference.HardwareDecoderOption.disabled.rawValue]) {
+      try await Self.withPlayer { player, _ in
+        player.syncUITimer?.invalidate()
+        let labels = { player.mpv.getFilters(MPVProperty.vf).compactMap { $0.label } }
+        let interactiveMode = player.mainWindow.interactiveMode
+        let (width, height) = player.originalVideoSize
+        interactiveMode.enter(mode: .crop)
+        interactiveMode.cropBoxView.selectedRect = NSRect(x: 0, y: 0, width: width / 2, height: height / 2)
+        let croppedWhileHeld = try await Self.returnsWhileHeld(player) { interactiveMode.doneAction(NSButton()) }
+        #expect(croppedWhileHeld, "Cropping in interactive mode waited for mpv")
+        try await Self.waitUntil { labels().contains(Constants.FilterName.crop) && player.info.cropFilter != nil }
+        // Selecting the whole video removes the crop.
+        interactiveMode.enter(mode: .crop, selectWholeVideoByDefault: true)
+        let uncroppedWhileHeld = try await Self.returnsWhileHeld(player) { interactiveMode.doneAction(NSButton()) }
+        #expect(uncroppedWhileHeld, "Removing the crop in interactive mode waited for mpv")
+        try await Self.waitUntil { !labels().contains(Constants.FilterName.crop) }
+        // The logo is inside the frame, away from its edges.
+        interactiveMode.enter(mode: .delogo)
+        interactiveMode.cropBoxView.selectedRect = NSRect(x: width / 4, y: height / 4, width: width / 2, height: height / 2)
+        let delogoedWhileHeld = try await Self.returnsWhileHeld(player) { interactiveMode.doneAction(NSButton()) }
+        #expect(delogoedWhileHeld, "Removing a logo in interactive mode waited for mpv")
+        try await Self.waitUntil { labels().contains(Constants.FilterName.delogo) && player.info.delogoFilter != nil }
+        let delogoItem = NSMenuItem()
+        delogoItem.state = .on
+        let delogoOffWhileHeld = try await Self.returnsWhileHeld(player) { player.mainWindow.menuSetDelogo(delogoItem) }
+        #expect(delogoOffWhileHeld, "Turning logo removal off from the menu waited for mpv")
+        #expect(player.info.delogoFilter == nil)
+        try await Self.waitUntil { !labels().contains(Constants.FilterName.delogo) }
+        // A saved filter has no label, so it is found by its name.
+        let mirrored = { player.mpv.getFilters(MPVProperty.vf).contains { $0.name == "hflip" && $0.label == nil } }
+        let savedItem = NSMenuItem()
+        savedItem.representedObject = "hflip"
+        let toggledOnWhileHeld = try await Self.returnsWhileHeld(player) {
+          player.mainWindow.menuActionHandler.menuToggleVideoFilterString(savedItem)
+        }
+        #expect(toggledOnWhileHeld, "Turning a saved video filter on from the menu waited for mpv")
+        try await Self.waitUntil { mirrored() }
+        let toggledOffWhileHeld = try await Self.returnsWhileHeld(player) {
+          player.mainWindow.menuActionHandler.menuToggleVideoFilterString(savedItem)
+        }
+        #expect(toggledOffWhileHeld, "Turning a saved video filter off from the menu waited for mpv")
+        try await Self.waitUntil { !mirrored() }
+      }
+    }
+  }
+
+  @Test("Deleting the current file from the menu, to the Trash or for good, returns while mpv's core is held, then removes its playlist entry and the file", arguments: [false, true])
+  func deleteCurrentFileDoesNotWait(hard: Bool) async throws {
+    try await Self.withPlayer { player, folder in
+      player.syncUITimer?.invalidate()
+      let handler: MainMenuActionHandler = player.mainWindow.menuActionHandler
+      let file = try #require(player.info.currentURL)
+      let count = player.info.$playlist.withLock { $0.count }
+      let (trash, restoreTrashItem) = try Self.useTestTrash(in: folder)
+      defer { restoreTrashItem() }
+      let deletedWhileHeld = try await Self.returnsWhileHeld(player) {
+        if hard {
+          handler.menuDeleteCurrentFileHard(.dummy)
+        } else {
+          handler.menuDeleteCurrentFile(.dummy)
+        }
+      }
+      #expect(deletedWhileHeld, "Deleting the current file waited for mpv")
+      try await Self.waitUntil { !FileManager.default.fileExists(atPath: file.path) }
+      try await Self.waitUntil { player.info.$playlist.withLock { $0.count } == count - 1 }
+      #expect(!player.info.$playlist.withLock { $0.contains { $0.filename == file.path } })
+      #expect(FileManager.default.fileExists(atPath: trash.appendingPathComponent(file.lastPathComponent).path) == !hard,
+              "The deleted file was not moved to the Trash, or was deleted for good")
+    }
   }
 
   /// Whether this process has the file at `url` open.
