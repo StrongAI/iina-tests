@@ -3618,11 +3618,15 @@ struct PlayerPlaybackTests {
         let controller: InitialWindowController = player.initialWindow
         let hold = QueueHold(InitialWindowController.fileQueue, limit: Self.holdLimit)
         controller.showWindow(nil)
-        // A last played file looked at on the main thread would be shown by the time the window is.
+        // A last played file looked at, or the app's icon looked up, on the main thread would be shown by the time the window is.
         let lookedWhileHeld = hold.limitPassed || !controller.lastFileNameLabel.stringValue.isEmpty
+        let iconShownWhileHeld = hold.limitPassed || controller.appIcon.image?.representations.isEmpty == false
         hold.release()
         #expect(!lookedWhileHeld, "The welcome window looked at the last played file on the main thread")
-        try await Self.waitUntil { !controller.lastFileContainerView.isHidden }
+        #expect(!iconShownWhileHeld, "The welcome window looked up the app's icon on the main thread")
+        try await Self.waitUntil {
+          !controller.lastFileContainerView.isHidden && controller.appIcon.image?.representations.isEmpty == false
+        }
         #expect(controller.lastFileNameLabel.stringValue == "last.mp4")
         #expect(!controller.recentDocuments.contains { $0.resolvingSymlinksInPath() == file.resolvingSymlinksInPath() })
         controller.close()
