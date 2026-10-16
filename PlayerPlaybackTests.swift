@@ -4698,6 +4698,32 @@ struct PlayerPlaybackTests {
     return (!installedWhileHeld, reported.value)
   }
 
+  @Test("Reading the plugins folder again reads it on the plugin install queue, returning while the queue is held, then replaces the plugin list with the plugins read")
+  func pluginListReadDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.list-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
+    await PluginManager(window: NSWindow()).install(localPackageURL: package)
+    let installed = try #require(Self.installedPlugin(identifier))
+    // The plugins read replace the plugins listed, which the other tests hold, so those are put back.
+    let listed = JavascriptPlugin.plugins
+    defer { JavascriptPlugin.plugins = listed }
+    let hold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
+    var read = false
+    JavascriptPlugin.recreateAllPlugins { read = true }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let readWhileHeld = hold.limitPassed || read
+    hold.release()
+    #expect(!readWhileHeld, "Reading the plugins folder read it on the main thread")
+    try await Self.waitUntil { read }
+    #expect(JavascriptPlugin.plugins.allSatisfy { plugin in !listed.contains { $0 === plugin } })
+    let reread = try #require(Self.installedPlugin(identifier))
+    #expect(reread.root.path == installed.root.path)
+    #expect(reread.version == "1.0")
+  }
+
   @Test("Installing a plugin package unpacks and reads it on the plugin install queue, returning while the queue is held, then installs and enables the plugin")
   func pluginPackageInstallDoesNotWait() async throws {
     let folder = try Self.makeFolder()
