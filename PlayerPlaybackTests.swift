@@ -3841,6 +3841,27 @@ struct PlayerPlaybackTests {
     #expect(KeyBindingTranslator.readableCommand(fromAction: ["seek", "5"]) != "seek 5")
   }
 
+  @Test("Saving the log window's logs joins them and writes the file on the log save queue, returning while the queue is held, then the file holds the logs")
+  func logSaveDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let url = folder.appendingPathComponent("iina.log")
+    let logs = ["first line\n", "second line\n"].map {
+      Logger.Log(subsystem: "iinaTests", level: .debug, message: $0, date: "", logString: $0)
+    }
+    let hold = await QueueHold.reached(LogWindowController.saveQueue, limit: Self.holdLimit)
+    var saved: Error?? = .none
+    LogWindowController.write(logs, to: url) { saved = .some($0) }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: url.path)
+    hold.release()
+    #expect(!savedWhileHeld, "Saving the logs joined them or wrote the file on the main thread")
+    try await Self.waitUntil { saved != nil }
+    #expect(saved! == nil)
+    let written = try String(contentsOf: url, encoding: .utf8)
+    #expect(written == "first line\nsecond line\n")
+  }
+
   @Test("A plugin subtitle's download makes the URLs of the paths its provider answers as files' without reading the file system")
   func pluginSubtitleDownloadReadsNoFiles() async throws {
     try await Self.withPlayer { player, folder in
