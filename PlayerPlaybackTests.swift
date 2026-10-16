@@ -4058,7 +4058,7 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("Logging a line writes it to the log file, and closing the log file closes it, on the logger's file queue, each returning while the queue is held")
+  @Test("Logging a line writes it to the log file, and closing the log file closes it, on the logger's file queue, each returning while the queue is held, the close then telling its caller on the main thread once the lines logged before it are written")
   func logFileDoesNotWait() async throws {
     let enabled = Logger.enabled
     Logger.enabled = true
@@ -4076,13 +4076,21 @@ struct PlayerPlaybackTests {
     #expect(!writtenWhileHeld, "Logging a line wrote it to the log file on the main thread")
     try await Self.waitUntil { written(line) }
     #expect(Self.isOpen(file))
-    // The log file stays closed for the rest of the run, the lines logged after it written only to the console.
+    // The log file stays closed for the rest of the run, the lines logged after it written only to the console. Its caller is told
+    // on the main thread once the lines logged before the close are written and the file is closed, as termination is.
+    let lastLine = "iinaTests-log-last-\(UUID().uuidString)"
     let closeHold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
-    Logger.closeLogFile()
-    let closedWhileHeld = closeHold.limitPassed || !Self.isOpen(file)
+    Logger.log(lastLine, level: .error)
+    let closed = Box<(onMain: Bool, lastWritten: Bool, fileOpen: Bool)>()
+    Logger.closeLogFile { closed.value = (Thread.isMainThread, written(lastLine), Self.isOpen(file)) }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let closedWhileHeld = closeHold.limitPassed || !Self.isOpen(file) || closed.value != nil
     closeHold.release()
-    #expect(!closedWhileHeld, "Closing the log file closed it on the main thread")
-    try await Self.waitUntil { !Self.isOpen(file) }
+    #expect(!closedWhileHeld, "Closing the log file closed it, or told its caller it had, on the main thread")
+    try await Self.waitUntil { closed.value != nil }
+    #expect(closed.value?.onMain == true)
+    #expect(closed.value?.lastWritten == true, "The log file was closed before the lines logged ahead of the close were written")
+    #expect(closed.value?.fileOpen == false)
   }
 
   @Test("Flipping, mirroring and cropping the video and removing a video filter by label, string or position return while mpv's core is held, then change mpv's video filters")
@@ -4564,6 +4572,247 @@ struct PlayerPlaybackTests {
       let instance = try #require(player.plugins.first { $0.plugin === installedUpdate })
       #expect(instance.js.evaluateScript("globalThis.version === \"2.0\"").toBool())
     }
+  }
+
+  /// Write the package `makePluginPackage` writes, of a plugin whose global entry `global.js` also sets `globalThis.version` to its
+  /// version.
+  private static func makeGlobalPluginPackage(in folder: URL, identifier: String, version: String) throws -> URL {
+    let package = try makePluginPackage(in: folder, identifier: identifier, version: version, info: ["globalEntry": "global.js"])
+    let script = folder.appendingPathComponent("\(identifier)-\(version)").appendingPathComponent("global.js")
+    try "globalThis.version = \"\(version)\";".write(to: script, atomically: true, encoding: .utf8)
+    let zip = Process()
+    zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+    zip.arguments = ["-j", "-q", package.path, script.path]
+    try zip.run()
+    zip.waitUntilExit()
+    try #require(zip.terminationStatus == 0)
+    return package
+  }
+
+  /// Install the package of a plugin with `identifier`, `version` and a global entry, wait until the plugin's global instance has
+  /// been made, then have the instance make a player, as the plugin's global script would.
+  /// - Returns: The plugin and the player its global instance made, which has no window and whose `mpv` is idle.
+  private static func installGlobalPlugin(_ identifier: String, version: String = "1.0",
+                                          in folder: URL) async throws -> (JavascriptPlugin, PlayerCore) {
+    let package = try makeGlobalPluginPackage(in: folder, identifier: identifier, version: version)
+    await PluginManager(window: NSWindow()).install(localPackageURL: package)
+    let plugin = try #require(installedPlugin(identifier))
+    try await waitUntil { plugin.globalInstance != nil }
+    let controller = try #require(plugin.globalInstance?.apis["global"] as? JavascriptAPIGlobalController)
+    let id = try #require(controller.createPlayerInstance([:]) as? Int)
+    return (plugin, try #require(controller.instances[id]))
+  }
+
+  /// Wait until `player`, which a plugin's global instance made, has shut down, then destroy the handle of its `mpv`, which no window
+  /// frees since the player never opened one, so that no test leaves a core and its threads running in the tests after it.
+  private static func destroyMPV(of player: PlayerCore) async throws {
+    try await waitUntil { player.info.state == .shutDown }
+    try #require(!player.mainWindow.loaded)
+    mpv_destroy(player.mpv.mpv)
+    player.mpv.mpv = nil
+  }
+
+  /// Make `request`, which has the global instance that made `player` shut its players down, while the core of the player's `mpv`
+  /// is held, then let the core go and wait until the player has shut down.
+  /// - Returns: Whether `request` returned while the core was held, having asked the player to shut down.
+  private static func shutsDownWhileHeld(_ player: PlayerCore, _ request: () -> Void) async throws -> Bool {
+    let returnedWhileHeld: Bool
+    // The hold's client is closed once the core is let go, so that mpv shutting down waits for no client but the player's.
+    do {
+      let hold = try MPVCoreHold(player.mpv, limit: holdLimit)
+      request()
+      returnedWhileHeld = !hold.hasLetGo && player.info.state == .shuttingDown
+      hold.release()
+      try await waitUntil { hold.hasLetGo }
+    }
+    try await destroyMPV(of: player)
+    return returnedWhileHeld
+  }
+
+  /// Wait until `window` shows a sheet, then answer it with its first button while the core of `player`, which a plugin's global
+  /// instance made, and `JavascriptPlugin.installQueue` are both held. Once the answer has had the time to be handled, `check` looks
+  /// at what it did while both were held; then both are let go and the player is waited for until it has shut down.
+  /// - Returns: Whether `check` passed and the answer asked the player to shut down, both holds holding until then.
+  private static func answerWhileHeld(_ window: NSWindow, player: PlayerCore, check: () -> Bool) async throws -> Bool {
+    try await waitUntil { window.attachedSheet != nil }
+    let sheet = try #require(window.attachedSheet)
+    let answeredWhileHeld: Bool
+    // The core hold's client is closed once the core is let go, so that mpv shutting down waits for no client but the player's.
+    do {
+      let coreHold = try MPVCoreHold(player.mpv, limit: holdLimit)
+      let queueHold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: holdLimit)
+      window.endSheet(sheet, returnCode: .alertFirstButtonReturn)
+      try await Task.sleep(for: heldAnswerWindow)
+      answeredWhileHeld = check() && player.info.state == .shuttingDown && !coreHold.hasLetGo && !queueHold.limitPassed
+      queueHold.release()
+      coreHold.release()
+      try await waitUntil { coreHold.hasLetGo }
+    }
+    try await destroyMPV(of: player)
+    return answeredWhileHeld
+  }
+
+  /// The first view of `type` among `view` and its subviews, searched depth first.
+  private static func firstSubview<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
+    if let match = view as? T { return match }
+    return view.subviews.lazy.compactMap { firstSubview(type, in: $0) }.first
+  }
+
+  @Test("A plugin's global instance cleaning up shuts down the players it made, returning while their mpv's core is held, after which they have shut down")
+  func pluginGlobalCleanUpDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.cleanup-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let (plugin, player) = try await Self.installGlobalPlugin(identifier, in: folder)
+    let instance = try #require(plugin.globalInstance)
+    let controller = try #require(instance.apis["global"] as? JavascriptAPIGlobalController)
+    let returnedWhileHeld = try await Self.shutsDownWhileHeld(player) { controller.cleanUp(instance) }
+    #expect(returnedWhileHeld, "A plugin's global instance cleaning up waited for mpv to shut its players down")
+    #expect(controller.instances.isEmpty)
+  }
+
+  @Test("Disabling a plugin releases its instances, its global instance shutting down the players it made, returning while their mpv's core is held; enabling it reads its entry scripts on the plugin install queue, returning while the queue is held, then makes its instances")
+  func pluginEnabledChangeDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      // Plugins are loaded in the players of the app, among which the test's player is listed while it runs.
+      PlayerCore.playerCores.append(player)
+      defer { PlayerCore.playerCores.removeAll { $0 === player } }
+      let identifier = "io.iina.tests.enabled-\(UUID().uuidString)"
+      defer { Self.uninstallPlugin(identifier) }
+      let (plugin, made) = try await Self.installGlobalPlugin(identifier, in: folder)
+      try #require(player.plugins.contains { $0.plugin === plugin })
+      let disabledWhileHeld = try await Self.shutsDownWhileHeld(made) { plugin.enabled = false }
+      #expect(disabledWhileHeld, "Disabling a plugin waited for mpv to shut down the players its global instance made")
+      #expect(plugin.globalInstance == nil)
+      #expect(!player.plugins.contains { $0.plugin === plugin })
+      let hold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
+      plugin.enabled = true
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let madeWhileHeld = hold.limitPassed || plugin.globalInstance != nil || player.plugins.contains { $0.plugin === plugin }
+      hold.release()
+      #expect(!madeWhileHeld, "Enabling a plugin read its entry scripts on the main thread")
+      try await Self.waitUntil { plugin.globalInstance != nil && player.plugins.contains { $0.plugin === plugin } }
+      #expect(plugin.entryScripts.isEmpty)
+      let global = try #require(plugin.globalInstance)
+      #expect(global.js.evaluateScript("globalThis.version === \"1.0\"").toBool())
+      let instance = try #require(player.plugins.first { $0.plugin === plugin })
+      #expect(instance.js.evaluateScript("globalThis.version === \"1.0\"").toBool())
+    }
+  }
+
+  @Test("Turning a plugin off and on with its switch in the settings' plugin list releases its instances, returning while mpv's core of the players its global instance made is held, then reads its entry scripts on the plugin install queue, returning while the queue is held")
+  func pluginSettingsSwitchDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.switch-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let (plugin, made) = try await Self.installGlobalPlugin(identifier, in: folder)
+    let page = SettingsPagePlugin()
+    let list = PluginListView(page: page)
+    Self.keptObjects += [page, list]
+    let row = try #require(JavascriptPlugin.plugins.firstIndex(of: plugin))
+    let item = try #require(list.tableView(list.tableView, viewFor: nil, row: row))
+    let toggle = try #require(Self.firstSubview(NSSwitch.self, in: item))
+    let action = try #require(toggle.action)
+    func turn(_ state: NSControl.StateValue) {
+      toggle.state = state
+      _ = NSApp.sendAction(action, to: toggle.target, from: toggle)
+    }
+    let offWhileHeld = try await Self.shutsDownWhileHeld(made) { turn(.off) }
+    #expect(offWhileHeld, "Turning a plugin off in the settings waited for mpv to shut down the players its global instance made")
+    #expect(!plugin.enabled)
+    #expect(plugin.globalInstance == nil)
+    let hold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
+    turn(.on)
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let madeWhileHeld = hold.limitPassed || plugin.globalInstance != nil
+    hold.release()
+    #expect(!madeWhileHeld, "Turning a plugin on in the settings read its entry scripts on the main thread")
+    #expect(plugin.enabled)
+    try await Self.waitUntil { plugin.globalInstance != nil }
+    #expect(plugin.globalInstance?.js.evaluateScript("globalThis.version === \"1.0\"").toBool() == true)
+  }
+
+  @Test("Reinstalling a plugin disables the old one, returning while mpv's core of the players its global instance made is held, then removes its files and moves the new one into its place on the plugin install queue, returning while the queue is held, then enables the new one")
+  func pluginReinstallDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.reinstall-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let (old, made) = try await Self.installGlobalPlugin(identifier, in: folder)
+    let oldRoot = old.root
+    let position = try #require(JavascriptPlugin.plugins.firstIndex(of: old))
+    let package = try Self.makeGlobalPluginPackage(in: folder, identifier: identifier, version: "2.0")
+    let window = NSWindow()
+    let manager = PluginManager(window: window)
+    let reported = Box<PluginManager.Result>()
+    let task = Task { await manager.install(localPackageURL: package) { reported.value = $0 } }
+    // The new plugin replaces the old one once the user agrees, after which the old one's files are removed on the held queue.
+    let answeredWhileHeld = try await Self.answerWhileHeld(window, player: made) {
+      reported.value == nil && old.globalInstance == nil && Self.installedPlugin(identifier) == nil
+        && FileManager.default.fileExists(atPath: oldRoot.path)
+    }
+    await task.value
+    #expect(answeredWhileHeld, "Reinstalling a plugin waited for mpv to shut down the old one's players, or removed its files or moved the new one on the main thread")
+    #expect(reported.value == .reinstalled)
+    let plugin = try #require(Self.installedPlugin(identifier))
+    #expect(plugin !== old)
+    #expect(JavascriptPlugin.plugins.firstIndex(of: plugin) == position)
+    #expect(plugin.version == "2.0")
+    #expect(plugin.root.path == Utility.pluginsURL.appendingPathComponent("\(identifier).iinaplugin").path)
+    #expect(plugin.enabled)
+    try await Self.waitUntil { plugin.globalInstance != nil }
+    #expect(plugin.globalInstance?.js.evaluateScript("globalThis.version === \"2.0\"").toBool() == true)
+  }
+
+  @Test("Uninstalling a plugin disables it, returning while mpv's core of the players its global instance made is held, and removes its files on the plugin install queue, returning while the queue is held, then removes them")
+  func pluginUninstallDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.uninstall-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let (plugin, made) = try await Self.installGlobalPlugin(identifier, in: folder)
+    let root = plugin.root
+    let window = NSWindow()
+    let manager = PluginManager(window: window)
+    let uninstalled = Box<Bool>()
+    let task = Task { uninstalled.value = await manager.uninstall(plugin) }
+    let answeredWhileHeld = try await Self.answerWhileHeld(window, player: made) {
+      uninstalled.value == true && plugin.globalInstance == nil && Self.installedPlugin(identifier) == nil
+        && FileManager.default.fileExists(atPath: root.path)
+    }
+    await task.value
+    #expect(answeredWhileHeld, "Uninstalling a plugin waited for mpv to shut down its players or removed its files on the main thread")
+    try await Self.waitUntil { !FileManager.default.fileExists(atPath: root.path) }
+  }
+
+  @Test("Uninstalling a plugin from the settings' plugin list disables it, returning while mpv's core of the players its global instance made is held, and removes its files on the plugin install queue, returning while the queue is held, then removes them")
+  func pluginSettingsUninstallDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.settings-uninstall-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let (plugin, made) = try await Self.installGlobalPlugin(identifier, in: folder)
+    let root = plugin.root
+    // The list checks every plugin for updates once it is in a window; the check is taken as running, so that none is made.
+    let checking = PluginListView.isCheckingForUpdates
+    PluginListView.isCheckingForUpdates = true
+    defer { PluginListView.isCheckingForUpdates = checking }
+    let current = PluginListView.currentPlugin
+    PluginListView.currentPlugin = plugin
+    defer { PluginListView.currentPlugin = current }
+    let page = SettingsPagePlugin()
+    let list = PluginListView(page: page)
+    let window = NSWindow()
+    window.contentView?.addSubview(list.view)
+    Self.keptObjects += [page, list, window]
+    list.uninstallAction()
+    let answeredWhileHeld = try await Self.answerWhileHeld(window, player: made) {
+      plugin.globalInstance == nil && Self.installedPlugin(identifier) == nil && FileManager.default.fileExists(atPath: root.path)
+    }
+    #expect(answeredWhileHeld, "Uninstalling a plugin in the settings waited for mpv to shut down its players or removed its files on the main thread")
+    try await Self.waitUntil { !FileManager.default.fileExists(atPath: root.path) }
   }
 }
 
