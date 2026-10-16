@@ -3824,6 +3824,23 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The key binding translator reads its strings and command format tables on its queue, returning while the queue is held, then translates a command with them")
+  func keyBindingTranslatorTablesDoNotWait() async throws {
+    let (strings, formats) = (KeyBindingTranslator.l10nDic, KeyBindingTranslator.mpvCmdFormat)
+    defer { (KeyBindingTranslator.l10nDic, KeyBindingTranslator.mpvCmdFormat) = (strings, formats) }
+    (KeyBindingTranslator.l10nDic, KeyBindingTranslator.mpvCmdFormat) = ([:], [:])
+    let hold = await QueueHold.reached(KeyBindingTranslator.queue, limit: Self.holdLimit)
+    var loaded = false
+    KeyBindingTranslator.load { loaded = true }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let loadedWhileHeld = hold.limitPassed || loaded
+    hold.release()
+    #expect(!loadedWhileHeld, "The key binding translator read its tables on the main thread")
+    try await Self.waitUntil { loaded }
+    #expect(!KeyBindingTranslator.l10nDic.isEmpty && !KeyBindingTranslator.mpvCmdFormat.isEmpty)
+    #expect(KeyBindingTranslator.readableCommand(fromAction: ["seek", "5"]) != "seek 5")
+  }
+
   @Test("A plugin subtitle's download makes the URLs of the paths its provider answers as files' without reading the file system")
   func pluginSubtitleDownloadReadsNoFiles() async throws {
     try await Self.withPlayer { player, folder in
@@ -5551,9 +5568,10 @@ private final class QueueHold: @unchecked Sendable {
   }
 }
 
-/// Holds a file by putting a named pipe in its place, so that opening the file to read it waits until the hold answers the read with
-/// the file's contents, which it does once `limit` has passed, or never if it is released first. `@unchecked Sendable` because its
-/// state is read and written only under `lock`.
+/// Holds a file by putting a named pipe in its place, so that a read of the file made while it is held does not get the file's
+/// contents: opening the pipe to read it waits until the hold answers the read with them, which it does once `limit` has passed, or
+/// never if it is released first, and Foundation's file readers refuse the pipe. `@unchecked Sendable` because its state is read and
+/// written only under `lock`.
 private final class FileHold: @unchecked Sendable {
   private let url: URL
   private let contents: Data
