@@ -4461,6 +4461,43 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A screenshot mpv has taken is found, decoded and removed on the screenshot queue, returning while the queue is held, then copied to the clipboard")
+  func screenshotCallbackDoesNotWait() async throws {
+    try await Self.withSettings([.screenshotSaveToFile: false, .screenshotCopyToClipboard: true, .screenshotShowPreview: false]) {
+      try await Self.withPlayer { player, folder in
+        // The clipboard the screenshot is copied to is put back after.
+        let pasteboard = NSPasteboard.general
+        let saved = (pasteboard.pasteboardItems ?? []).map { item in
+          let copy = NSPasteboardItem()
+          item.types.forEach { type in item.data(forType: type).map { _ = copy.setData($0, forType: type) } }
+          return copy
+        }
+        defer {
+          pasteboard.clearContents()
+          pasteboard.writeObjects(saved)
+        }
+        let shots = folder.appendingPathComponent("screenshots")
+        try FileManager.default.createDirectory(at: shots, withIntermediateDirectories: true)
+        let shot = shots.appendingPathComponent("shot.png")
+        let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4, bitsPerSample: 8,
+                                                   samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                                   colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        try #require(bitmap.representation(using: .png, properties: [:])).write(to: shot)
+        player.mpv.setString(MPVOption.Screenshot.screenshotDir, shots.path)
+        let changeCount = pasteboard.changeCount
+        let hold = await QueueHold.reached(PlayerCore.screenshotQueue, limit: Self.holdLimit)
+        player.screenshotCallback()
+        try await Task.sleep(for: Self.heldAnswerWindow)
+        let handledWhileHeld = hold.limitPassed || pasteboard.changeCount != changeCount
+          || !FileManager.default.fileExists(atPath: shot.path)
+        hold.release()
+        #expect(!handledWhileHeld, "Handling the screenshot found or decoded it on the main thread")
+        try await Self.waitUntil { !FileManager.default.fileExists(atPath: shot.path) }
+        #expect(pasteboard.changeCount != changeCount)
+      }
+    }
+  }
+
   @Test("The icon of a file's type is looked up on the icon queue, the lookup returning while the queue is held, then handed back on the main thread")
   func fileTypeIconDoesNotWait() async throws {
     let hold = await QueueHold.reached(Utility.iconQueue, limit: Self.holdLimit)
