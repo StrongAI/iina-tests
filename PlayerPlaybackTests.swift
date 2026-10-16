@@ -4814,6 +4814,43 @@ struct PlayerPlaybackTests {
     #expect(answeredWhileHeld, "Uninstalling a plugin in the settings waited for mpv to shut down its players or removed its files on the main thread")
     try await Self.waitUntil { !FileManager.default.fileExists(atPath: root.path) }
   }
+
+  @Test("A language token field reads the language list on the list's queue, its saved language a token of its code and its completions empty while the queue is held, then makes the language's token again with its description and completes a typed name from the list")
+  func languageListDoesNotWait() async throws {
+    // The list is read again in the test, so that the queue is held before it is read.
+    let languages = ISO639Helper.languages
+    ISO639Helper.languages = []
+    defer {
+      if ISO639Helper.languages.isEmpty {
+        ISO639Helper.languages = languages
+      }
+    }
+    let field = LanguageTokenField()
+    Self.keptObjects.append(field)
+    func editingString(_ code: String) -> String? {
+      field.tokenField(field, representedObjectForEditing: code).flatMap { field.tokenField(field, editingStringForRepresentedObject: $0) }
+    }
+    func completions(_ typed: String) -> [String] {
+      field.tokenField(field, completionsForSubstring: typed, indexOfToken: 0, indexOfSelectedItem: nil) as? [String] ?? []
+    }
+    func savedEditingString() -> String? {
+      (field.objectValue as? [Any])?.first.flatMap { field.tokenField(field, editingStringForRepresentedObject: $0) }
+    }
+    let hold = await QueueHold.reached(ISO639Helper.queue, limit: Self.holdLimit)
+    field.awakeFromNib()
+    field.commaSeparatedValues = "eng"
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let readWhileHeld = hold.limitPassed || !ISO639Helper.languages.isEmpty || editingString("eng") != "eng"
+      || !completions("fre").isEmpty || savedEditingString() != "eng"
+    hold.release()
+    #expect(!readWhileHeld, "A language token field read the language list on the main thread")
+    try await Self.waitUntil { !ISO639Helper.languages.isEmpty }
+    #expect(field.commaSeparatedValues == "eng")
+    let description = try #require(savedEditingString())
+    #expect(description.hasPrefix("English") && description.hasSuffix("(eng)"))
+    #expect(editingString("eng") == description)
+    #expect(completions("fre").contains { $0.hasPrefix("French") })
+  }
 }
 
 private final class PlayerPlaybackTestsBundle {}
