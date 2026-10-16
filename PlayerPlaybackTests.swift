@@ -3868,6 +3868,30 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Syncing a plugin's preferences writes its preferences file on the plugins' preferences queue, returning while the queue is held, then writes the values set")
+  func pluginPreferencesSyncDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let plugin = try Self.makePlugin(in: folder)
+    Self.keptPlugins.append(plugin)
+    let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
+      .appendingPathComponent("\(plugin.identifier).plist")
+    try? FileManager.default.removeItem(at: file)
+    defer { try? FileManager.default.removeItem(at: file) }
+    var loaded = false
+    plugin.loadPreferences { loaded = true }
+    try await Self.waitUntil { loaded }
+    plugin.preferences["synced"] = 3
+    let hold = await QueueHold.reached(JavascriptPlugin.preferencesQueue, limit: Self.holdLimit)
+    plugin.syncPreferences()
+    // A file written on the main thread would have been written once the main queue had run the write.
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let writtenWhileHeld = hold.limitPassed || FileManager.default.fileExists(atPath: file.path)
+    hold.release()
+    #expect(!writtenWhileHeld, "Syncing a plugin's preferences wrote its preferences file on the main thread")
+    try await Self.waitUntil { (NSDictionary(contentsOf: file) as? [String: Any])?["synced"] as? Int == 3 }
+  }
+
   @Test("A plugin's keychainWrite and keychainRead ask the Keychain on its queue, returning promises while the queue is held, then settle with what the Keychain answered")
   func pluginKeychainDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
@@ -4722,6 +4746,37 @@ struct PlayerPlaybackTests {
     let reread = try #require(Self.installedPlugin(identifier))
     #expect(reread.root.path == installed.root.path)
     #expect(reread.version == "1.0")
+  }
+
+  @Test("Installing the packages of a folder, as the default plugins are installed on first launch, unpacks them and moves their plugins into the plugins folder on the plugin install queue, returning while the queue is held, then installs and enables the plugins")
+  func pluginPackagesInstallDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.default-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let packages = folder.appendingPathComponent("packages")
+    try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true)
+    _ = try Self.makePluginPackage(in: packages, identifier: identifier, version: "1.0")
+    let destination = Utility.pluginsURL.appendingPathComponent("\(identifier).iinaplugin")
+    let installedAll = Box<Bool>()
+    // The packages are unpacked while the queue is held first, and their plugins moved into the plugins folder while it is held again.
+    let unpackHold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
+    JavascriptPlugin.installPackages(in: packages.path) { installedAll.value = $0 }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let unpackedWhileHeld = unpackHold.limitPassed || installedAll.value != nil || Self.installedPlugin(identifier) != nil
+    unpackHold.release()
+    let moveHold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let movedWhileHeld = moveHold.limitPassed || installedAll.value != nil || Self.installedPlugin(identifier) != nil
+      || FileManager.default.fileExists(atPath: destination.path)
+    moveHold.release()
+    #expect(!unpackedWhileHeld, "Installing the packages of a folder unpacked them on the main thread")
+    #expect(!movedWhileHeld, "Installing the packages of a folder moved their plugins into the plugins folder on the main thread")
+    try await Self.waitUntil { installedAll.value != nil }
+    #expect(installedAll.value == true)
+    let plugin = try #require(Self.installedPlugin(identifier))
+    #expect(plugin.root.path == destination.path)
+    #expect(plugin.enabled)
   }
 
   @Test("Installing a plugin package unpacks and reads it on the plugin install queue, returning while the queue is held, then installs and enables the plugin")
