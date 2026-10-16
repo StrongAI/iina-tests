@@ -2086,6 +2086,26 @@ struct PlayerPlaybackTests {
     #expect(videoView.currentDisplay == nil, "A player window whose video was uninitialized updated its display link")
   }
 
+  @Test("Hiding the OSD of a player whose main window was never loaded leaves the window unloaded, and a loaded window's OSD is hidden")
+  func hideOSDWithoutLoadedWindow() async throws {
+    // A player with no window, as PlayerCore.active is when no player window is the main window and the first player has opened
+    // nothing.
+    let windowless = PlayerCore()
+    windowless.label = "iinaTests-playback-\(Self.playerCount)"
+    Self.playerCount += 1
+    windowless.hideOSD()
+    // The OSD is hidden on the main queue.
+    await Self.drainMain()
+    #expect(!windowless.mainWindow.loaded, "Hiding the OSD of a player whose main window was never loaded loaded the window")
+    try await Self.withPlayer { player, _ in
+      let window = try #require(player.mainWindow)
+      window.displayOSD(.pause, autoHide: false)
+      try #require(window.osdAnimationState == .shown)
+      player.hideOSD()
+      try await Self.waitUntil { window.osdAnimationState == .hidden && window.osdView.isHidden }
+    }
+  }
+
   /// A site that stops a player: each must not wait for `mpv` on the main thread.
   enum StopRequest: String, CaseIterable, Sendable {
     case menuStop, windowClose, miniPlayerClose, jsStop, remoteStop

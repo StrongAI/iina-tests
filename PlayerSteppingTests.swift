@@ -36,6 +36,29 @@ struct PlayerSteppingTests {
     return player
   }
 
+  /// Fault threshold for the core of a player's `mpv` to start, not an estimate of how long starting takes.
+  private static let startLimit: Duration = .seconds(30)
+
+  /// A player whose `mpv` core has started with nothing loaded and is idle.
+  ///
+  /// The core starts once every script `mpv` loads has started, and only then makes the first entry of its playlist current and
+  /// plays it, so an entry added to the playlist before then would be played. A core that starts with an empty playlist enters idle
+  /// mode, which `mpv` reports with an idle event, and an entry appended after that is not played.
+  private static func idlePlayer() async throws -> PlayerCore {
+    let player = unstartedPlayer()
+    let idleEvent = EventController.Name("mpv.idle")
+    var isIdle = false
+    let listener = player.events.addListener(EventListener { isIdle = true }, for: idleEvent)
+    defer { player.events.removeListener(listener, for: idleEvent) }
+    player.startMPV()
+    let deadline = ContinuousClock.now + startLimit
+    while !isIdle {
+      try #require(ContinuousClock.now < deadline, "The core of the player's mpv did not start")
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    return player
+  }
+
   /// Wait until every block the main queue holds has run.
   private static func drainMain() async {
     await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
@@ -163,7 +186,7 @@ struct PlayerSteppingTests {
 
   @Test("The playlist is read from mpv in a request that returns before mpv handles it")
   func playlistRead() async throws {
-    let player = Self.startedPlayer()
+    let player = try await Self.idlePlayer()
     player.mpv.playlistAppend("/iinaTests/a.mp4")
     player.mpv.playlistAppend("/iinaTests/b.mp4")
     let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
@@ -184,8 +207,8 @@ struct PlayerSteppingTests {
   }
 
   @Test("Refreshing the playlist reads it from mpv")
-  func playlistRefreshed() async {
-    let player = Self.startedPlayer()
+  func playlistRefreshed() async throws {
+    let player = try await Self.idlePlayer()
     player.mpv.playlistAppend("/iinaTests/a.mp4")
     player.refreshPlaylist()
     // mpv answers in the order it is asked, and the refresh stores the playlist when its answer comes, ahead of this one.
@@ -238,7 +261,7 @@ struct PlayerSteppingTests {
 
   @Test("The folder playlist adds entries to mpv's playlist until the playlist is abandoned")
   func folderPlaylist() async throws {
-    let player = Self.startedPlayer()
+    let player = try await Self.idlePlayer()
     let matcher = AutoFileMatcher(player: player, ticket: player.folderPlaylistTicket.value)
     try matcher.checkFolderTicket()
     matcher.append("/iinaTests/b.mp4")
@@ -247,5 +270,18 @@ struct PlayerSteppingTests {
     #expect(player.info.playlist.map(\.filename) == ["/iinaTests/a.mp4", "/iinaTests/b.mp4"])
     player.folderPlaylistTicket.abandon()
     #expect(throws: PlayerCore.TicketExpiredError.self) { try matcher.checkFolderTicket() }
+  }
+}
+
+/// Runs a block on the main thread each time a player emits an event it listens for.
+private final class EventListener: EventCallable {
+  private let block: @MainActor () -> Void
+
+  init(_ block: @escaping @MainActor () -> Void) {
+    self.block = block
+  }
+
+  func call(withArguments args: [Any]) {
+    MainActor.assumeIsolated { block() }
   }
 }
