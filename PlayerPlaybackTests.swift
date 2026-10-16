@@ -3970,6 +3970,27 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Loading the key bindings lists the input configs and reads the current one on the key bindings queue, returning while the queue is held, then sets its bindings")
+  func keyBindingsLoadDoesNotWait() async throws {
+    // The bindings are emptied, so that bindings set while the queue is held show they were read on the main thread.
+    let keyBindings = PlayerCore.keyBindings
+    defer {
+      if PlayerCore.keyBindings.isEmpty {
+        PlayerCore.keyBindings = keyBindings
+      }
+    }
+    PlayerCore.keyBindings = [:]
+    let hold = await QueueHold.reached(PlayerCore.keyBindingsQueue, limit: Self.holdLimit)
+    var loaded = false
+    PlayerCore.loadKeyBindings { loaded = true }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let loadedWhileHeld = hold.limitPassed || loaded || !PlayerCore.keyBindings.isEmpty
+    hold.release()
+    #expect(!loadedWhileHeld, "Loading the key bindings read the input config on the main thread")
+    try await Self.waitUntil { loaded }
+    #expect(!PlayerCore.keyBindings.isEmpty)
+  }
+
   /// Run `body`, then put back the entries of `keys` in the app's own settings domain, removing those it did not hold.
   private static func restoringSettings(_ keys: [String], _ body: () async throws -> Void) async throws {
     let defaults = UserDefaults.standard
