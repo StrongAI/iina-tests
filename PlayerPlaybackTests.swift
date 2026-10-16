@@ -3826,6 +3826,35 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A site that makes a player's instances of the plugins: each must make them from the scripts read when the plugin was made.
+  enum PlayerPluginLoad: String, CaseIterable, Sendable {
+    case loadPlugins, reloadPlugin
+  }
+
+  @Test("Each site that makes a player's instance of a plugin makes it from the scripts read when the plugin was made, returning while the plugin's entry script file is held, then the instance has run the script",
+        arguments: PlayerPluginLoad.allCases)
+  func playerPluginLoadReadsNoScripts(_ load: PlayerPluginLoad) async throws {
+    try await Self.withPlayer { player, folder in
+      let identifier = "io.iina.tests.player-\(load.rawValue)-\(UUID().uuidString)"
+      defer { Self.uninstallPlugin(identifier) }
+      let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
+      await PluginManager(window: NSWindow()).install(localPackageURL: package)
+      let plugin = try #require(Self.installedPlugin(identifier))
+      try #require(plugin.enabled)
+      let entry = plugin.root.appendingPathComponent(plugin.entryPath)
+      let hold = try FileHold(entry, contents: try Data(contentsOf: entry), limit: Self.holdLimit)
+      switch load {
+      case .loadPlugins: player.loadPlugins()
+      case .reloadPlugin: player.reloadPlugin(plugin, forced: true)
+      }
+      let readWhileHeld = hold.limitPassed
+      hold.release()
+      #expect(!readWhileHeld, "Making a player's instance of a plugin read its entry script from its file on the main thread")
+      let instance = try #require(player.plugins.first { $0.plugin === plugin })
+      #expect(instance.js.evaluateScript("globalThis.version === \"1.0\"").toBool())
+    }
+  }
+
   @Test("The key binding translator reads its strings and command format tables on its queue, returning while the queue is held, then translates a command with them")
   func keyBindingTranslatorTablesDoNotWait() async throws {
     let (strings, formats) = (KeyBindingTranslator.l10nDic, KeyBindingTranslator.mpvCmdFormat)
@@ -3862,6 +3891,46 @@ struct PlayerPlaybackTests {
     #expect(saved! == nil)
     let written = try String(contentsOf: url, encoding: .utf8)
     #expect(written == "first line\nsecond line\n")
+  }
+
+  @Test("Saving the playlist writes the playlist file on the menu save queue, returning while the queue is held, then the file holds the playlist")
+  func playlistSaveDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let url = folder.appendingPathComponent("playlist.m3u8")
+    let playlist = ["a.mp4", "b.mp4"].map { folder.appendingPathComponent($0).path + "\n" }.joined()
+    let hold = await QueueHold.reached(MainMenuActionHandler.saveQueue, limit: Self.holdLimit)
+    var saved: Error?? = .none
+    MainMenuActionHandler.write(playlist, to: url) { saved = .some($0) }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: url.path)
+    hold.release()
+    #expect(!savedWhileHeld, "Saving the playlist wrote the file on the main thread")
+    try await Self.waitUntil { saved != nil }
+    #expect(saved! == nil)
+    let written = try String(contentsOf: url, encoding: .utf8)
+    #expect(written == playlist)
+  }
+
+  @Test("Saving a downloaded subtitle copies it on the menu save queue, returning while the queue is held, then the copy holds the subtitle")
+  func downloadedSubtitleSaveDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let subtitle = folder.appendingPathComponent("downloaded.srt")
+    let contents = "1\n00:00:00,000 --> 00:00:01,000\nsaved\n"
+    try contents.write(to: subtitle, atomically: true, encoding: .utf8)
+    let destination = folder.appendingPathComponent("saved.srt")
+    let hold = await QueueHold.reached(MainMenuActionHandler.saveQueue, limit: Self.holdLimit)
+    var saved: Error?? = .none
+    MainMenuActionHandler.copySubtitle(subtitle, to: destination) { saved = .some($0) }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: destination.path)
+    hold.release()
+    #expect(!savedWhileHeld, "Saving the downloaded subtitle copied it on the main thread")
+    try await Self.waitUntil { saved != nil }
+    #expect(saved! == nil)
+    let copied = try String(contentsOf: destination, encoding: .utf8)
+    #expect(copied == contents)
   }
 
   /// Run `body`, then put back the entries of `keys` in the app's own settings domain, removing those it did not hold.
