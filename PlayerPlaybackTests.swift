@@ -3814,6 +3814,40 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A plugin's preferences get and set wait for the preferences file to be read on the plugins' preferences queue, returning promises while the queue is held, then settle with the value read and set it")
+  func pluginPreferencesDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
+        .appendingPathComponent("\(plugin.identifier).plist")
+      let stored = try? Data(contentsOf: file)
+      defer {
+        if let stored { try? stored.write(to: file) } else { try? FileManager.default.removeItem(at: file) }
+      }
+      try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try (["stored": 1] as NSDictionary).write(to: file)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+      let hold = await QueueHold.reached(JavascriptPlugin.preferencesQueue, limit: Self.holdLimit)
+      _ = instance.js.evaluateScript("""
+        globalThis.answers = {};
+        iina.preferences.set("written", 2).then(() => { answers.set = true; });
+        iina.preferences.get("stored").then(value => { answers.get = value; });
+        iina.preferences.get("written").then(value => { answers.written = value; });
+        """)
+      // Preferences read on the script's thread would have been answered once the script had run.
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let readWhileHeld = hold.limitPassed || !holds("Object.keys(answers).length === 0") || plugin.preferences["written"] != nil
+      hold.release()
+      #expect(!readWhileHeld, "A plugin's preferences were read from the file on the script's thread")
+      try await Self.waitUntil { holds("Object.keys(answers).length === 3") }
+      #expect(holds("answers.set === true && answers.get === 1 && answers.written === 2"))
+      #expect(plugin.preferences["stored"] as? Int == 1)
+      #expect(plugin.preferences["written"] as? Int == 2)
+    }
+  }
+
   @Test("A plugin's keychainWrite and keychainRead ask the Keychain on its queue, returning promises while the queue is held, then settle with what the Keychain answered")
   func pluginKeychainDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
