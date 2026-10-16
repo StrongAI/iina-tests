@@ -3693,6 +3693,39 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The welcome window finds the icon of each recent document on its file queue, returning while the queue is held, then shows it in the document's row")
+  func initialWindowRecentIconDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let document = folder.appendingPathComponent("a.mp4")
+      // The window lists this document without the test writing to the recent-documents list the installed app shares.
+      let recent = InitialWindowController.recentDocumentURLs
+      InitialWindowController.recentDocumentURLs = { [document] }
+      defer { InitialWindowController.recentDocumentURLs = recent }
+      // Each icon is handed back by the recorder, which records whether the main thread looked it up.
+      let icons = IconLookupRecorder()
+      let documentIcon = InitialWindowController.documentIcon
+      InitialWindowController.documentIcon = icons.lookUp
+      defer { InitialWindowController.documentIcon = documentIcon }
+      try await Self.withSettings([.recordRecentFiles: true]) {
+        let controller: InitialWindowController = player.initialWindow
+        let hold = await QueueHold.reached(InitialWindowController.fileQueue, limit: Self.holdLimit)
+        controller.showWindow(nil)
+        let table: NSTableView = controller.recentFilesTableView
+        // An icon looked up, or a row listed, while the queue is held was looked up on the main thread.
+        let lookedUpWhileHeld = hold.limitPassed || !icons.onMainThread.isEmpty || table.numberOfRows > 0
+        hold.release()
+        #expect(!lookedUpWhileHeld, "The welcome window looked up a recent document's icon on the main thread")
+        try await Self.waitUntil { table.numberOfRows == 1 }
+        let cell = try #require(table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? NSTableCellView)
+        #expect(cell.textField?.stringValue == "a.mp4")
+        #expect(cell.imageView?.image === icons.icon)
+        // Showing the row looks up no icon of its own on the main thread.
+        #expect(!icons.onMainThread.contains(true), "The welcome window looked up a recent document's icon on the main thread")
+        controller.close()
+      }
+    }
+  }
+
   @Test("The welcome window finds whether the last played file exists, which recent documents to list and the icons it shows on its file queue, returning while the queue is held, then shows the last played file")
   func initialWindowDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
@@ -4758,6 +4791,32 @@ private final class QueueHold: @unchecked Sendable {
 
   func release() {
     released.signal()
+  }
+}
+
+/// Records, for each icon of a recent document looked up, whether the main thread looked it up, in place of looking it up.
+/// `@unchecked Sendable`: lookups are recorded from any thread, and every access to `made` holds `lock`.
+private final class IconLookupRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var made: [Bool] = []
+
+  /// The icon handed back for every lookup.
+  let icon = NSImage(size: NSSize(width: 16, height: 16))
+
+  /// Whether the main thread made each lookup, in the order they were made.
+  var onMainThread: [Bool] {
+    lock.lock()
+    defer { lock.unlock() }
+    return made
+  }
+
+  /// Record a lookup of the icon of a document, from any thread.
+  /// - Returns: `icon`.
+  func lookUp(_ document: URL) -> NSImage {
+    lock.lock()
+    made.append(Thread.isMainThread)
+    lock.unlock()
+    return icon
   }
 }
 
