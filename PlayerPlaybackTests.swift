@@ -3780,6 +3780,27 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A plugin's data and temporary folders are made when the plugin is made, and a path its script names in them reads no file system")
+  func pluginFolderPathReadsNoFiles() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      let folders = [plugin.dataFolderURL, plugin.tmpFolderURL]
+      #expect(folders.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+      // With the folders gone, a path named in them that made them would show the file system read on the script's thread.
+      try folders.forEach { try FileManager.default.removeItem(at: $0) }
+      defer { plugin.makeFolders() }
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let api = try #require(instance.apis["subtitle"] as? JavascriptAPISubtitle)
+      let named = [api.parsePath("@data/a.txt"), api.parsePath("@tmp/b.txt")]
+      #expect(named.map { $0.path } == [plugin.dataFolderURL.appendingPathComponent("a.txt").standardized.path,
+                                     plugin.tmpFolderURL.appendingPathComponent("b.txt").standardized.path])
+      #expect(named.allSatisfy { $0.local })
+      #expect(folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) },
+              "A path a plugin's script named in its data or temporary folder made the folder on the script's thread")
+    }
+  }
+
   @Test("A plugin subtitle's download makes the URLs of the paths its provider answers as files' without reading the file system")
   func pluginSubtitleDownloadReadsNoFiles() async throws {
     try await Self.withPlayer { player, folder in
@@ -3958,7 +3979,7 @@ struct PlayerPlaybackTests {
       Self.keptPlugins.append(plugin)
       // A folder of the plugin's own, so that the folder listed holds only the test's files.
       let sub = UUID().uuidString
-      let folderURL = plugin.tmpURL.appendingPathComponent(sub)
+      let folderURL = plugin.tmpFolderURL.appendingPathComponent(sub)
       try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
       defer { try? FileManager.default.removeItem(at: folderURL) }
       func url(_ name: String) -> URL { folderURL.appendingPathComponent(name) }
@@ -4021,7 +4042,7 @@ struct PlayerPlaybackTests {
       let plugin = try Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let sub = UUID().uuidString
-      let folderURL = plugin.tmpURL.appendingPathComponent(sub)
+      let folderURL = plugin.tmpFolderURL.appendingPathComponent(sub)
       try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
       defer { try? FileManager.default.removeItem(at: folderURL) }
       let written = folderURL.appendingPathComponent("written.txt")
