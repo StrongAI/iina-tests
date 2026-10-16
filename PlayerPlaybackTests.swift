@@ -88,8 +88,9 @@ struct PlayerPlaybackTests {
   }
 
   /// Close the window of `player`, wait for its playback to stop, then shut it down and wait until its `mpv` core is gone, so that
-  /// no test leaves a core and its threads running in the tests after it.
+  /// no test leaves a core and its threads running in the tests after it. A player the test has shut down is left as it is.
   private static func shutDown(_ player: PlayerCore) async throws {
+    guard player.info.state != .shutDown else { return }
     player.mainWindow.close()
     try await waitUntil { player.info.state == .idle }
     player.shutdown()
@@ -1958,6 +1959,92 @@ struct PlayerPlaybackTests {
         try await Self.waitUntil { Preference.url(for: .iinaLastPlayedFilePath) == file }
       }
     }
+  }
+
+  /// A site that shuts a player down: each must not wait for `mpv` on the main thread.
+  enum ShutdownRequest: String, CaseIterable, Sendable {
+    case playerShutdown, mpvQuit
+  }
+
+  @Test("Each site that shuts a player down returns before mpv handles the quit, after which mpv has shut down and the player has stored the file played",
+        arguments: ShutdownRequest.allCases)
+  func shutdownRequestDoesNotWait(_ request: ShutdownRequest) async throws {
+    let defaults = UserDefaults.standard
+    let keys = [Preference.Key.iinaLastPlayedFilePath.rawValue, Preference.Key.iinaLastPlayedFilePosition.rawValue]
+    let stored = keys.map { defaults.object(forKey: $0) }
+    defer { zip(keys, stored).forEach { defaults.set($1, forKey: $0) } }
+    try await Self.withPlayer { player, folder in
+      let file = try #require(player.info.currentURL)
+      // mpv saves the position on quit into the test's folder; the player is shut down here, so nothing is restored after.
+      player.mpv.setString("watch-later-directory", folder.path)
+      player.mpv.setFlag(MPVOption.WatchLater.savePositionOnQuit, true)
+      defaults.removeObject(forKey: Preference.Key.iinaLastPlayedFilePath.rawValue)
+      // A player whose background task is still loading the folder's files puts off its shutdown until the task ends, so the shutdown
+      // is asked once it has ended, to be made while the core is held.
+      try await Self.waitUntil { !player.backgroundTaskInUse }
+      // The hold's client is closed once the core is let go, so that mpv shutting down soon waits for no client but the player's.
+      do {
+        let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+        switch request {
+        case .playerShutdown:
+          player.shutdown()
+        case .mpvQuit:
+          // As PlayerCore.shutdown does before it, so that mpv shutting down is not taken for a quit mpv was asked for directly.
+          player.info.state = .shuttingDown
+          player.mpv.mpvQuit()
+        }
+        let returnedWhileHeld = !hold.hasLetGo && player.info.state == .shuttingDown
+        hold.release()
+        try await Self.waitUntil { hold.hasLetGo }
+        #expect(returnedWhileHeld, "Shutting a player down waited for mpv")
+      }
+      try await Self.waitUntil { player.info.state == .shutDown }
+      if request == .playerShutdown {
+        #expect(Preference.url(for: .iinaLastPlayedFilePath) == file)
+      }
+    }
+  }
+
+  @Test("A player whose mpv shut down on its own stores the file played from what mpv last reported, returning while mpv's core is held, then asks for the app to terminate")
+  func mpvShutdownDoesNotWait() async throws {
+    let defaults = UserDefaults.standard
+    let keys = [Preference.Key.iinaLastPlayedFilePath.rawValue, Preference.Key.iinaLastPlayedFilePosition.rawValue]
+    let stored = keys.map { defaults.object(forKey: $0) }
+    defer { zip(keys, stored).forEach { defaults.set($1, forKey: $0) } }
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    // A player with no window, whose video is never initialized, so that mpv is not asked to free its renderer.
+    let player = PlayerCore()
+    player.label = "iinaTests-playback-\(Self.playerCount)"
+    Self.playerCount += 1
+    player.startMPV()
+    player.mpv.setString("watch-later-directory", folder.path)
+    player.mpv.setFlag(MPVOption.WatchLater.savePositionOnQuit, true)
+    try await Self.waitUntil { player.info.savesPositionOnQuit }
+    let file = folder.appendingPathComponent("a.mp4")
+    player.info.currentURL = file
+    defaults.removeObject(forKey: Preference.Key.iinaLastPlayedFilePath.rawValue)
+    var terminations = 0
+    let terminateApp = PlayerCore.terminateApp
+    PlayerCore.terminateApp = { terminations += 1 }
+    defer { PlayerCore.terminateApp = terminateApp }
+    // The hold's client is closed before mpv is asked to quit, so that mpv waits for no client but the player's.
+    do {
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      player.mpvHasShutdown()
+      let returnedWhileHeld = !hold.hasLetGo && Preference.url(for: .iinaLastPlayedFilePath) == file
+      hold.release()
+      try await Self.waitUntil { hold.hasLetGo }
+      #expect(returnedWhileHeld, "A player whose mpv shut down asked mpv whether it saves the position")
+    }
+    try await Self.waitUntil { terminations == 1 }
+    // mpv has not shut down: it is asked to quit as the player would ask it, and its handle, which no window frees, is destroyed.
+    player.info.state = .shuttingDown
+    player.mpv.mpvQuit()
+    try await Self.waitUntil { player.info.state == .shutDown }
+    mpv_destroy(player.mpv.mpv)
+    player.mpv.mpv = nil
+    #expect(terminations == 1)
   }
 
   /// A site that stops a player: each must not wait for `mpv` on the main thread.
