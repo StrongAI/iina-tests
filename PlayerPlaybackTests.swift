@@ -2307,7 +2307,8 @@ struct PlayerPlaybackTests {
     case .prefLogFolder:
       let controller = PrefAdvancedViewController()
       ask = { controller.openLogDir(controller) }
-      expected = [.open(Logger.logDirectory)]
+      // The log folder is made on the workspace queue before it is opened, so it is known once LaunchServices is asked.
+      asked = { made in Logger.logDirectory.map { made == [.open($0)] } == true }
     case .prefAdvancedHelp:
       let controller = PrefAdvancedViewController()
       ask = { controller.helpBtnAction(controller) }
@@ -2422,7 +2423,8 @@ struct PlayerPlaybackTests {
       let page = SettingsPageAdvanced()
       keptObjects.append(page)
       ask = { _ = NSApp.sendAction(NSSelectorFromString("openLogFolder"), to: page, from: nil) }
-      expected = [.open(Logger.logDirectory)]
+      // The log folder is made on the workspace queue before it is opened, so it is known once LaunchServices is asked.
+      asked = { made in Logger.logDirectory.map { made == [.open($0)] } == true }
     case .settingsShowConfFile:
       let editor = ConfigEditor()
       keptObjects.append(editor)
@@ -4494,10 +4496,12 @@ struct PlayerPlaybackTests {
     let enabled = Logger.enabled
     Logger.enabled = true
     defer { Logger.enabled = enabled }
-    let file = Logger.logDirectory.appendingPathComponent("iina.log")
+    // The log folder is made when the first line is written to the log file, so the file is looked for once a line is written.
+    func file() -> URL? { Logger.logDirectory?.appendingPathComponent("iina.log") }
     func written(_ line: String) -> Bool {
-      (try? String(contentsOf: file, encoding: .utf8))?.contains(line) == true
+      file().flatMap { try? String(contentsOf: $0, encoding: .utf8) }?.contains(line) == true
     }
+    func isOpen() -> Bool { file().map(Self.isOpen) == true }
     // At the error level, so that the line is logged whatever level the settings log at.
     let line = "iinaTests-log-\(UUID().uuidString)"
     let writeHold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
@@ -4506,22 +4510,60 @@ struct PlayerPlaybackTests {
     writeHold.release()
     #expect(!writtenWhileHeld, "Logging a line wrote it to the log file on the main thread")
     try await Self.waitUntil { written(line) }
-    #expect(Self.isOpen(file))
+    #expect(isOpen())
     // The log file stays closed for the rest of the run, the lines logged after it written only to the console. Its caller is told
     // on the main thread once the lines logged before the close are written and the file is closed, as termination is.
     let lastLine = "iinaTests-log-last-\(UUID().uuidString)"
     let closeHold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
     Logger.log(lastLine, level: .error)
     let closed = Box<(onMain: Bool, lastWritten: Bool, fileOpen: Bool)>()
-    Logger.closeLogFile { closed.value = (Thread.isMainThread, written(lastLine), Self.isOpen(file)) }
+    Logger.closeLogFile { closed.value = (Thread.isMainThread, written(lastLine), isOpen()) }
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let closedWhileHeld = closeHold.limitPassed || !Self.isOpen(file) || closed.value != nil
+    let closedWhileHeld = closeHold.limitPassed || !isOpen() || closed.value != nil
     closeHold.release()
     #expect(!closedWhileHeld, "Closing the log file closed it, or told its caller it had, on the main thread")
     try await Self.waitUntil { closed.value != nil }
     #expect(closed.value?.onMain == true)
     #expect(closed.value?.lastWritten == true, "The log file was closed before the lines logged ahead of the close were written")
     #expect(closed.value?.fileOpen == false)
+  }
+
+  @Test("The first line written to the log file makes this session's log folder and opens the file in it on the logger's file queue, returning while the queue is held, then the file holds the line")
+  func logFileOpenDoesNotWait() async throws {
+    let enabled = Logger.enabled
+    Logger.enabled = true
+    defer { Logger.enabled = enabled }
+    // While the queue is held the logger is set to open its file again, in a new folder; the file and folder it had are put back
+    // after.
+    let hold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
+    let logFile = Logger.logFile
+    let logDirectory = Logger.logDirectory
+    Logger.logFile = .unopened
+    Logger.logDirectory = nil
+    // At the error level, so that the line is logged whatever level the settings log at.
+    let line = "iinaTests-log-open-\(UUID().uuidString)"
+    Logger.log(line, level: .error)
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let openedWhileHeld = hold.limitPassed || Logger.logDirectory != nil
+    hold.release()
+    #expect(!openedWhileHeld, "Writing the first line made the log folder on the main thread")
+    try await Self.waitUntil { Logger.logDirectory != nil }
+    let folder = try #require(Logger.logDirectory)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("iina.log")
+    try await Self.waitUntil { (try? String(contentsOf: file, encoding: .utf8))?.contains(line) == true }
+    #expect(folder != logDirectory)
+    #expect(Self.isOpen(file))
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      Logger.fileQueue.async {
+        if case let .open(fileHandle, _) = Logger.logFile {
+          fileHandle.closeFile()
+        }
+        Logger.logFile = logFile
+        Logger.logDirectory = logDirectory
+        continuation.resume()
+      }
+    }
   }
 
   @Test("Flipping, mirroring and cropping the video and removing a video filter by label, string or position return while mpv's core is held, then change mpv's video filters")
