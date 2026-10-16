@@ -3780,6 +3780,35 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A plugin subtitle's download makes the URLs of the paths its provider answers as files' without reading the file system")
+  func pluginSubtitleDownloadReadsNoFiles() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let api = try #require(instance.apis["subtitle"] as? JavascriptAPISubtitle)
+      // The provider answers the path of a folder, which a URL made by reading the file system would mark a directory.
+      let answered = folder.path
+      // The item is made by the plugin's script, as a provider makes the items it finds.
+      let made = instance.js.evaluateScript("""
+        (() => {
+          const item = iina.subtitle.item({}, null);
+          item.__setDownloadCallback((done, failed) => done(["\(answered)"]));
+          return item;
+        })()
+        """)
+      let item = try #require(made?.toObject() as? JavascriptPluginSubtitleItem)
+      let subtitle = JSPluginSub.Subtitle(index: 0, item: item, api: api)
+      let urls: [URL] = try await withCheckedThrowingContinuation { continuation in
+        subtitle.download()
+          .done { continuation.resume(returning: $0) }
+          .catch { continuation.resume(throwing: $0) }
+      }
+      #expect(urls.map(\.path) == [answered])
+      #expect(urls.allSatisfy { !$0.hasDirectoryPath }, "A plugin subtitle's download read the file system to make its URLs")
+    }
+  }
+
   @Test("A plugin's exec looks up its binary and starts its process on the plugin's queue, returning while the queue is held, then rejects a binary it cannot find and runs one it can")
   func pluginExecDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
