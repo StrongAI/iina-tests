@@ -2622,8 +2622,9 @@ struct PlayerPlaybackTests {
       // let go.
       let titleBar = try #require(window.titleBarView)
       let field = try #require(titleBar.titleTextField)
-      field.stringValue = ""
       let hold = await QueueHold.reached(Utility.workspaceQueue, limit: holdLimit)
+      // Emptied once the hold is reached, since a title update already queued on the main thread runs while the hold is awaited.
+      field.stringValue = ""
       titleBar.updateTitle()
       let returnedWhileHeld = !hold.limitPassed && field.stringValue.isEmpty
       hold.release()
