@@ -3862,6 +3862,65 @@ struct PlayerPlaybackTests {
     #expect(written == "first line\nsecond line\n")
   }
 
+  /// Run `body`, then put back the entries of `keys` in the app's own settings domain, removing those it did not hold.
+  private static func restoringSettings(_ keys: [String], _ body: () async throws -> Void) async throws {
+    let defaults = UserDefaults.standard
+    let stored = defaults.persistentDomain(forName: InfoDictionary.shared.bundleIdentifier) ?? [:]
+    defer {
+      for key in keys {
+        if let value = stored[key] { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+      }
+    }
+    try await body()
+  }
+
+  /// Whether the app's own settings domain holds an entry for `key`.
+  private static func settingsDomainHolds(_ key: String) -> Bool {
+    UserDefaults.standard.persistentDomain(forName: InfoDictionary.shared.bundleIdentifier)?[key] != nil
+  }
+
+  @Test("Migrating the legacy color settings copies the settings domain and decodes the legacy colors on the migration queue, returning while the queue is held, then sets the modern setting")
+  func legacyColorMigrationDoesNotWait() async throws {
+    let legacyKey = "subTextColor", modernKey = Preference.Key.subTextColorString.rawValue
+    try await Self.restoringSettings([legacyKey, modernKey]) {
+      // Older versions of IINA stored the color archived by NSArchiver, which is deprecated, so it is called by name.
+      let color = NSColor(deviceRed: 1, green: 0.5, blue: 0, alpha: 1)
+      let archived = try #require((NSClassFromString("NSArchiver") as AnyObject)
+        .perform(NSSelectorFromString("archivedDataWithRootObject:"), with: color)?.takeUnretainedValue() as? Data)
+      UserDefaults.standard.set(archived, forKey: legacyKey)
+      UserDefaults.standard.removeObject(forKey: modernKey)
+      let hold = await QueueHold.reached(LegacyMigration.queue, limit: Self.holdLimit)
+      var migrated = false
+      LegacyMigration.shared.migrateLegacyPreferences { migrated = true }
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let migratedWhileHeld = hold.limitPassed || migrated || Self.settingsDomainHolds(modernKey)
+      hold.release()
+      #expect(!migratedWhileHeld, "Migrating the legacy color settings read them on the main thread")
+      try await Self.waitUntil { migrated }
+      #expect(Preference.string(for: .subTextColorString) == color.mpvColorString)
+    }
+  }
+
+  @Test("Migrating the legacy tone mapping target peak setting copies the settings domain on the migration queue, returning while the queue is held, then sets the new settings")
+  func toneMappingTargetPeakMigrationDoesNotWait() async throws {
+    let keys = [Preference.Key.toneMappingTargetPeak, .enableToneMappingTargetPeakOverride, .toneMappingTargetPeakOverride]
+    try await Self.restoringSettings(keys.map(\.rawValue)) {
+      Preference.set(800, for: .toneMappingTargetPeak)
+      UserDefaults.standard.removeObject(forKey: Preference.Key.enableToneMappingTargetPeakOverride.rawValue)
+      let hold = await QueueHold.reached(LegacyMigration.queue, limit: Self.holdLimit)
+      var migrated = false
+      LegacyMigration.shared.migrateToneMappingTargetPeak { migrated = true }
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let migratedWhileHeld = hold.limitPassed || migrated
+        || Self.settingsDomainHolds(Preference.Key.enableToneMappingTargetPeakOverride.rawValue)
+      hold.release()
+      #expect(!migratedWhileHeld, "Migrating the tone mapping target peak setting read the settings domain on the main thread")
+      try await Self.waitUntil { migrated }
+      #expect(Preference.bool(for: .enableToneMappingTargetPeakOverride))
+      #expect(Preference.integer(for: .toneMappingTargetPeakOverride) == 800)
+    }
+  }
+
   @Test("A plugin subtitle's download makes the URLs of the paths its provider answers as files' without reading the file system")
   func pluginSubtitleDownloadReadsNoFiles() async throws {
     try await Self.withPlayer { player, folder in
