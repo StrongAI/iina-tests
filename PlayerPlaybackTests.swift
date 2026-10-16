@@ -2042,9 +2042,48 @@ struct PlayerPlaybackTests {
     player.info.state = .shuttingDown
     player.mpv.mpvQuit()
     try await Self.waitUntil { player.info.state == .shutDown }
-    mpv_destroy(player.mpv.mpv)
-    player.mpv.mpv = nil
+    player.mpv.mpvDestroy()
     #expect(terminations == 1)
+  }
+
+  @Test("A player's mpv handle is set to nil and its destruction left to the queue its events are read on, returning while mpv's core is held with the player's quit unanswered, then destroyed once the core is let go")
+  func mpvDestroyDoesNotWait() async throws {
+    // A player with no window, whose video is never initialized, so that nothing but the test destroys its handle.
+    let player = PlayerCore()
+    player.label = "iinaTests-playback-\(Self.playerCount)"
+    Self.playerCount += 1
+    player.startMPV()
+    // The hold's client is closed once the core is let go, so that mpv shutting down waits for no client but the player's.
+    do {
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      // Destroying a handle waits until mpv has answered the handle's requests, and the quit is not answered while the core is held.
+      player.info.state = .shuttingDown
+      player.mpv.mpvQuit()
+      player.mpv.mpvDestroy()
+      let returnedWhileHeld = !hold.hasLetGo && player.mpv.mpv == nil
+      hold.release()
+      try await Self.waitUntil { hold.hasLetGo }
+      #expect(returnedWhileHeld, "Destroying a player's mpv handle waited for mpv to answer the player's requests")
+    }
+    // Work queued on the events' queue after the handle's destruction runs once the handle is destroyed.
+    let destroyed = DispatchSemaphore(value: 0)
+    player.mpv.queue.async { destroyed.signal() }
+    try await Self.waitUntil { destroyed.wait(timeout: .now()) == .success }
+  }
+
+  @Test("A player window whose video was uninitialized as its player shut down reaches no mpv handle when the window changes screen")
+  func screenChangeAfterShutdownReachesNoMPV() async throws {
+    var shutDownPlayer: PlayerCore?
+    try await Self.withPlayer { player, _ in shutDownPlayer = player }
+    let player = try #require(shutDownPlayer)
+    let videoView = player.mainWindow.videoView
+    try #require(videoView.isUninited && player.mpv.mpv == nil)
+    let window = try #require(player.mainWindow.window)
+    try #require(window.screen?.displayId != nil)
+    // The display the view was on is forgotten, as when the window has moved to another display.
+    videoView.currentDisplay = nil
+    NotificationCenter.default.post(name: NSWindow.didChangeScreenNotification, object: window)
+    #expect(videoView.currentDisplay == nil, "A player window whose video was uninitialized updated its display link")
   }
 
   /// A site that stops a player: each must not wait for `mpv` on the main thread.
@@ -4608,8 +4647,7 @@ struct PlayerPlaybackTests {
   private static func destroyMPV(of player: PlayerCore) async throws {
     try await waitUntil { player.info.state == .shutDown }
     try #require(!player.mainWindow.loaded)
-    mpv_destroy(player.mpv.mpv)
-    player.mpv.mpv = nil
+    player.mpv.mpvDestroy()
   }
 
   /// Make `request`, which has the global instance that made `player` shut its players down, while the core of the player's `mpv`
