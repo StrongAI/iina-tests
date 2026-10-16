@@ -3789,6 +3789,31 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A plugin's fileInPath looks for the file on the plugin's queue, returning a promise while the queue is held, then settles with whether the file is there")
+  func pluginFileInPathDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+      let hold = await QueueHold.reached(instance.queue, limit: Self.holdLimit)
+      _ = instance.js.evaluateScript("""
+        globalThis.found = null;
+        globalThis.missing = null;
+        iina.utils.fileInPath("/bin/ls").then(value => { globalThis.found = value; });
+        iina.utils.fileInPath("\(folder.path)/missing").then(value => { globalThis.missing = value; });
+        """)
+      // A file looked for on the script's thread would have been answered once the script had run.
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let lookedWhileHeld = hold.limitPassed || !holds("globalThis.found === null && globalThis.missing === null")
+      hold.release()
+      #expect(!lookedWhileHeld, "A plugin's fileInPath looked for the file on the script's thread")
+      try await Self.waitUntil { holds("globalThis.found !== null && globalThis.missing !== null") }
+      #expect(holds("globalThis.found === true"))
+      #expect(holds("globalThis.missing === false"))
+    }
+  }
+
   @Test("A plugin's keychainWrite and keychainRead ask the Keychain on its queue, returning promises while the queue is held, then settle with what the Keychain answered")
   func pluginKeychainDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
@@ -3816,6 +3841,125 @@ struct PlayerPlaybackTests {
           .read(username: "stored-user", service: service, server: nil, port: nil)
         ])
       }
+    }
+  }
+
+  @Test("A plugin's file functions use the file system on the file API's queue, returning promises while the queue is held, then settle in the order they were asked with what the file system answered")
+  func pluginFileDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      // A folder of the plugin's own, so that the folder listed holds only the test's files.
+      let sub = UUID().uuidString
+      let folderURL = plugin.tmpURL.appendingPathComponent(sub)
+      try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: folderURL) }
+      func url(_ name: String) -> URL { folderURL.appendingPathComponent(name) }
+      func exists(_ name: String) -> Bool { FileManager.default.fileExists(atPath: url(name).path) }
+      let trashed = "trashed-\(sub).txt"
+      for name in ["kept.txt", "deleted.txt", "moved.txt", trashed] {
+        try name.write(to: url(name), atomically: true, encoding: .utf8)
+      }
+      let dir = "@tmp/\(sub)/"
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let api = try #require(instance.apis["file"] as? JavascriptAPIFile)
+      func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+      let hold = await QueueHold.reached(api.queue, limit: Self.holdLimit)
+      _ = instance.js.evaluateScript("""
+        globalThis.answers = {};
+        iina.file.exists("\(dir)kept.txt").then(value => { answers.exists = value; });
+        iina.file.list("\(dir)", {}).then(entries => { answers.list = entries.map(entry => entry.filename).sort().join(","); });
+        iina.file.write("\(dir)written.txt", "written").then(() => { answers.write = true; });
+        iina.file.read("\(dir)kept.txt", {}).then(value => { answers.read = value; });
+        iina.file.trash("\(dir)\(trashed)").then(() => { answers.trash = true; });
+        iina.file.delete("\(dir)deleted.txt").then(() => { answers.delete = true; });
+        iina.file.handle("\(dir)kept.txt", "read").then(handle => { answers.handle = typeof handle.readToEnd; });
+        """)
+      // file.move is not given to scripts, so it is called here as a plugin's script would call it.
+      instance.js.setObject(api.move("\(dir)moved.txt", "\(dir)moved-to.txt"), forKeyedSubscript: "moved" as NSString)
+      _ = instance.js.evaluateScript("moved.then(() => { answers.move = true; });")
+      // A function run on the script's thread would have used the file system by now, and its promise been settled once the script
+      // had run.
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let passed = hold.limitPassed
+      #expect(!passed && holds("answers.exists === undefined"), "A plugin's file.exists looked for the file on the script's thread")
+      #expect(!passed && holds("answers.list === undefined"), "A plugin's file.list listed the folder on the script's thread")
+      #expect(!passed && !exists("written.txt") && holds("answers.write === undefined"),
+              "A plugin's file.write wrote the file on the script's thread")
+      #expect(!passed && holds("answers.read === undefined"), "A plugin's file.read read the file on the script's thread")
+      #expect(!passed && exists(trashed), "A plugin's file.trash trashed the file on the script's thread")
+      #expect(!passed && exists("deleted.txt"), "A plugin's file.delete deleted the file on the script's thread")
+      #expect(!passed && exists("moved.txt"), "A plugin's file.move moved the file on the script's thread")
+      #expect(!passed && holds("answers.handle === undefined"), "A plugin's file.handle opened the file on the script's thread")
+      hold.release()
+      try await Self.waitUntil { holds("Object.keys(answers).length === 8") }
+      #expect(holds("answers.exists === true"))
+      // The folder is listed after the requests asked before it and before those asked after it.
+      #expect(holds("answers.list === 'deleted.txt,kept.txt,moved.txt,\(trashed)'"))
+      #expect(try String(contentsOf: url("written.txt"), encoding: .utf8) == "written")
+      #expect(holds("answers.read === 'kept.txt'"))
+      #expect(!exists(trashed))
+      #expect(!exists("deleted.txt"))
+      #expect(!exists("moved.txt") && exists("moved-to.txt"))
+      #expect(holds("answers.handle === 'function'"))
+      if let trash = try? FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: folderURL, create: false) {
+        try? FileManager.default.removeItem(at: trash.appendingPathComponent(trashed))
+      }
+    }
+  }
+
+  @Test("A plugin's file handle moves, reads, writes and closes on the file API's queue, returning promises while the queue is held, then settles in the order it was asked with what the file answered")
+  func pluginFileHandleDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      let sub = UUID().uuidString
+      let folderURL = plugin.tmpURL.appendingPathComponent(sub)
+      try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: folderURL) }
+      let written = folderURL.appendingPathComponent("written.txt")
+      try "0123456789".write(to: folderURL.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
+      try Data().write(to: written)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let api = try #require(instance.apis["file"] as? JavascriptAPIFile)
+      func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+      _ = instance.js.evaluateScript("""
+        globalThis.answers = {};
+        iina.file.handle("@tmp/\(sub)/source.txt", "read").then(handle => { globalThis.reader = handle; });
+        iina.file.handle("@tmp/\(sub)/written.txt", "write").then(handle => { globalThis.writer = handle; });
+        """)
+      try await Self.waitUntil { holds("globalThis.reader !== undefined && globalThis.writer !== undefined") }
+      let hold = await QueueHold.reached(api.queue, limit: Self.holdLimit)
+      _ = instance.js.evaluateScript("""
+        reader.seekTo(2).then(() => { answers.seekTo = true; });
+        reader.offset().then(value => { answers.offset = value; });
+        reader.read(3).then(bytes => { answers.read = String.fromCharCode(...bytes); });
+        reader.readToEnd().then(bytes => { answers.readToEnd = String.fromCharCode(...bytes); });
+        reader.seekToEnd().then(() => { answers.seekToEnd = true; });
+        reader.offset().then(value => { answers.endOffset = value; });
+        writer.write("abc").then(() => { answers.write = true; });
+        writer.close().then(() => { answers.close = true; });
+        """)
+      // A handle used on the script's thread would have moved, read or written by now, and its promise been settled once the script
+      // had run.
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      let passed = hold.limitPassed
+      let writtenWhileHeld = try Data(contentsOf: written)
+      #expect(!passed && holds("answers.seekTo === undefined"), "A plugin's handle.seekTo moved in the file on the script's thread")
+      #expect(!passed && holds("answers.offset === undefined"), "A plugin's handle.offset told its offset on the script's thread")
+      #expect(!passed && holds("answers.read === undefined"), "A plugin's handle.read read the file on the script's thread")
+      #expect(!passed && holds("answers.readToEnd === undefined"), "A plugin's handle.readToEnd read the file on the script's thread")
+      #expect(!passed && holds("answers.seekToEnd === undefined"), "A plugin's handle.seekToEnd moved in the file on the script's thread")
+      #expect(!passed && writtenWhileHeld.isEmpty && holds("answers.write === undefined"),
+              "A plugin's handle.write wrote the file on the script's thread")
+      #expect(!passed && holds("answers.close === undefined"), "A plugin's handle.close closed the file on the script's thread")
+      hold.release()
+      try await Self.waitUntil { holds("Object.keys(answers).length === 8") }
+      #expect(holds("answers.seekTo === true && answers.offset === 2"))
+      #expect(holds("answers.read === '234' && answers.readToEnd === '56789'"))
+      #expect(holds("answers.seekToEnd === true && answers.endOffset === 10"))
+      #expect(holds("answers.write === true && answers.close === true"))
+      #expect(try String(contentsOf: written, encoding: .utf8) == "abc")
     }
   }
 
