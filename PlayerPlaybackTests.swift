@@ -3741,6 +3741,45 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A key binding mpv runs as a command string is run without waiting for mpv, and what is asked after it is handled after it")
+  func rawKeyBindingDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let window: MainWindowController = player.mainWindow
+      let binding = KeyMapping(rawKey: "x", rawAction: "set speed 1.5")
+      var handled: Bool?
+      let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+      window.handleKeyBinding(binding) { handled = $0 }
+      // Asked after the key binding, so that mpv sets this speed after the key binding's.
+      player.mpv.setDoubleAsync(MPVOption.PlaybackControl.speed, 2)
+      let returnedWhileHeld = !hold.hasLetGo && handled == nil
+      hold.release()
+      try await Self.waitUntil { hold.hasLetGo }
+      #expect(returnedWhileHeld, "Running a key binding as a command string waited for mpv")
+      try await Self.waitUntil { handled != nil }
+      #expect(handled == true)
+      try await Self.waitUntil { player.mpv.getDouble(MPVOption.PlaybackControl.speed) == 2 }
+    }
+  }
+
+  @Test("A screenshot key binding with a flag IINA's screenshot does not take is run as a command string without waiting for mpv")
+  func rawScreenshotKeyBindingDoesNotWait() async throws {
+    try await Self.withSettings([.screenshotSaveToFile: true]) {
+      try await Self.withPlayer { player, _ in
+        // A flag mpv does not know either, so that mpv takes no screenshot and answers that the command failed.
+        let binding = KeyMapping(rawKey: "x", rawAction: "screenshot iinaTests-unknown")
+        var taken: Bool?
+        let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+        player.screenshot(fromKeyBinding: binding) { taken = $0 }
+        let returnedWhileHeld = !hold.hasLetGo && taken == nil
+        hold.release()
+        try await Self.waitUntil { hold.hasLetGo }
+        #expect(returnedWhileHeld, "Running a screenshot key binding as a command string waited for mpv")
+        try await Self.waitUntil { taken != nil }
+        #expect(taken == false)
+      }
+    }
+  }
+
   @Test("The icon of a file's type is looked up on the icon queue, the lookup returning while the queue is held, then handed back on the main thread")
   func fileTypeIconDoesNotWait() async throws {
     let hold = await QueueHold.reached(Utility.iconQueue, limit: Self.holdLimit)
