@@ -3933,6 +3933,43 @@ struct PlayerPlaybackTests {
     #expect(copied == contents)
   }
 
+  @Test("Saving a subtitle downloaded from Open Subtitles writes it to the temporary folder on its save queue, returning while the queue is held, then the file holds the subtitle")
+  func openSubDownloadSaveDoesNotWait() async throws {
+    let filename = "iinaTests-\(UUID().uuidString).srt"
+    let file = Utility.tempDirURL.appendingPathComponent(filename)
+    defer { try? FileManager.default.removeItem(at: file) }
+    let contents = Data("1\n00:00:00,000 --> 00:00:01,000\nsaved\n".utf8)
+    let hold = await QueueHold.reached(OpenSub.Subtitle.saveQueue, limit: Self.holdLimit)
+    var saved: Swift.Result<URL, Error>?
+    OpenSub.Subtitle.save(contents, as: filename).done { saved = .success($0) }.catch { saved = .failure($0) }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: file.path)
+    hold.release()
+    #expect(!savedWhileHeld, "Saving the downloaded subtitle wrote it on the main thread")
+    try await Self.waitUntil { saved != nil }
+    let url = try #require(saved).get()
+    #expect(url == file)
+    let written = try Data(contentsOf: file)
+    #expect(written == contents)
+  }
+
+  @Test("Opening a path string makes its file URL on the player's open queue, returning while the queue is held, then opens the file")
+  func openURLStringDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let file = folder.appendingPathComponent("c.mp4")
+      let hold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
+      player.openURLString(file.path)
+      // An open is recorded on the main thread as it starts, so an open recorded while the queue is held made its URL on the main
+      // thread.
+      let openedWhileHeld = hold.limitPassed || !player.opensFindingFiles.isEmpty
+      hold.release()
+      #expect(!openedWhileHeld, "Opening a path string made its file URL on the main thread")
+      try await Self.waitUntil {
+        player.info.currentURL?.path == file.path && player.info.state == .paused && !player.info.pausedForLoading
+      }
+    }
+  }
+
   /// Run `body`, then put back the entries of `keys` in the app's own settings domain, removing those it did not hold.
   private static func restoringSettings(_ keys: [String], _ body: () async throws -> Void) async throws {
     let defaults = UserDefaults.standard
