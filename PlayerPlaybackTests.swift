@@ -3395,13 +3395,18 @@ struct PlayerPlaybackTests {
 
   /// A plugin in `folder` with `permissions` and `author` whose script does nothing, in whose context a test evaluates scripts.
   private static func makePlugin(in folder: URL, permissions: [String] = [],
-                                 author: [String: String] = ["name": "iinaTests"]) throws -> JavascriptPlugin {
+                                 author: [String: String] = ["name": "iinaTests"],
+                                 scripts: [String: String] = ["main.js": ""]) throws -> JavascriptPlugin {
     let root = folder.appendingPathComponent("iinaTests-plugin")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let info: [String: Any] = ["name": "iinaTests", "author": author, "identifier": "io.iina.tests",
                                "version": "1.0", "entry": "main.js", "permissions": permissions]
     try JSONSerialization.data(withJSONObject: info).write(to: root.appendingPathComponent("Info.json"))
-    try Data().write(to: root.appendingPathComponent("main.js"))
+    for (path, script) in scripts {
+      let url = root.appendingPathComponent(path)
+      try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try Data(script.utf8).write(to: url)
+    }
     return try #require(JavascriptPlugin(filename: root.lastPathComponent, externalURL: root))
   }
 
@@ -3798,6 +3803,24 @@ struct PlayerPlaybackTests {
       #expect(named.allSatisfy { $0.local })
       #expect(folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) },
               "A path a plugin's script named in its data or temporary folder made the folder on the script's thread")
+    }
+  }
+
+  @Test("A plugin's scripts are read when the plugin is made, so that its instance evaluates its entry script and the module the script requires while the script files are held, reading neither")
+  func pluginScriptsReadWhenMade() async throws {
+    try await Self.withPlayer { player, folder in
+      let scripts = ["main.js": "globalThis.value = require(\"./lib/value.js\");",
+                     "lib/value.js": "module.exports = \"read when made\";"]
+      let plugin = try Self.makePlugin(in: folder, scripts: scripts)
+      Self.keptPlugins.append(plugin)
+      let holds = try scripts.map { path, script in
+        try FileHold(plugin.root.appendingPathComponent(path), contents: Data(script.utf8), limit: Self.holdLimit)
+      }
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let readWhileHeld = holds.contains { $0.limitPassed }
+      holds.forEach { $0.release() }
+      #expect(!readWhileHeld, "A plugin's instance read its scripts from their files on the script's thread")
+      #expect(instance.js.evaluateScript("globalThis.value === \"read when made\"").toBool())
     }
   }
 
@@ -4935,7 +4958,6 @@ struct PlayerPlaybackTests {
       #expect(JavascriptPlugin.plugins.firstIndex(of: installedUpdate) == position)
       #expect(installedUpdate.version == "2.0")
       #expect(installedUpdate.root.path == Utility.pluginsURL.appendingPathComponent("\(identifier).iinaplugin").path)
-      #expect(installedUpdate.entryScripts.isEmpty)
       // The player's instance of the plugin is made again from the update's script.
       let instance = try #require(player.plugins.first { $0.plugin === installedUpdate })
       #expect(instance.js.evaluateScript("globalThis.version === \"2.0\"").toBool())
@@ -5039,7 +5061,7 @@ struct PlayerPlaybackTests {
     #expect(controller.instances.isEmpty)
   }
 
-  @Test("Disabling a plugin releases its instances, its global instance shutting down the players it made, returning while their mpv's core is held; enabling it reads its entry scripts on the plugin install queue, returning while the queue is held, then makes its instances")
+  @Test("Disabling a plugin releases its instances, its global instance shutting down the players it made, returning while their mpv's core is held; enabling it makes its instances from the scripts read when the plugin was made, returning while the plugin install queue is held")
   func pluginEnabledChangeDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
       // Plugins are loaded in the players of the app, among which the test's player is listed while it runs.
@@ -5055,12 +5077,9 @@ struct PlayerPlaybackTests {
       #expect(!player.plugins.contains { $0.plugin === plugin })
       let hold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
       plugin.enabled = true
-      try await Task.sleep(for: Self.heldAnswerWindow)
-      let madeWhileHeld = hold.limitPassed || plugin.globalInstance != nil || player.plugins.contains { $0.plugin === plugin }
+      let madeWhileHeld = !hold.limitPassed && plugin.globalInstance != nil && player.plugins.contains { $0.plugin === plugin }
       hold.release()
-      #expect(!madeWhileHeld, "Enabling a plugin read its entry scripts on the main thread")
-      try await Self.waitUntil { plugin.globalInstance != nil && player.plugins.contains { $0.plugin === plugin } }
-      #expect(plugin.entryScripts.isEmpty)
+      #expect(madeWhileHeld, "Enabling a plugin waited for the plugin install queue before making its instances")
       let global = try #require(plugin.globalInstance)
       #expect(global.js.evaluateScript("globalThis.version === \"1.0\"").toBool())
       let instance = try #require(player.plugins.first { $0.plugin === plugin })
@@ -5068,7 +5087,7 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("Turning a plugin off and on with its switch in the settings' plugin list releases its instances, returning while mpv's core of the players its global instance made is held, then reads its entry scripts on the plugin install queue, returning while the queue is held")
+  @Test("Turning a plugin off and on with its switch in the settings' plugin list releases its instances, returning while mpv's core of the players its global instance made is held, then makes them from the scripts read when the plugin was made, returning while the plugin install queue is held")
   func pluginSettingsSwitchDoesNotWait() async throws {
     let folder = try Self.makeFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
@@ -5092,12 +5111,10 @@ struct PlayerPlaybackTests {
     #expect(plugin.globalInstance == nil)
     let hold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
     turn(.on)
-    try await Task.sleep(for: Self.heldAnswerWindow)
-    let madeWhileHeld = hold.limitPassed || plugin.globalInstance != nil
+    let madeWhileHeld = !hold.limitPassed && plugin.globalInstance != nil
     hold.release()
-    #expect(!madeWhileHeld, "Turning a plugin on in the settings read its entry scripts on the main thread")
+    #expect(madeWhileHeld, "Turning a plugin on in the settings waited for the plugin install queue before making its instances")
     #expect(plugin.enabled)
-    try await Self.waitUntil { plugin.globalInstance != nil }
     #expect(plugin.globalInstance?.js.evaluateScript("globalThis.version === \"1.0\"").toBool() == true)
   }
 
@@ -5531,6 +5548,64 @@ private final class QueueHold: @unchecked Sendable {
 
   func release() {
     released.signal()
+  }
+}
+
+/// Holds a file by putting a named pipe in its place, so that opening the file to read it waits until the hold answers the read with
+/// the file's contents, which it does once `limit` has passed, or never if it is released first. `@unchecked Sendable` because its
+/// state is read and written only under `lock`.
+private final class FileHold: @unchecked Sendable {
+  private let url: URL
+  private let contents: Data
+  private let lock = NSLock()
+  private var released = false
+  private var passed = false
+
+  init(_ url: URL, contents: Data, limit: DispatchTimeInterval) throws {
+    self.url = url
+    self.contents = contents
+    try FileManager.default.removeItem(at: url)
+    guard mkfifo(url.path, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + limit) { [self] in answerRead() }
+  }
+
+  /// Answer the first read of the file that waits, unless the hold is released before one does.
+  private func answerRead() {
+    while true {
+      lock.lock()
+      if released {
+        lock.unlock()
+        return
+      }
+      // Opening the pipe to write without waiting fails while no read waits on it.
+      let descriptor = open(url.path, O_WRONLY | O_NONBLOCK)
+      if descriptor >= 0 {
+        passed = true
+        lock.unlock()
+        _ = fcntl(descriptor, F_SETFL, 0)
+        _ = contents.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
+        close(descriptor)
+        return
+      }
+      lock.unlock()
+      Thread.sleep(forTimeInterval: 0.05)
+    }
+  }
+
+  /// Whether the limit passed with a read of the file waiting, the read having been answered then.
+  var limitPassed: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return passed
+  }
+
+  /// Release the hold, putting the file back in the pipe's place.
+  func release() {
+    lock.lock()
+    released = true
+    lock.unlock()
+    try? FileManager.default.removeItem(at: url)
+    try? contents.write(to: url)
   }
 }
 
