@@ -60,7 +60,7 @@ struct PlayerPlaybackTests {
   }
 
   /// Open `b.mp4` of a new folder in a new player under the test settings, run `body` once the play state of the file has been
-  /// decided and the folder's other files are in the playlist, then close the player's window and restore the settings.
+  /// decided and the folder's other files are in the playlist, then shut the player down and restore the settings.
   private static func withPlayer(_ body: (PlayerCore, URL) async throws -> Void) async throws {
     let defaults = UserDefaults.standard
     let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
@@ -77,15 +77,23 @@ struct PlayerPlaybackTests {
     current = player
     defer { current = nil }
     player.openURL(folder.appendingPathComponent("b.mp4"))
-    try await waitUntil { player.info.state == .paused && player.mpv.getInt(MPVProperty.playlistCount) == 3 }
     do {
+      try await waitUntil { player.info.state == .paused && player.mpv.getInt(MPVProperty.playlistCount) == 3 }
       try await body(player, folder)
     } catch {
-      player.mainWindow.close()
+      try? await shutDown(player)
       throw error
     }
+    try await shutDown(player)
+  }
+
+  /// Close the window of `player`, wait for its playback to stop, then shut it down and wait until its `mpv` core is gone, so that
+  /// no test leaves a core and its threads running in the tests after it.
+  private static func shutDown(_ player: PlayerCore) async throws {
     player.mainWindow.close()
     try await waitUntil { player.info.state == .idle }
+    player.shutdown()
+    try await waitUntil { player.info.state == .shutDown }
   }
 
   /// Wait until `condition` holds, failing the test once the fault threshold passes.
@@ -2365,7 +2373,7 @@ struct PlayerPlaybackTests {
     let make = Utility.makeWorkspaceRequest
     Utility.makeWorkspaceRequest = recorder.record
     defer { Utility.makeWorkspaceRequest = make }
-    let hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    let hold = await QueueHold.reached(Utility.workspaceQueue, limit: holdLimit)
     request()
     let returnedWhileHeld = !hold.limitPassed && recorder.requests.isEmpty
     hold.release()
@@ -2521,7 +2529,7 @@ struct PlayerPlaybackTests {
     defer { Utility.makeWorkspaceRequest = make }
 
     var path: String?
-    var hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    var hold = await QueueHold.reached(Utility.workspaceQueue, limit: holdLimit)
     ask(name) { path = $0 }
     let freeReturned = !hold.limitPassed && path == nil
     hold.release()
@@ -2530,14 +2538,14 @@ struct PlayerPlaybackTests {
     #expect(path == Utility.userInputConfDirURL.appendingPathComponent("\(name).conf").path)
 
     path = nil
-    hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    hold = await QueueHold.reached(Utility.workspaceQueue, limit: holdLimit)
     ask("\(name)-taken") { path = $0 }
     let takenReturned = !hold.limitPassed && window.attachedSheet == nil
     hold.release()
     #expect(takenReturned, "Asking \(request) for a new config file of a taken name waited for the file system")
     try await waitUntil { window.attachedSheet != nil }
     let sheet = try #require(window.attachedSheet)
-    hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+    hold = await QueueHold.reached(Utility.workspaceQueue, limit: holdLimit)
     window.endSheet(sheet, returnCode: .alertFirstButtonReturn)
     // What answering the panel does on the main thread is done before the requests are looked at.
     await drainMain()
@@ -2615,7 +2623,7 @@ struct PlayerPlaybackTests {
       let titleBar = try #require(window.titleBarView)
       let field = try #require(titleBar.titleTextField)
       field.stringValue = ""
-      let hold = QueueHold(Utility.workspaceQueue, limit: holdLimit)
+      let hold = await QueueHold.reached(Utility.workspaceQueue, limit: holdLimit)
       titleBar.updateTitle()
       let returnedWhileHeld = !hold.limitPassed && field.stringValue.isEmpty
       hold.release()
@@ -2807,11 +2815,10 @@ struct PlayerPlaybackTests {
         try await checkFrameFromGeometry(player)
       }
     } catch {
-      player.mainWindow.close()
+      try? await shutDown(player)
       throw error
     }
-    player.mainWindow.close()
-    try await waitUntil { player.info.state == .idle }
+    try await shutDown(player)
   }
 
   /// Size the window of `player` by the geometry option while the core of its `mpv` is held, expecting the size to be worked out
@@ -2979,7 +2986,7 @@ struct PlayerPlaybackTests {
     func asked() -> Bool { queue.operations.contains { !$0.isCancelled } }
     // A cache name no cache file has, so that the thumbnails are asked of FFmpeg.
     player.info.mpvMd5 = UUID().uuidString
-    let hold = QueueHold(player.thumbnailQueue, limit: holdLimit)
+    let hold = await QueueHold.reached(player.thumbnailQueue, limit: holdLimit)
     var askedWhileHeld = true
     let returnedWhileHeld = try await returnsWhileHeld(player) {
       request()
@@ -3592,7 +3599,7 @@ struct PlayerPlaybackTests {
         #expect(addedWhileHeld, "Adding the 3D LUT file dropped on the welcome window waited for mpv")
         try await Self.waitUntil { player.mpv.getFilters(MPVProperty.vf).contains { $0.label == "iina_quickl3d" } }
         let file = folder.appendingPathComponent("c.mp4")
-        let queueHold = QueueHold(player.openQueue, limit: Self.holdLimit)
+        let queueHold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
         let accepted = player.mainWindow.videoView.performDragOperation(FileDrop([file]))
         // An open is recorded on the main thread as it starts, so an open recorded while the queue is held made its URL on the main
         // thread.
@@ -3634,7 +3641,7 @@ struct PlayerPlaybackTests {
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
       let marker = folder.appendingPathComponent("exec-marker")
-      let hold = QueueHold(instance.queue, limit: Self.holdLimit)
+      let hold = await QueueHold.reached(instance.queue, limit: Self.holdLimit)
       _ = instance.js.evaluateScript("""
         globalThis.missing = null;
         globalThis.status = null;
@@ -3664,7 +3671,7 @@ struct PlayerPlaybackTests {
       try await Self.withKeychainRecorded(stored: [service.rawValue: ("stored-user", "stored-password")]) { keychain in
         let instance = JavascriptPluginInstance(player: player, plugin: plugin)
         func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
-        let hold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
+        let hold = await QueueHold.reached(KeychainAccess.queue, limit: Self.holdLimit)
         _ = instance.js.evaluateScript("""
           globalThis.written = null;
           globalThis.read = null;
@@ -3693,7 +3700,7 @@ struct PlayerPlaybackTests {
       try await Self.withSettings([.recordRecentFiles: true, .resumeLastPosition: true,
                                    .iinaLastPlayedFilePath: file.path, .iinaLastPlayedFilePosition: 75.0]) {
         let controller: InitialWindowController = player.initialWindow
-        let hold = QueueHold(InitialWindowController.fileQueue, limit: Self.holdLimit)
+        let hold = await QueueHold.reached(InitialWindowController.fileQueue, limit: Self.holdLimit)
         controller.showWindow(nil)
         // A last played file looked at, or the app's icon looked up, on the main thread would be shown by the time the window is.
         let lookedWhileHeld = hold.limitPassed || !controller.lastFileNameLabel.stringValue.isEmpty
@@ -3721,7 +3728,7 @@ struct PlayerPlaybackTests {
       let count = player.info.$playlist.withLock { $0.count }
       // Adding to the playlist turns shuffling off at once, so shuffling still on shows that nothing was added yet.
       player.info.isShuffled = true
-      let hold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      let hold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
       // The drop is kept until the paste has read its pasteboard, which it releases when it goes.
       let drop = FileDrop([subfolder])
       let accepted = withExtendedLifetime(drop) { pane.pasteFromPasteboard(row: count, from: drop.draggingPasteboard) }
@@ -3736,7 +3743,7 @@ struct PlayerPlaybackTests {
 
   @Test("The icon of a file's type is looked up on the icon queue, the lookup returning while the queue is held, then handed back on the main thread")
   func fileTypeIconDoesNotWait() async throws {
-    let hold = QueueHold(Utility.iconQueue, limit: Self.holdLimit)
+    let hold = await QueueHold.reached(Utility.iconQueue, limit: Self.holdLimit)
     var icon: NSImage?
     Utility.icon(for: URL(fileURLWithPath: "/iinaTests/a.mp4")) { icon = $0 }
     let lookedUpWhileHeld = hold.limitPassed || icon != nil
@@ -3770,7 +3777,7 @@ struct PlayerPlaybackTests {
       let count = player.info.$playlist.withLock { $0.count }
       // Adding to the playlist turns shuffling off at once, so shuffling still on shows that nothing was added yet.
       player.info.isShuffled = true
-      let hold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      let hold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
       pane.addFiles([subfolder])
       let addedWhileHeld = hold.limitPassed || !player.info.isShuffled
       hold.release()
@@ -3789,7 +3796,7 @@ struct PlayerPlaybackTests {
       pane.selectedRows = IndexSet([row])
       // The new window's player is the idle player the action is handed, whose open queue is held.
       let target = PlayerCore.newPlayerCore
-      let hold = QueueHold(target.openQueue, limit: Self.holdLimit)
+      let hold = await QueueHold.reached(target.openQueue, limit: Self.holdLimit)
       pane.contextMenuPlayInNewWindow(NSMenuItem())
       // An open is recorded on the main thread as it starts, so an open recorded while the queue is held made its URL on the main
       // thread.
@@ -3827,7 +3834,7 @@ struct PlayerPlaybackTests {
       let (trash, restoreTrashItem) = try Self.useTestTrash(in: folder)
       defer { restoreTrashItem() }
       let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
-      let queueHold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      let queueHold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
       pane.contextMenuDeleteFile(NSMenuItem())
       let trashedWhileHeld = queueHold.limitPassed || !FileManager.default.fileExists(atPath: file.path)
       queueHold.release()
@@ -3857,7 +3864,7 @@ struct PlayerPlaybackTests {
       @MainActor func panel() -> NSOpenPanel? {
         NSApp.windows.lazy.compactMap { $0 as? NSOpenPanel }.first { !windows.contains(ObjectIdentifier($0)) }
       }
-      let hold = QueueHold(player.openQueue, limit: Self.holdLimit)
+      let hold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
       pane.contextMenuAddSubtitle(NSMenuItem())
       let shownWhileHeld = hold.limitPassed || panel() != nil
       hold.release()
@@ -3878,7 +3885,7 @@ struct PlayerPlaybackTests {
       let titlebar = try #require(player.mainWindow.titleBarView as Titlebar?)
       let menus = MenuRecorder()
       defer { menus.stop() }
-      let hold = QueueHold(Titlebar.pathQueue, limit: Self.holdLimit)
+      let hold = await QueueHold.reached(Titlebar.pathQueue, limit: Self.holdLimit)
       titlebar.showPathMenu()
       let shownWhileHeld = hold.limitPassed || !menus.titles.isEmpty
       hold.release()
@@ -3902,7 +3909,7 @@ struct PlayerPlaybackTests {
     }
     // At the error level, so that the line is logged whatever level the settings log at.
     let line = "iinaTests-log-\(UUID().uuidString)"
-    let writeHold = QueueHold(Logger.fileQueue, limit: Self.holdLimit)
+    let writeHold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
     Logger.log(line, level: .error)
     let writtenWhileHeld = writeHold.limitPassed || written(line)
     writeHold.release()
@@ -3910,7 +3917,7 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { written(line) }
     #expect(Self.isOpen(file))
     // The log file stays closed for the rest of the run, the lines logged after it written only to the console.
-    let closeHold = QueueHold(Logger.fileQueue, limit: Self.holdLimit)
+    let closeHold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
     Logger.closeLogFile()
     let closedWhileHeld = closeHold.limitPassed || !Self.isOpen(file)
     closeHold.release()
@@ -4129,7 +4136,7 @@ struct PlayerPlaybackTests {
     try await Self.withSettings([.openSubUsername: "iinaTests"]) {
       try await Self.withKeychainRecorded { keychain in
         try #require(!OpenSubClient.shared.loggedIn, "Open Subtitles was logged in to before the test")
-        let hold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
+        let hold = await QueueHold.reached(KeychainAccess.queue, limit: Self.holdLimit)
         let login = OpenSub.Fetcher.shared.login()
         let returnedWhileHeld = !hold.limitPassed && keychain.requests.isEmpty
         hold.release()
@@ -4152,8 +4159,8 @@ struct PlayerPlaybackTests {
             // A file too small for Open Subtitles to hash, so that the search stops once the file is read.
             let file = folder.appendingPathComponent("small.mp4")
             try Data(count: 1024).write(to: file)
-            let keychainHold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
-            let hashHold = QueueHold(OpenSub.Fetcher.hashQueue, limit: Self.holdLimit)
+            let keychainHold = await QueueHold.reached(KeychainAccess.queue, limit: Self.holdLimit)
+            let hashHold = await QueueHold.reached(OpenSub.Fetcher.hashQueue, limit: Self.holdLimit)
             let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
             let search = OpenSub.Fetcher.shared.fetch(from: file, withProviderID: OnlineSubtitle.Providers.openSub.id,
                                                       playerCore: player)
@@ -4209,7 +4216,7 @@ struct PlayerPlaybackTests {
           // Its view observes plugin changes without keeping the controller.
           Self.keptObjects.append(controller)
           _ = controller.view
-          let hold = QueueHold(KeychainAccess.queue, limit: Self.holdLimit)
+          let hold = await QueueHold.reached(KeychainAccess.queue, limit: Self.holdLimit)
           // The username asked for is entered and the prompt answered, the password being left empty.
           let prompts = ModalWindowDismisser(entering: "iinaTests")
           controller.openSubLoginAction(controller)
@@ -4274,7 +4281,7 @@ struct PlayerPlaybackTests {
     async throws -> (Bool, PluginManager.Result?) {
     let reported = Box<PluginManager.Result>()
     let ended = Box<Bool>()
-    let hold = QueueHold(JavascriptPlugin.installQueue, limit: holdLimit)
+    let hold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: holdLimit)
     let task = Task {
       await install { reported.value = $0 }
       ended.value = true
@@ -4374,7 +4381,7 @@ struct PlayerPlaybackTests {
       JavascriptPlugin.getFromGitHub = github.answer
       defer { JavascriptPlugin.getFromGitHub = get }
       let updated = Box<(PluginManager.Result, JavascriptPlugin?)>()
-      let hold = QueueHold(JavascriptPlugin.installQueue, limit: Self.holdLimit)
+      let hold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
       let task = Task { updated.value = await manager.update(plugin) }
       // The update found is installed once the user agrees, after which it is downloaded on the held queue.
       try await Self.answerSheet(of: window, with: .alertFirstButtonReturn)
@@ -4676,16 +4683,6 @@ private final class QueueHold: @unchecked Sendable {
   private let released = DispatchSemaphore(value: 0)
   private let lock = NSLock()
   private var passed = false
-
-  /// Hold `queue`, returning once the queue has reached the hold.
-  convenience init(_ queue: DispatchQueue, limit: DispatchTimeInterval) {
-    self.init(holding: queue, limit: limit)
-    // The run loop goes on running the work queued on this thread until the queue reaches the hold, since the work the queue is
-    // finishing may wait for this thread, as a notification posted from the queue waits for its main queue observers.
-    while reached.wait(timeout: .now()) == .timedOut {
-      RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
-    }
-  }
 
   /// Hold `queue`, returning once the queue has reached the hold without blocking the calling thread meanwhile. A queue whose work
   /// posts a notification waits for the notification's main queue observers, which a main thread blocked in the synchronous
