@@ -3341,6 +3341,30 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A playlist cell reads its file's duration and saved progress on the player's playlist queue, returning while the queue is held, then caches them")
+  func playlistCellInfoDoesNotWait() async throws {
+    try await Self.withSettings([.prefetchPlaylistVideoDuration: true, .playlistShowMetadata: false]) {
+      try await Self.withPlayer { player, _ in
+        let pane = SidebarPlaylistPane(player: player)
+        Self.keptObjects.append(pane)
+        try await Self.waitUntil { pane.tableView.numberOfRows == 3 }
+        // The first column shows which entry is playing; the second shows the entry's track.
+        let cell = try #require(pane.tableView.view(atColumn: 1, row: 1, makeIfNecessary: true) as? PlaylistTrackCellView)
+        let item = player.info.playlist[1]
+        // The queue is held once the reads already asked of it have run, so that nothing caches the file's duration but the cell's read.
+        let hold = await QueueHold.reached(player.playlistQueue, limit: Self.holdLimit)
+        player.info.setCachedVideoDurationAndProgress(item.filename, (duration: nil, progress: nil))
+        cell.update(pane: pane, player: player, item: item, row: 1)
+        // A read on the main thread would have been made once the main queue had run it.
+        try await Task.sleep(for: Self.heldAnswerWindow)
+        let readWhileHeld = hold.limitPassed || player.info.getCachedVideoDurationAndProgress(item.filename)?.duration != nil
+        hold.release()
+        #expect(!readWhileHeld, "A playlist cell read its file's duration and saved progress on the main thread")
+        try await Self.waitUntil { (player.info.getCachedVideoDurationAndProgress(item.filename)?.duration ?? 0) > 0 }
+      }
+    }
+  }
+
   @Test("A file the system asks the app to open just after a command-line launch is not opened, and one asked after it is")
   func systemOpenIgnoredOnce() async throws {
     try await Self.withPlayer { _, folder in
