@@ -756,6 +756,27 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Playing a playlist entry next asks mpv for the entry playing without waiting for it, then moves the entry after it")
+  func playNextDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      await Self.readPlaylist(of: player)
+      #expect(player.info.playlist.map(\.filename) == ["a", "b", "c"].map(path))
+      // b plays, so a played next moves after it.
+      pane.selectedRows = IndexSet([0])
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { pane.contextMenuPlayNext(NSMenuItem()) }
+      #expect(returnedWhileHeld, "Playing a playlist entry next waited for mpv")
+      let moved = ["b", "a", "c"].map(path)
+      let deadline = ContinuousClock.now + .seconds(30)
+      while player.info.playlist.map(\.filename) != moved && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+        await Self.readPlaylist(of: player)
+      }
+      #expect(player.info.playlist.map(\.filename) == moved)
+    }
+  }
+
   /// Ask `mpv` whether the window is on top and wait for the answer, which comes after its answers to every request made before.
   private static func ontop(_ player: PlayerCore) async -> Bool? {
     await withCheckedContinuation { continuation in
@@ -4595,10 +4616,41 @@ struct PlayerPlaybackTests {
     let returnedWhileHeld = !hold.limitPassed
     hold.release()
     #expect(returnedWhileHeld, "Making the mpv option defaults waited for their mpv to read its config file and initialize")
-    #expect(defaults.mpvVersion == MPVOptionDefaults.shared.mpvVersion)
-    #expect(defaults.mpvVersion.hasPrefix("mpv "))
+    let versions = await Self.versions(of: defaults)
+    let shared = await Self.versions(of: MPVOptionDefaults.shared)
+    #expect(versions.mpv == shared.mpv && versions.libass == shared.libass)
+    #expect(versions.mpv.hasPrefix("mpv "))
     #expect(defaults.getFlag(MPVOption.PlaybackControl.pause) == false)
     #expect(defaults.getDouble(MPVOption.PlaybackControl.speed) == 1)
+  }
+
+  /// The mpv and libass versions the given defaults answer.
+  private static func versions(of defaults: MPVOptionDefaults) async -> (mpv: String, libass: String) {
+    await withCheckedContinuation { continuation in defaults.versions { continuation.resume(returning: ($0, $1)) } }
+  }
+
+  @Test("The About window and a plugin's getVersion read the mpv version while the mpv option defaults' queue is held, returning before it is read, then the window shows it and the plugin's promise settles with it")
+  func versionReadsDoNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let shared = await Self.versions(of: MPVOptionDefaults.shared)
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let about = AboutWindowController()
+      Self.keptObjects.append(about)
+      let hold = await QueueHold.reached(MPVOptionDefaults.shared.queue, limit: Self.holdLimit)
+      _ = about.window
+      instance.js.evaluateScript("iina.core.getVersion().then(v => { globalThis.iinaTestsMpv = v.mpv })")
+      let returnedWhileHeld = !hold.limitPassed && about.mpvVersionLabel.stringValue != shared.mpv
+        && instance.js.objectForKeyedSubscript("iinaTestsMpv").isUndefined
+      hold.release()
+      #expect(returnedWhileHeld, "Reading the mpv version waited for the mpv option defaults")
+      try await Self.waitUntil {
+        about.mpvVersionLabel.stringValue == shared.mpv
+          && instance.js.objectForKeyedSubscript("iinaTestsMpv").toString() == shared.mpv
+      }
+      about.close()
+    }
   }
 
 #if USE_ICC_PROFILE_AUTO
