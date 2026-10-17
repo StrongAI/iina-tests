@@ -777,6 +777,23 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Entering interactive mode takes the video size mpv reported and asks mpv to pause without waiting for it, after which the mode is active and mpv has playback paused")
+  func interactiveModeEnterDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let interactiveMode = player.mainWindow.interactiveMode
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { interactiveMode.enter(mode: .crop) }
+      #expect(returnedWhileHeld, "Entering interactive mode waited for mpv")
+      #expect(interactiveMode.isActive)
+      let paused = await withCheckedContinuation { (continuation: CheckedContinuation<Bool?, Never>) in
+        player.mpv.getFlagAsync(MPVOption.PlaybackControl.pause) { continuation.resume(returning: $0) }
+      }
+      #expect(paused == true)
+      var exited = false
+      interactiveMode.exit { exited = true }
+      try await Self.waitUntil { exited }
+    }
+  }
+
   /// Ask `mpv` whether the window is on top and wait for the answer, which comes after its answers to every request made before.
   private static func ontop(_ player: PlayerCore) async -> Bool? {
     await withCheckedContinuation { continuation in
