@@ -4364,6 +4364,38 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { !fm.fileExists(atPath: flag.path) }
   }
 
+  @Test("Refreshing a player's display link and EDR mode for a new display sets mpv's display, tone mapping and ICC profile options without waiting for mpv, returning while its core is held, then the options are set")
+  func edrRefreshDoesNotWait() async throws {
+    try await Self.withSettings([.enableToneMapping: true, .enableToneMappingTargetPeakOverride: false, .loadIccProfile: true]) {
+      try await Self.withPlayer { player, _ in
+        let mpv: MPVController = player.mpv
+        let view = player.mainWindow.videoView
+        // The options the refresh sets are given other values first, so that the values it sets show it ran.
+        mpv.setDouble(MPVOption.Video.displayFpsOverride, 1)
+        mpv.setString(MPVOption.GPURendererOptions.targetPeak, "100")
+        mpv.setString(MPVOption.GPURendererOptions.toneMapping, "clip")
+        mpv.setString(MPVOption.GPURendererOptions.toneMappingParam, "0.5")
+        mpv.setString(MPVOption.GPURendererOptions.iccProfile, "")
+        let param = mpv.getString(MPVOption.GPURendererOptions.toneMappingParam)
+        // The view takes the display it is on for one it has moved to, so that it refreshes its display link and EDR mode.
+        view.currentDisplay = nil
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) { view.updateDisplayLink() }
+        #expect(returnedWhileHeld, "Refreshing the display link and EDR mode waited for mpv on the main thread")
+        let displayId = try #require(view.currentDisplay)
+        try await Self.waitUntil {
+          mpv.getDouble(MPVOption.Video.displayFpsOverride) != 1
+            && mpv.getString(MPVOption.GPURendererOptions.targetPeak) == "auto"
+            && mpv.getString(MPVOption.GPURendererOptions.toneMapping) == "auto"
+            && mpv.getString(MPVOption.GPURendererOptions.toneMappingParam) != param
+        }
+#if !USE_ICC_PROFILE_AUTO
+        let profile = VideoView.findProfilePath(for: displayId) ?? ""
+        try await Self.waitUntil { mpv.getString(MPVOption.GPURendererOptions.iccProfile) == profile }
+#endif
+      }
+    }
+  }
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
