@@ -4216,6 +4216,91 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { label() == expected }
   }
 
+  /// What a utilities settings page clears.
+  enum UtilitiesClear: String, CaseIterable, Sendable {
+    case watchLater, history, thumbnailCache
+
+    /// The folder, or for the history the file, that clearing removes.
+    var url: URL {
+      switch self {
+      case .watchLater: return Utility.watchLaterURL
+      case .history: return Utility.playbackHistoryURL
+      case .thumbnailCache: return Utility.thumbnailCacheURL
+      }
+    }
+  }
+
+  @Test("A utilities settings page clears the saved playback progress, the playback history or the thumbnail cache on the file removal queue, returning while the queue is held, then shows it cleared", arguments: KeyBindingConfigPage.allCases, UtilitiesClear.allCases)
+  func utilitiesClearDoesNotWait(_ page: KeyBindingConfigPage, _ clear: UtilitiesClear) async throws {
+    let fm = FileManager.default
+    let url = clear.url
+    // What the account holds there is set aside while the test clears its own, and put back once the test is done.
+    let aside = url.deletingLastPathComponent().appendingPathComponent("\(url.lastPathComponent).iinaTests-\(UUID().uuidString)")
+    let setAside = (try? fm.moveItem(at: url, to: aside)) != nil
+    defer {
+      try? fm.removeItem(at: url)
+      if setAside { try? fm.moveItem(at: aside, to: url) }
+      if clear != .history { Utility.createDirIfNotExist(url: url) }
+    }
+    // A file that clearing removes.
+    let marker = clear == .history ? url : url.appendingPathComponent("iinaTests-\(UUID().uuidString)")
+    if clear != .history { try fm.createDirectory(at: url, withIntermediateDirectories: true) }
+    try Data([1]).write(to: marker)
+    try await Self.restoringSettings([Preference.Key.iinaLastPlayedFilePath.rawValue]) {
+      let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.titled], backing: .buffered,
+                            defer: false)
+      Self.keptObjects.append(window)
+      let ask: () -> Void
+      // Whether the page shows that what it cleared is cleared.
+      let shown: () -> Bool
+      if page == .preferences {
+        let controller = PrefUtilsViewController()
+        Self.keptObjects.append(controller)
+        window.contentView = controller.view
+        switch clear {
+        case .watchLater:
+          ask = { controller.clearWatchLaterBtnAction(controller) }
+          shown = { !controller.savedPlaybackProgressClearedLabel.isHidden }
+        case .history:
+          ask = { controller.clearHistoryBtnAction(controller) }
+          shown = { !controller.playHistoryClearedLabel.isHidden }
+        case .thumbnailCache:
+          ask = { controller.clearCacheBtnAction(controller) }
+          shown = { true }
+        }
+      } else {
+        let utilities = SettingsPageUtilities()
+        Self.keptObjects.append(utilities)
+        let button = NSButton()
+        window.contentView?.addSubview(button)
+        switch clear {
+        case .watchLater:
+          ask = { utilities.clearWatchLaterBtnAction(button) }
+          shown = { window.attachedSheet != nil }
+        case .history:
+          ask = { utilities.clearHistoryBtnAction(button) }
+          shown = { window.attachedSheet != nil }
+        case .thumbnailCache:
+          ask = { utilities.clearCacheBtnAction(button) }
+          shown = { true }
+        }
+      }
+      let hold = await QueueHold.reached(Utility.removalQueue, limit: Self.holdLimit)
+      ask()
+      try await Self.answerSheet(of: window, with: .alertFirstButtonReturn)
+      await Self.drainMain()
+      let clearedWhileHeld = hold.limitPassed || !fm.fileExists(atPath: marker.path)
+      hold.release()
+      #expect(!clearedWhileHeld, "The \(page) utilities page cleared the \(clear) on the main thread")
+      try await Self.waitUntil { !fm.fileExists(atPath: marker.path) }
+      try await Self.waitUntil { shown() }
+      if clear != .history {
+        #expect(fm.fileExists(atPath: url.path))
+      }
+      if let sheet = window.attachedSheet { window.endSheet(sheet) }
+    }
+  }
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
@@ -4425,6 +4510,55 @@ struct PlayerPlaybackTests {
     hold.release()
     #expect(!writtenWhileHeld, "Syncing a plugin's preferences wrote its preferences file on the main thread")
     try await Self.waitUntil { (NSDictionary(contentsOf: file) as? [String: Any])?["synced"] as? Int == 3 }
+  }
+
+  /// An act of a plugin's preference page that saves the plugin's preferences.
+  enum PluginPreferencesSave: String, CaseIterable, Sendable {
+    case preferencesPageClosed, detailsTabChanged, detailsDismissed
+  }
+
+  @Test("A plugin's preference page saves the plugin's preferences on the plugins' preferences queue when it closes, changes tab or is dismissed, returning while the queue is held, then writes the values set", arguments: PluginPreferencesSave.allCases)
+  func pluginPreferencesSaveDoesNotWait(_ save: PluginPreferencesSave) async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let plugin = try Self.makePlugin(in: folder)
+    Self.keptPlugins.append(plugin)
+    let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
+      .appendingPathComponent("\(plugin.identifier).plist")
+    try? FileManager.default.removeItem(at: file)
+    defer { try? FileManager.default.removeItem(at: file) }
+    var loaded = false
+    plugin.loadPreferences { loaded = true }
+    try await Self.waitUntil { loaded }
+    plugin.preferences["saved"] = 4
+    let ask: () -> Void
+    switch save {
+    case .preferencesPageClosed:
+      let page = PrefPluginPreferencesViewController()
+      page.plugin = plugin
+      Self.keptObjects.append(page)
+      ask = { page.viewWillDisappear() }
+    case .detailsTabChanged, .detailsDismissed:
+      let parent = NSWindow()
+      let details = PluginDetailsWindow(plugin: plugin, window: parent)
+      Self.keptObjects += [parent, details]
+      if save == .detailsTabChanged {
+        // The tab change is the window's action of its tab control, which is private to it.
+        let tabs = NSSegmentedControl(labels: ["", "", ""], trackingMode: .selectOne, target: nil, action: nil)
+        tabs.selectedSegment = 1
+        ask = { _ = details.perform(NSSelectorFromString("changeTab:"), with: tabs) }
+      } else {
+        ask = { details.dismissSheet() }
+      }
+    }
+    let hold = await QueueHold.reached(JavascriptPlugin.preferencesQueue, limit: Self.holdLimit)
+    ask()
+    // A file written on the main thread would have been written once the main queue had run the write.
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let writtenWhileHeld = hold.limitPassed || FileManager.default.fileExists(atPath: file.path)
+    hold.release()
+    #expect(!writtenWhileHeld, "A plugin's preference page wrote the plugin's preferences file on the main thread when \(save)")
+    try await Self.waitUntil { (NSDictionary(contentsOf: file) as? [String: Any])?["saved"] as? Int == 4 }
   }
 
   @Test("A plugin's keychainWrite and keychainRead ask the Keychain on its queue, returning promises while the queue is held, then settle with what the Keychain answered")
