@@ -4193,6 +4193,29 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { fetched.isRejected }
   }
 
+  @Test("A utilities settings page reads the thumbnail cache size on the cache manager's queue, returning while the queue is held, then shows it", arguments: KeyBindingConfigPage.allCases)
+  func thumbnailCacheSizeDoesNotWait(_ page: KeyBindingConfigPage) async throws {
+    let expected = "\(FloatingPointByteCountFormatter.string(fromByteCount: CacheManager.shared.getCacheSize(), countStyle: .binary))B"
+    let hold = await QueueHold.reached(CacheManager.queue, limit: Self.holdLimit)
+    let label: () -> String
+    if page == .preferences {
+      let controller = PrefUtilsViewController()
+      Self.keptObjects.append(controller)
+      _ = controller.view
+      label = { controller.thumbCacheSizeLabel.stringValue }
+    } else {
+      let utilities = SettingsPageUtilities()
+      Self.keptObjects.append(utilities)
+      label = { utilities.thumbCacheSizeLabel.stringValue }
+    }
+    // The old page reads the size in a block it puts on the main queue as its view loads.
+    await Self.drainMain()
+    let shownWhileHeld = hold.limitPassed || label() == expected
+    hold.release()
+    #expect(!shownWhileHeld, "The \(page) utilities page listed the thumbnail cache on the main thread")
+    try await Self.waitUntil { label() == expected }
+  }
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
