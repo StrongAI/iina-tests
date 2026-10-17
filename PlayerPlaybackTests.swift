@@ -4180,6 +4180,19 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { !FileManager.default.fileExists(atPath: file.path) }
   }
 
+  @Test("Fetching subtitles from Shooter hashes the media file on its hash queue, returning while the queue is held, then fails for a file it cannot read")
+  func shooterHashDoesNotWait() async throws {
+    // A file that cannot be read fails the hash, so that no request is made of Shooter.
+    let missing = FileManager.default.temporaryDirectory.appendingPathComponent("iinaTests-\(UUID().uuidString).mp4")
+    let hold = await QueueHold.reached(Shooter.Fetcher.hashQueue, limit: Self.holdLimit)
+    let fetched = Shooter.Fetcher().fetch(from: missing, withProviderID: "shooter", playerCore: PlayerCore.active)
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let hashedWhileHeld = hold.limitPassed || !fetched.isPending
+    hold.release()
+    #expect(!hashedWhileHeld, "Fetching subtitles from Shooter read the media file on the main thread")
+    try await Self.waitUntil { fetched.isRejected }
+  }
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
