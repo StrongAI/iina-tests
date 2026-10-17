@@ -4164,6 +4164,22 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Deleting a screenshot from its OSD removes the file on the removal queue, returning while the queue is held, then the file is gone")
+  func screenshotDeleteDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("screenshot.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: file)
+    let osd = ScreenshootOSDView()
+    osd.setImage(NSImage(), size: .zero, fileURL: file)
+    let hold = await QueueHold.reached(Utility.removalQueue, limit: Self.holdLimit)
+    osd.deleteBtnAction(osd)
+    let removedWhileHeld = hold.limitPassed || !FileManager.default.fileExists(atPath: file.path)
+    hold.release()
+    #expect(!removedWhileHeld, "Deleting a screenshot removed the file on the main thread")
+    try await Self.waitUntil { !FileManager.default.fileExists(atPath: file.path) }
+  }
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
