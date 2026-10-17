@@ -4414,6 +4414,101 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Core Animation displaying a player's video layer on the main thread hands the frame to the layer's queue, returning while a frame being drawn there holds the layer's display lock, then the layer is drawn there")
+  func layerDisplayDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let layer = player.mainWindow.videoView.videoLayer
+      // A frame being drawn on the layer's queue holds the display lock while mpv renders it.
+      let hold = await LockHold.reached(layer.displayLock, limit: Self.holdLimit)
+      layer.display()
+      let returnedWhileHeld = !hold.limitPassed
+      hold.release()
+      #expect(returnedWhileHeld, "Displaying the video layer on the main thread waited for a frame being drawn on the layer's queue")
+      // A snapshot is taken from the next frame the layer's queue draws, which it draws after the frame handed to it.
+      let captured = Box<Bool>()
+      Task { @MainActor in
+        _ = await layer.captureSnapshot()
+        captured.value = true
+      }
+      try await Self.waitUntil { captured.value == true }
+    }
+  }
+
+  @Test("Initializing a player's video creates mpv's renderer with its video layer's OpenGL context and sets force-window once the renderer exists, without waiting for mpv, returning while mpv's core is held, then the renderer exists and force-window is set")
+  func videoInitDoesNotWait() async throws {
+    let player = PlayerCore()
+    player.label = "iinaTests-playback-\(Self.playerCount)"
+    Self.playerCount += 1
+    player.startMPV()
+    Self.current = player
+    defer { Self.current = nil }
+    let mpv: MPVController = player.mpv
+    // The window is loaded with no file opened, making mpv's renderer, so that freeing the renderer fails no video output.
+    let view = player.mainWindow.videoView
+    do {
+      try await Self.waitUntil { mpv.mpvRenderContext != nil }
+      // The renderer is freed as uninitializing the video frees it, keeping the handle, so that it is made again.
+      await withCheckedContinuation { continuation in
+        view.videoLayer.mpvGLQueue.async {
+          let mpv: MPVController = view.player.mpv
+          view.stopDisplayLink()
+          mpv.lockAndSetOpenGLContext()
+          mpv.mpvUninitRendering(destroying: nil)
+          mpv.unlockOpenGLContext()
+          continuation.resume()
+        }
+      }
+      #expect(mpv.mpvRenderContext == nil)
+      mpv.setString(MPVOption.Window.forceWindow, "no")
+      // A frame being drawn holds the layer's display lock, behind which the renderer is created off the main thread, and setting
+      // force-window waits for mpv's core, which a held core does not give.
+      let frame = await LockHold.reached(view.videoLayer.displayLock, limit: Self.holdLimit)
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.initVideo() }
+      let madeWhileFrameHeld = mpv.mpvRenderContext != nil
+      frame.release()
+      #expect(returnedWhileHeld, "Initializing a player's video waited for mpv on the main thread")
+      #expect(!madeWhileFrameHeld, "mpv's renderer was created on the main thread, not behind the frame being drawn")
+      try await Self.waitUntil {
+        mpv.mpvRenderContext != nil && mpv.getString(MPVOption.Window.forceWindow) == "immediate"
+      }
+      let link = try #require(view.link)
+      #expect(CVDisplayLinkIsRunning(link))
+    } catch {
+      player.shutdown()
+      throw error
+    }
+    // Shutting the player down uninitializes its video, freeing the renderer and destroying the handle.
+    player.shutdown()
+    try await Self.waitUntil { player.info.state == .shutDown && mpv.mpvRenderContext == nil && view.isUninited }
+  }
+
+#if USE_ICC_PROFILE_AUTO
+  @Test("Refreshing a player's EDR mode for an SDR video hands mpv's renderer the display's ICC profile and enables icc-profile-auto in request order, the main thread going on while a frame being drawn holds the video layer's OpenGL context, then icc-profile-auto is enabled")
+  func iccProfileAutoDoesNotWait() async throws {
+    try await Self.withSettings([.loadIccProfile: true]) {
+      try await Self.withPlayer { player, _ in
+        let mpv: MPVController = player.mpv
+        let view = player.mainWindow.videoView
+        mpv.setFlag(MPVOption.GPURendererOptions.iccProfileAuto, false)
+        // The layer is given a color space the refresh replaces, so that its replacement shows the refresh ran on the main thread.
+        let marker = try #require(CGColorSpace(name: CGColorSpace.genericGrayGamma2_2))
+        view.videoLayer.colorspace = marker
+        // A frame being drawn holds the OpenGL context of the video layer, which handing the renderer an ICC profile locks.
+        let hold = await LockHold.reached(OpenGLContextLock(mpv), limit: Self.holdLimit)
+        // The view takes the display it is on for one it has moved to, so that it refreshes its EDR mode once mpv has answered the
+        // video's parameters, which mpv does at once.
+        view.currentDisplay = nil
+        view.updateDisplayLink()
+        try await Self.waitUntil { view.videoLayer.colorspace != marker }
+        let returnedWhileHeld = !hold.limitPassed
+        hold.release()
+        #expect(returnedWhileHeld, "Handing mpv's renderer the display's ICC profile waited on the main thread for the OpenGL context")
+        try await Self.waitUntil { mpv.getFlag(MPVOption.GPURendererOptions.iccProfileAuto) }
+      }
+    }
+  }
+#endif
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
@@ -6391,6 +6486,69 @@ private final class QueueHold: @unchecked Sendable {
     released.signal()
   }
 }
+
+/// A hold on a lock, taken on a thread other than the calling one: while it is in place a thread locking the lock waits, until the
+/// hold is released or its limit passes. `@unchecked Sendable` because its state is read and written only under `lock`.
+private final class LockHold: @unchecked Sendable {
+  private let held: NSLocking
+  private let reached = DispatchSemaphore(value: 0)
+  private let released = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var passed = false
+
+  /// Hold `held`, returning once it is held without blocking the calling thread meanwhile.
+  static func reached(_ held: NSLocking, limit: DispatchTimeInterval) async -> LockHold {
+    let hold = LockHold(holding: held, limit: limit)
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        hold.reached.wait()
+        continuation.resume()
+      }
+    }
+    return hold
+  }
+
+  private init(holding held: NSLocking, limit: DispatchTimeInterval) {
+    self.held = held
+    // The lock is taken and let go within one block, so on one thread, as a recursive lock requires.
+    DispatchQueue.global(qos: .userInitiated).async { [self] in
+      self.held.lock()
+      reached.signal()
+      if released.wait(timeout: .now() + limit) == .timedOut {
+        lock.withLock { passed = true }
+      }
+      self.held.unlock()
+    }
+  }
+
+  /// Whether the limit passed before the hold was released, the lock having been let go then.
+  var limitPassed: Bool {
+    lock.withLock { passed }
+  }
+
+  func release() {
+    released.signal()
+  }
+}
+
+#if USE_ICC_PROFILE_AUTO
+/// The lock of the OpenGL context a player's renderer is created with, as `NSLocking`, so that a `LockHold` can hold it.
+private final class OpenGLContextLock: NSObject, NSLocking {
+  private let mpv: MPVController
+
+  init(_ mpv: MPVController) {
+    self.mpv = mpv
+  }
+
+  func lock() {
+    mpv.lockAndSetOpenGLContext()
+  }
+
+  func unlock() {
+    mpv.unlockOpenGLContext()
+  }
+}
+#endif
 
 /// A hold on listing the key binding configs: while it is in place, `PrefKeyBindingViewController.listConfigs` waits, wherever it is
 /// called, until the hold is removed or its limit passes. `@unchecked Sendable` because its state is read and written only under
