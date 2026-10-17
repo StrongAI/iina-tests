@@ -4396,6 +4396,24 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A player whose mpv has shut down stops its video view's display link, frees mpv's renderer and destroys its mpv handle without waiting for mpv, returning while mpv's core is held, then the renderer is freed once the core is let go")
+  func videoUninitDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let mpv: MPVController = player.mpv
+      let view = player.mainWindow.videoView
+      #expect(mpv.mpvRenderContext != nil)
+      // The player is marked as shutting down, as asking mpv to quit marks it, so that it is shut down once its video is uninitialized
+      // and the test's own shutdown of it does not ask the destroyed handle to quit.
+      player.info.state = .shuttingDown
+      // Freeing the renderer waits for mpv to tear its video output down, which it does not do while its core is held.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.mpvHasShutdown() }
+      #expect(returnedWhileHeld, "Uninitializing a player's video waited for mpv on the main thread")
+      #expect(mpv.mpv == nil, "A player's mpv handle was left for requests made after its video was uninitialized")
+      try await Self.waitUntil { mpv.mpvRenderContext == nil && view.isUninited }
+      player.mainWindow.close()
+    }
+  }
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
