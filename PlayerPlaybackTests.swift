@@ -4624,6 +4624,61 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { (NSDictionary(contentsOf: file) as? [String: Any])?["saved"] as? Int == 4 }
   }
 
+  @Test("A plugin's preference page serializes a value its page asks for on the plugins' preferences queue, returning while the queue is held, then hands the page the value", arguments: KeyBindingConfigPage.allCases)
+  func pluginPreferencePageGetDoesNotWait(_ page: KeyBindingConfigPage) async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let plugin = try Self.makePlugin(in: folder)
+    Self.keptPlugins.append(plugin)
+    let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
+      .appendingPathComponent("\(plugin.identifier).plist")
+    try? FileManager.default.removeItem(at: file)
+    defer { try? FileManager.default.removeItem(at: file) }
+    var loaded = false
+    plugin.loadPreferences { loaded = true }
+    try await Self.waitUntil { loaded }
+    plugin.preferences["listed"] = ["a", "b"]
+    let webView: WKWebView
+    if page == .preferences {
+      let controller = PrefPluginViewController()
+      Self.keptObjects.append(controller)
+      _ = controller.view
+      controller.currentPlugin = plugin
+      // The preference page is shown by the tab whose tag is 2.
+      let tabs = NSSegmentedControl(labels: ["", "", ""], trackingMode: .selectOne, target: nil, action: nil)
+      tabs.setTag(2, forSegment: 2)
+      tabs.selectedSegment = 2
+      controller.tabSwitched(tabs)
+      let shown: NonscrollableWebview? = controller.pluginPreferencesWebView
+      webView = try #require(shown)
+    } else {
+      let parent = NSWindow()
+      let details = PluginDetailsWindow(plugin: plugin, window: parent)
+      Self.keptObjects += [parent, details]
+      // The window shows its settings page in its web view, which is private to it.
+      webView = try #require(details.contentView?.subviews.compactMap { $0 as? WKWebView }.first)
+    }
+    try await Self.waitUntil("document.readyState === 'complete' && typeof window.iina?.preferences?.get === 'function'", in: webView)
+    let hold = await QueueHold.reached(JavascriptPlugin.preferencesQueue, limit: Self.holdLimit)
+    _ = try await webView.evaluateJavaScript("iina.preferences.get('listed', value => { window.answer = value; }); true")
+    // A value serialized on the main thread would have been handed to the page once the main queue had run the page's message.
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let answered = (try? await webView.evaluateJavaScript("window.answer !== undefined")) as? Bool ?? true
+    let answeredWhileHeld = hold.limitPassed || answered
+    hold.release()
+    #expect(!answeredWhileHeld, "The \(page) plugin preference page serialized the value it was asked for on the main thread")
+    try await Self.waitUntil("JSON.stringify(window.answer) === '[\"a\",\"b\"]'", in: webView)
+  }
+
+  /// Wait until `expression` is true in the page `webView` shows, failing the test once the fault threshold passes.
+  private static func waitUntil(_ expression: String, in webView: WKWebView) async throws {
+    let deadline = ContinuousClock.now + faultTimeout
+    while (try? await webView.evaluateJavaScript(expression)) as? Bool != true {
+      try #require(ContinuousClock.now < deadline, "Waited \(faultTimeout) for the page: \(expression)")
+      try await Task.sleep(for: .milliseconds(20))
+    }
+  }
+
   @Test("A plugin's keychainWrite and keychainRead ask the Keychain on its queue, returning promises while the queue is held, then settle with what the Keychain answered")
   func pluginKeychainDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
