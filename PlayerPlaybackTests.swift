@@ -4482,6 +4482,78 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { player.info.state == .shutDown && mpv.mpvRenderContext == nil && view.isUninited }
   }
 
+  @Test("Starting a player's mpv sets its options and initializes it in request order, returning while mpv waits to read its config file, with the requests made after it unanswered and the plugins not told mpv is initialized, then mpv has read the file and answers them")
+  func mpvStartDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    // mpv reads mpv.conf from the user's config folder as it initializes, and the file it includes, which the test holds.
+    let defaults = UserDefaults.standard
+    let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    let configured: [String: Any] = [Preference.Key.enableAdvancedSettings.rawValue: true,
+                                     Preference.Key.useUserDefinedConfDir.rawValue: true,
+                                     Preference.Key.userDefinedConfDir.rawValue: folder.path,
+                                     Preference.Key.userOptions.rawValue: [[String]]()]
+    defaults.setVolatileDomain(arguments.merging(Self.settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    // A player with no window, whose video is never initialized, so that nothing but the test destroys its handle.
+    let player = PlayerCore()
+    player.label = "iinaTests-playback-\(Self.playerCount)"
+    Self.playerCount += 1
+    var initialized = false
+    let listener = player.events.addListener(EventRecorder { _ in initialized = true }, for: .mpvInitialized)
+    defer { player.events.removeListener(listener, for: .mpvInitialized) }
+    var title: String?
+    player.startMPV()
+    player.mpv.getNodesAsync([MPVOption.Window.title]) { values in title = values[0] as? String ?? "" }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let returnedWhileHeld = !hold.limitPassed && title == nil && !initialized
+    hold.release()
+    #expect(returnedWhileHeld, "Starting a player's mpv waited for mpv to read its config file and initialize")
+    try await Self.waitUntil { initialized && title != nil }
+    #expect(title == "iinaTests-held-conf")
+    // mpv is asked to quit as the player would ask it, and its handle, which no window frees, is destroyed.
+    player.info.state = .shuttingDown
+    player.mpv.mpvQuit()
+    try await Self.waitUntil { player.info.state == .shutDown }
+    player.mpv.mpvDestroy()
+  }
+
+  @Test("A plugin's global instance makes a player, returning the player's number while the player's mpv waits to read its config file, then the player's mpv has read the file and started")
+  func pluginCreatePlayerDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.create-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let package = try Self.makeGlobalPluginPackage(in: folder, identifier: identifier, version: "1.0")
+    await PluginManager(window: NSWindow()).install(localPackageURL: package)
+    let plugin = try #require(Self.installedPlugin(identifier))
+    try await Self.waitUntil { plugin.globalInstance != nil }
+    let instance = try #require(plugin.globalInstance)
+    let controller = try #require(instance.apis["global"] as? JavascriptAPIGlobalController)
+    // The player's mpv reads mpv.conf from the user's config folder as it initializes, and the file it includes, which the test holds.
+    let defaults = UserDefaults.standard
+    let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    let configured: [String: Any] = [Preference.Key.enableAdvancedSettings.rawValue: true,
+                                     Preference.Key.useUserDefinedConfDir.rawValue: true,
+                                     Preference.Key.userDefinedConfDir.rawValue: folder.path,
+                                     Preference.Key.userOptions.rawValue: [[String]]()]
+    defaults.setVolatileDomain(arguments.merging(Self.settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    let made = (controller.createPlayerInstance([:]) as? Int).flatMap { controller.instances[$0] }
+    let returnedWhileHeld = !hold.limitPassed && made != nil
+    hold.release()
+    #expect(returnedWhileHeld, "A plugin's global instance making a player waited for the player's mpv to start")
+    let player = try #require(made)
+    var title: String?
+    player.mpv.getNodesAsync([MPVOption.Window.title]) { values in title = values[0] as? String ?? "" }
+    try await Self.waitUntil { title != nil }
+    #expect(title == "iinaTests-held-conf")
+    controller.cleanUp(instance)
+    try await Self.destroyMPV(of: player)
+  }
+
 #if USE_ICC_PROFILE_AUTO
   @Test("Refreshing a player's EDR mode for an SDR video hands mpv's renderer the display's ICC profile and enables icc-profile-auto in request order, the main thread going on while a frame being drawn holds the video layer's OpenGL context, then icc-profile-auto is enabled")
   func iccProfileAutoDoesNotWait() async throws {
@@ -6646,6 +6718,52 @@ private final class FileHold: @unchecked Sendable {
     lock.unlock()
     try? FileManager.default.removeItem(at: url)
     try? contents.write(to: url)
+  }
+}
+
+/// Holds `mpv` as it initializes: the config file the hold writes includes a file `mpv` reads from a socket the hold keeps, as
+/// `MPVCoreHold` has a running core read one, so that `mpv` waits for the rest of it until the hold is released or its limit passes.
+private final class ConfigIncludeHold: @unchecked Sendable {
+  private let writer: Int32
+  private let lock = NSLock()
+  private var released = false
+  private var passed = false
+
+  /// Write mpv.conf in `folder`, including from the socket a file of the given contents.
+  init(in folder: URL, contents: String, limit: DispatchTimeInterval) throws {
+    var ends: [Int32] = [-1, -1]
+    guard socketpair(AF_UNIX, SOCK_STREAM, 0, &ends) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    // mpv owns the reader once it reads the include, and closes it once it has read the end of the file.
+    try "include=fdclose://\(ends[0])\n".write(to: folder.appendingPathComponent("mpv.conf"), atomically: true, encoding: .utf8)
+    writer = ends[1]
+    _ = contents.withCString { write(ends[1], $0, strlen($0)) }
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + limit) { [self] in
+      guard letGo() else { return }
+      lock.lock()
+      passed = true
+      lock.unlock()
+    }
+  }
+
+  /// Whether the limit passed before the hold was released, `mpv` having gone on.
+  var limitPassed: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return passed
+  }
+
+  func release() {
+    _ = letGo()
+  }
+
+  /// Close the hold's end, so that `mpv` reads the end of the file, unless it is closed.
+  private func letGo() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !released else { return false }
+    released = true
+    close(writer)
+    return true
   }
 }
 

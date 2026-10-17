@@ -181,8 +181,10 @@ struct MPVAsyncRequestTests {
   }
 
   @Test("A command mpv cannot parse is answered at once with an error")
-  func commandRefused() {
+  func commandRefused() async {
     let player = Self.startedPlayer()
+    // mpv starts in request order, so the command is asked once a read asked after the start is answered.
+    _ = await Self.flag(MPVOption.PlaybackControl.pause, of: player)
     var codes: [Int32] = []
     player.mpv.asyncCommand(.seek, args: ["not-a-time"]) { codes.append($0) }
     #expect(codes.count == 1)

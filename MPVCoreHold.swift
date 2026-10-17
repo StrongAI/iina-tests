@@ -71,7 +71,14 @@ final class MPVCoreHold {
       mpv_destroy(client)
       throw HoldError.socketNotCreated(error)
     }
-    let returnValue = mpv_command_async(client, 0, &arguments)
+    // A player's mpv is initialized on the queue its start is handed to, see MPVController.mpvInit, and refuses the command until it
+    // is, so the command is asked again until it is taken.
+    let deadline = DispatchTime.now() + limit
+    var returnValue = mpv_command_async(client, 0, &arguments)
+    while returnValue == MPV_ERROR_UNINITIALIZED.rawValue && DispatchTime.now() < deadline {
+      usleep(1000)
+      returnValue = mpv_command_async(client, 0, &arguments)
+    }
     guard returnValue >= 0 else {
       ends.forEach { close($0) }
       mpv_destroy(client)
@@ -83,7 +90,6 @@ final class MPVCoreHold {
     writer = ends[1]
     // A request that waits for mpv is handled ahead of the requests queued before it, so it could be handled before the core
     // reaches this hold. Requests are made only once the core is held.
-    let deadline = DispatchTime.now() + limit
     var unread = pollfd(fd: reader, events: Int16(POLLIN), revents: 0)
     while poll(&unread, 1, 0) > 0 {
       guard DispatchTime.now() < deadline else { throw HoldError.notHeld }
