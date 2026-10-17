@@ -4325,6 +4325,45 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The app's folders are made on the folder queue, returning while the queue is held, and a first-run flag is written and removed there after them")
+  func appFoldersDoNotWait() async throws {
+    let fm = FileManager.default
+    let folder = Utility.screenshotCacheURL
+    // What the account holds there is set aside while the test makes the folder, and put back once the test is done.
+    let aside = folder.deletingLastPathComponent()
+      .appendingPathComponent("\(folder.lastPathComponent).iinaTests-\(UUID().uuidString)")
+    let setAside = (try? fm.moveItem(at: folder, to: aside)) != nil
+    let key = FirstRunManager.Key("iinaTests-\(UUID().uuidString)")
+    let flag = Utility.appSupportDirUrl.appendingPathComponent(".\(key.rawValue)", isDirectory: false)
+    defer {
+      try? fm.removeItem(at: flag)
+      if setAside {
+        try? fm.removeItem(at: folder)
+        try? fm.moveItem(at: aside, to: folder)
+      }
+    }
+    let hold = await QueueHold.reached(Utility.folderQueue, limit: Self.holdLimit)
+    var made = false
+    Utility.makeFolders { made = true }
+    let firstRun = FirstRunManager.isFirstRun(for: key)
+    await Self.drainMain()
+    let madeWhileHeld = hold.limitPassed || made || fm.fileExists(atPath: folder.path) || fm.fileExists(atPath: flag.path)
+    hold.release()
+    #expect(!madeWhileHeld, "The app's folders or a first-run flag were made on the main thread")
+    #expect(firstRun)
+    try await Self.waitUntil { made }
+    #expect(fm.fileExists(atPath: folder.path))
+    try await Self.waitUntil { fm.fileExists(atPath: flag.path) }
+    #expect(!FirstRunManager.isFirstRun(for: key))
+    let removalHold = await QueueHold.reached(Utility.folderQueue, limit: Self.holdLimit)
+    FirstRunManager.unsetFirstRun(for: key)
+    await Self.drainMain()
+    let removedWhileHeld = removalHold.limitPassed || !fm.fileExists(atPath: flag.path)
+    removalHold.release()
+    #expect(!removedWhileHeld, "A first-run flag was removed on the main thread")
+    try await Self.waitUntil { !fm.fileExists(atPath: flag.path) }
+  }
+
   @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
   func playerStartListsNoInputConfigs() async throws {
     let inputConfPath = try #require(PlayerCore.inputConfPath)
