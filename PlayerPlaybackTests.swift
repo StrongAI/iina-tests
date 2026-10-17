@@ -2428,6 +2428,8 @@ struct PlayerPlaybackTests {
     case .settingsShowConfFile:
       let editor = ConfigEditor()
       keptObjects.append(editor)
+      // The editor reads its config off the main thread.
+      try await waitUntil { editor.currentConfFilePath != nil }
       let path = try #require(editor.currentConfFilePath)
       ask = { editor.showConfFileAction(editor) }
       expected = [.revealInFinder([URL(fileURLWithPath: path)])]
@@ -3989,6 +3991,188 @@ struct PlayerPlaybackTests {
     #expect(!loadedWhileHeld, "Loading the key bindings read the input config on the main thread")
     try await Self.waitUntil { loaded }
     #expect(!PlayerCore.keyBindings.isEmpty)
+  }
+
+  /// A page that edits the key binding configs: the old preferences page, or the editor of the settings window's page.
+  enum KeyBindingConfigPage: String, CaseIterable, Sendable {
+    case preferences, settings
+  }
+
+  /// A change a key binding config page makes to the config files.
+  enum KeyBindingConfigChange: String, CaseIterable, Sendable {
+    case save, create, duplicate, rename, importFile, delete
+
+    /// The changes each page makes, the settings page's editor renaming no config.
+    static let made: [(KeyBindingConfigPage, KeyBindingConfigChange)] = KeyBindingConfigPage.allCases.flatMap { page in
+      allCases.filter { page == .preferences || $0 != .rename }.map { (page, $0) }
+    }
+  }
+
+  /// A key binding config page under test, read and driven through closures, since the two pages share no type.
+  private struct ConfigPageUnderTest {
+    let currentName: () -> String?
+    let currentPath: () -> String?
+    /// The config names the page shows.
+    let names: () -> [String]
+    let mappings: () -> [KeyMapping]
+    let validate: (String) -> Utility.ValidationResult
+    let add: (KeyMapping) -> Void
+    let save: () -> Void
+    let create: (String, String) -> Void
+    let duplicate: (String, String) -> Void
+    let rename: (String, String) -> Void
+    let importFile: (URL) -> Void
+    let delete: () -> Void
+  }
+
+  /// Make `page`, which starts reading its current config as it is made.
+  private static func makeConfigPage(_ page: KeyBindingConfigPage) -> ConfigPageUnderTest {
+    switch page {
+    case .preferences:
+      let controller = PrefKeyBindingViewController()
+      keptObjects.append(controller)
+      _ = controller.view
+      return ConfigPageUnderTest(
+        currentName: { controller.currentConfName }, currentPath: { controller.currentConfFilePath },
+        names: {
+          let table = controller.confTableView!
+          return (0..<controller.numberOfRows(in: table)).compactMap {
+            (controller.tableView(table, objectValueFor: nil, row: $0) as? [String: Any])?["name"] as? String
+          }
+        },
+        mappings: { controller.mappingController.arrangedObjects as? [KeyMapping] ?? [] },
+        validate: { controller.configNameValidator($0) }, add: { controller.mappingController.addObject($0) },
+        save: { controller.saveToConfFile(Notification(name: .iinaKeyBindingChanged)) },
+        create: { controller.createConfig(named: $0, at: $1) }, duplicate: { controller.duplicateConfig(named: $0, at: $1) },
+        rename: { controller.renameConfig(to: $0, at: $1) }, importFile: { controller.importConfig(from: $0) },
+        delete: { controller.deleteConfFileAction(controller) })
+    case .settings:
+      let editor = ConfigEditor()
+      keptObjects.append(editor)
+      return ConfigPageUnderTest(
+        currentName: { editor.currentConfName }, currentPath: { editor.currentConfFilePath },
+        names: { editor.chooserPopupButton.itemTitles },
+        mappings: { editor.mappingController.arrangedObjects as? [KeyMapping] ?? [] },
+        validate: { editor.configNameValidator($0) }, add: { editor.mappingController.addObject($0) },
+        save: { editor.saveToConfFile(Notification(name: .iinaKeyBindingChanged)) },
+        create: { editor.createConfig(named: $0, at: $1) }, duplicate: { editor.duplicateConfig(named: $0, at: $1) },
+        rename: { _, _ in Issue.record("The settings page's editor renames no config") },
+        importFile: { editor.importConfig(from: $0) }, delete: { editor.deleteCurrentConfig() })
+    }
+  }
+
+  /// Write a user input config of a new name that binds x, make it the current config in the argument domain, and run `body` with
+  /// its name and file; then remove every input config file named after it, put back the current config the pages store, and read
+  /// the key bindings again.
+  private static func withTestInputConfig(_ body: (String, String) async throws -> Void) async throws {
+    let name = "iinaTests-\(UUID().uuidString)"
+    let folder = Utility.userInputConfDirURL
+    let file = folder.appendingPathComponent("\(name).conf")
+    try "x show-text iinaTests\n".write(to: file, atomically: true, encoding: .utf8)
+    defer {
+      let files = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+      files.filter { $0.hasPrefix(name) }.forEach { try? FileManager.default.removeItem(at: folder.appendingPathComponent($0)) }
+    }
+    try await restoringSettings([Preference.Key.currentInputConfigName.rawValue]) {
+      try await withSettings([.currentInputConfigName: name]) { try await body(name, file.path) }
+    }
+    await withCheckedContinuation { continuation in PlayerCore.loadKeyBindings { continuation.resume() } }
+  }
+
+  @Test("A key binding config page lists the configs and reads the current one on the key bindings queue, returning while the queue is held, then shows them", arguments: KeyBindingConfigPage.allCases)
+  func keyBindingConfigLoadDoesNotWait(_ page: KeyBindingConfigPage) async throws {
+    try await Self.withTestInputConfig { name, path in
+      let hold = await QueueHold.reached(PlayerCore.keyBindingsQueue, limit: Self.holdLimit)
+      let shown = Self.makeConfigPage(page)
+      // The built-in configs' names are known without a lookup, so only the user's configs show what was listed.
+      let loadedWhileHeld = hold.limitPassed || shown.currentPath() != nil || shown.names().contains(name)
+      hold.release()
+      #expect(!loadedWhileHeld, "The \(page) page listed or read the key binding configs on the main thread")
+      try await Self.waitUntil { shown.currentPath() == path }
+      #expect(shown.currentName() == name)
+      let names = shown.names()
+      #expect(Array(names.prefix(PrefKeyBindingViewController.defaultConfigMap.count))
+              == PrefKeyBindingViewController.defaultConfigMap.map { $0.key })
+      #expect(names.contains(name))
+      #expect(shown.mappings().map(\.rawKey) == ["x"])
+    }
+  }
+
+  @Test("A key binding config page checks a new config's name against the configs it listed, answering while listing the configs is held", arguments: KeyBindingConfigPage.allCases)
+  func keyBindingConfigNameCheckDoesNotWait(_ page: KeyBindingConfigPage) async throws {
+    try await Self.withTestInputConfig { name, path in
+      let shown = Self.makeConfigPage(page)
+      try await Self.waitUntil { shown.currentPath() == path }
+      let hold = ConfigListingHold(limit: Self.holdLimit)
+      let answers = [name, "IINA Default", "\(name)-free", ""].map(shown.validate)
+      let answeredWhileHeld = !hold.wasReached && !hold.limitPassed
+      hold.remove()
+      #expect(answeredWhileHeld, "The \(page) page listed the key binding configs on the main thread to check a name")
+      #expect(answers.map { "\($0)" } == ["valueAlreadyExists", "valueAlreadyExists", "ok", "valueIsEmpty"])
+    }
+  }
+
+  @Test("A key binding config page changes the config files on the key bindings queue, returning while the queue is held, then shows the config changed", arguments: KeyBindingConfigChange.made)
+  func keyBindingConfigChangeDoesNotWait(_ page: KeyBindingConfigPage, _ change: KeyBindingConfigChange) async throws {
+    try await Self.withTestInputConfig { name, path in
+      let shown = Self.makeConfigPage(page)
+      try await Self.waitUntil { shown.currentPath() == path }
+      let fm = FileManager.default
+      let newName = "\(name)-\(change)"
+      let newPath = Utility.userInputConfDirURL.appendingPathComponent("\(newName).conf").path
+      let contents = try String(contentsOfFile: path, encoding: .utf8)
+      let read = { (path: String) in try? String(contentsOfFile: path, encoding: .utf8) }
+      let source = fm.temporaryDirectory.appendingPathComponent("iinaTests-\(UUID().uuidString)", isDirectory: true)
+      defer { try? fm.removeItem(at: source) }
+      let ask: () -> Void
+      // Whether the change is on disk, and the config the page shows once it is.
+      let made: () -> Bool
+      var shownName = newName
+      switch change {
+      case .save:
+        shown.add(KeyMapping(rawKey: "y", rawAction: "show-text saved"))
+        let saved = KeyMapping.generateInputConf(from: shown.mappings())
+        ask = shown.save
+        made = { read(path) == saved }
+        shownName = name
+      case .create:
+        ask = { shown.create(newName, newPath) }
+        made = { fm.fileExists(atPath: newPath) }
+      case .duplicate:
+        ask = { shown.duplicate(newName, newPath) }
+        made = { read(newPath) == contents }
+      case .rename:
+        ask = { shown.rename(newName, newPath) }
+        made = { !fm.fileExists(atPath: path) && read(newPath) == contents }
+      case .importFile:
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        let imported = source.appendingPathComponent("\(newName).conf")
+        try contents.write(to: imported, atomically: true, encoding: .utf8)
+        ask = { shown.importFile(imported) }
+        made = { read(newPath) == contents }
+      case .delete:
+        ask = shown.delete
+        made = { !fm.fileExists(atPath: path) }
+        shownName = "IINA Default"
+      }
+      let hold = await QueueHold.reached(PlayerCore.keyBindingsQueue, limit: Self.holdLimit)
+      ask()
+      let changedWhileHeld = hold.limitPassed || made() || shown.currentName() != name
+      hold.release()
+      #expect(!changedWhileHeld, "The \(page) page's \(change) changed the key binding config files on the main thread")
+      try await Self.waitUntil { made() && shown.currentName() == shownName }
+    }
+  }
+
+  @Test("Starting a player gives its mpv the input config the key bindings were read from, listing no configs, so it returns while listing the configs is held")
+  func playerStartListsNoInputConfigs() async throws {
+    let inputConfPath = try #require(PlayerCore.inputConfPath)
+    let hold = ConfigListingHold(limit: Self.holdLimit)
+    defer { hold.remove() }
+    try await Self.withPlayer { player, _ in
+      #expect(!hold.wasReached && !hold.limitPassed, "Starting a player listed the key binding configs on the main thread")
+      #expect(player.mpv.getString(MPVOption.Input.inputConf) == inputConfPath)
+    }
   }
 
   /// Run `body`, then put back the entries of `keys` in the app's own settings domain, removing those it did not hold.
@@ -5851,6 +6035,46 @@ private final class QueueHold: @unchecked Sendable {
 
   func release() {
     released.signal()
+  }
+}
+
+/// A hold on listing the key binding configs: while it is in place, `PrefKeyBindingViewController.listConfigs` waits, wherever it is
+/// called, until the hold is removed or its limit passes. `@unchecked Sendable` because its state is read and written only under
+/// `lock`.
+private final class ConfigListingHold: @unchecked Sendable {
+  private let list = PrefKeyBindingViewController.listConfigs
+  private let released = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var reached = false
+  private var passed = false
+
+  @MainActor init(limit: DispatchTimeInterval) {
+    PrefKeyBindingViewController.listConfigs = { [self] in
+      lock.withLock { reached = true }
+      if released.wait(timeout: .now() + limit) == .timedOut {
+        lock.withLock { passed = true }
+      } else {
+        // Let any other listing waiting on the hold go too.
+        released.signal()
+      }
+      return list()
+    }
+  }
+
+  /// Whether the configs were listed while the hold was in place.
+  var wasReached: Bool {
+    lock.withLock { reached }
+  }
+
+  /// Whether a listing waited for the limit to pass.
+  var limitPassed: Bool {
+    lock.withLock { passed }
+  }
+
+  /// Let every listing go, and list the configs as before.
+  @MainActor func remove() {
+    released.signal()
+    PrefKeyBindingViewController.listConfigs = list
   }
 }
 
