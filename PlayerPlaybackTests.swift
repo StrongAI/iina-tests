@@ -4554,6 +4554,22 @@ struct PlayerPlaybackTests {
     try await Self.destroyMPV(of: player)
   }
 
+  @Test("Making the mpv option defaults creates, configures and initializes their mpv off the calling thread, returning while that mpv waits to read its config file, then the defaults and versions are read from it once it has started")
+  func optionDefaultsStartDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    // The defaults' mpv reads mpv.conf from the folder it is given as it initializes, and the file it includes, which the test holds.
+    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    let defaults = MPVOptionDefaults(configDir: folder.path)
+    let returnedWhileHeld = !hold.limitPassed
+    hold.release()
+    #expect(returnedWhileHeld, "Making the mpv option defaults waited for their mpv to read its config file and initialize")
+    #expect(defaults.mpvVersion == MPVOptionDefaults.shared.mpvVersion)
+    #expect(defaults.mpvVersion.hasPrefix("mpv "))
+    #expect(defaults.getFlag(MPVOption.PlaybackControl.pause) == false)
+    #expect(defaults.getDouble(MPVOption.PlaybackControl.speed) == 1)
+  }
+
 #if USE_ICC_PROFILE_AUTO
   @Test("Refreshing a player's EDR mode for an SDR video hands mpv's renderer the display's ICC profile and enables icc-profile-auto in request order, the main thread going on while a frame being drawn holds the video layer's OpenGL context, then icc-profile-auto is enabled")
   func iccProfileAutoDoesNotWait() async throws {
