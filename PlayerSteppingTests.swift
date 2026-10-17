@@ -130,7 +130,7 @@ struct PlayerSteppingTests {
     #expect(await Self.paused(player) == true)
     player.resumeMpv()
     #expect(await Self.paused(player) == false)
-    // At the end of a file MPVController pauses on the thread of the queue for reading mpv events, waiting for mpv.
+    // At the end of a file MPVController pauses on the thread of the queue for reading mpv events, without waiting for mpv.
     player.mpv.pauseMpv()
     #expect(await Self.paused(player) == true)
   }

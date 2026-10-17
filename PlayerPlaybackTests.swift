@@ -725,6 +725,37 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Pausing at the end of a file asks mpv to pause without waiting for it, after which mpv has playback paused")
+  func endOfFilePauseDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      // FileEnd pauses through MPVController on the queue for reading mpv events; here it is asked on the main thread.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.mpv.pauseMpv() }
+      #expect(returnedWhileHeld, "Pausing at the end of a file waited for mpv")
+      let paused = await withCheckedContinuation { (continuation: CheckedContinuation<Bool?, Never>) in
+        player.mpv.getFlagAsync(MPVOption.PlaybackControl.pause) { continuation.resume(returning: $0) }
+      }
+      #expect(paused == true)
+    }
+  }
+
+  @Test("Ticking the saved filters menu asks mpv for its filters without waiting for it, then ticks each item by the filters mpv answers")
+  func savedFiltersMenuDoesNotWait() async throws {
+    try await Self.withPlayer { _, _ in
+      let active = PlayerCore.active
+      let menuController = try #require(AppDelegate.shared.menuController)
+      let menu: NSMenu = menuController.savedVideoFiltersMenu
+      // A saved filter mpv does not have, ticked before, which the menu unticks once mpv answers.
+      let item = NSMenuItem(title: "iinaTests-hflip", action: nil, keyEquivalent: "")
+      item.representedObject = "hflip"
+      item.state = .on
+      menu.addItem(item)
+      defer { menu.removeItem(item) }
+      let returnedWhileHeld = try await Self.returnsWhileHeld(active) { menuController.updateSavedFiltersMenu(type: MPVProperty.vf) }
+      #expect(returnedWhileHeld, "Ticking the saved filters menu waited for mpv")
+      try await Self.waitUntil { item.state == .off }
+    }
+  }
+
   /// Ask `mpv` whether the window is on top and wait for the answer, which comes after its answers to every request made before.
   private static func ontop(_ player: PlayerCore) async -> Bool? {
     await withCheckedContinuation { continuation in
