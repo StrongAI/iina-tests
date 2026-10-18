@@ -2304,6 +2304,62 @@ struct PlayerPlaybackTests {
     }
   }
 
+  enum TerminationCase: String, CaseIterable, Sendable {
+    /// The player is playing when the app terminates: closing its window stops it, and it is shut down once it has stopped.
+    case playing
+    /// The player has stopped before the app terminates: termination shuts it down at once.
+    case stopped
+  }
+
+  @Test("Terminating the app returns before mpv handles the stop or quit it asks for, after which the player has shut down and AppKit is told to proceed",
+        arguments: TerminationCase.allCases)
+  func terminationDoesNotWait(_ termination: TerminationCase) async throws {
+    try #require(!OnlineSubtitle.loggedIn, "Terminating the app would log out of the online subtitles provider")
+    try await Self.withPlayer { player, _ in
+      let app = AppDelegate.shared
+      let window = try #require(player.mainWindow.window)
+      // Termination shuts down only this player and closes only its window, and replies to the test instead of to AppKit, so that the
+      // app hosting the tests keeps its players, windows and log and is not terminated.
+      let (players, windows, reply) = (AppDelegate.terminatingPlayers, AppDelegate.terminatingWindows, AppDelegate.replyToTerminate)
+      var replies = 0
+      AppDelegate.terminatingPlayers = { [player] }
+      AppDelegate.terminatingWindows = { [window] }
+      AppDelegate.replyToTerminate = { replies += 1 }
+      // Termination empties a copy of the dock menu instead of the dock menu, and the menus and remote commands it disables are enabled
+      // again after.
+      let dockMenu = app.dockMenu
+      let terminatedDockMenu = try #require(dockMenu?.copy() as? NSMenu)
+      app.dockMenu = terminatedDockMenu
+      let remoteCommandsEnabled = RemoteCommandController.shared.isEnabled
+      defer {
+        (AppDelegate.terminatingPlayers, AppDelegate.terminatingWindows, AppDelegate.replyToTerminate) = (players, windows, reply)
+        app.dockMenu = dockMenu
+        app.menuController.enableAllMenus()
+        if remoteCommandsEnabled {
+          RemoteCommandController.shared.enable()
+        }
+        app.isTerminating = false
+      }
+      try await Self.waitUntil { !player.backgroundTaskInUse }
+      if termination == .stopped {
+        player.stop()
+        try await Self.waitUntil { player.info.state == .idle }
+      }
+      do {
+        let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+        let answer = app.applicationShouldTerminate(NSApp)
+        let asked: PlayerState = termination == .playing ? .stopping : .shuttingDown
+        let returnedWhileHeld = !hold.hasLetGo && answer == .terminateLater && player.info.state == asked
+        hold.release()
+        try await Self.waitUntil { hold.hasLetGo }
+        #expect(returnedWhileHeld, "Terminating the app waited for mpv")
+      }
+      try await Self.waitUntil { replies == 1 }
+      #expect(player.info.state == .shutDown)
+      #expect(terminatedDockMenu.items.isEmpty)
+    }
+  }
+
   @Test("A player whose mpv shut down on its own stores the file played from what mpv last reported, returning while mpv's core is held, then asks for the app to terminate")
   func mpvShutdownDoesNotWait() async throws {
     let defaults = UserDefaults.standard
