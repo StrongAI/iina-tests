@@ -1146,6 +1146,60 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A site of the video filter window that sets, adds or removes a filter: each must not wait for `mpv` on the main thread.
+  enum FilterWindowRequest: String, CaseIterable, Sendable {
+    case setFilters, addFilter, removeFilter, toggleSavedFilter
+  }
+
+  @Test("Each site of the video filter window that sets, adds or removes a filter returns before mpv handles it, after which mpv has the filters asked for",
+        arguments: FilterWindowRequest.allCases)
+  func filterWindowDoesNotWait(_ request: FilterWindowRequest) async throws {
+    // Hardware decoding is off from the start: adding a filter while it is set to auto asks the user first.
+    let saved = ["name": "iinaTests", "filterString": "hflip", "shortcutKey": "", "shortcutKeyModifiers": ""]
+    try await Self.withSettings([.hardwareDecoder: Preference.HardwareDecoderOption.disabled.rawValue,
+                                 .savedVideoFilters: [saved]]) {
+      try await Self.withPlayer { player, _ in
+        player.syncUITimer?.invalidate()
+        // The window asks the last active player.
+        let lastActive = PlayerCore.lastActive
+        PlayerCore.lastActive = player
+        defer { PlayerCore.lastActive = lastActive }
+        let hflip = try #require(MPVFilter(rawString: "hflip"))
+        let flipped = { player.mpv.getFilters(MPVProperty.vf).contains { $0.name == "hflip" } }
+        let controller = FilterWindowController(filterType: MPVProperty.vf, autosaveName: "iinaTestsVideoFilters")
+        Self.keptObjects.append(controller)
+        _ = controller.window
+        if request == .removeFilter {
+          // The filter removed is the one selected in the window's list of the filters mpv has.
+          player.mpv.setFilters(MPVProperty.vf, filters: [hflip])
+          try await Self.waitUntil { flipped() }
+          controller.reloadTable()
+          controller.currentFiltersTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        }
+        // The saved filter's checkbox is stood for by a checkbox in the saved filter's row.
+        let row = try #require(controller.savedFiltersTableView.view(atColumn: 0, row: 0, makeIfNecessary: true))
+        let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+        row.addSubview(checkbox)
+        checkbox.state = .on
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+          switch request {
+          case .setFilters:
+            controller.filters = [hflip]
+            controller.setFilters()
+          case .addFilter:
+            controller.addFilter(hflip) { _ in }
+          case .removeFilter:
+            controller.removeFilterAction(controller)
+          case .toggleSavedFilter:
+            controller.toggleSavedFilterAction(checkbox)
+          }
+        }
+        #expect(returnedWhileHeld, "The filter window's \(request) waited for mpv")
+        try await Self.waitUntil { flipped() == (request != .removeFilter) }
+      }
+    }
+  }
+
   @Test("A video reconfig mpv reports is handled on the main thread without waiting for mpv, storing the display size read with it")
   func videoReconfigDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
