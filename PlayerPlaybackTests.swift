@@ -2594,6 +2594,9 @@ struct PlayerPlaybackTests {
         PlaybackHistory(url: $0, duration: 4, title: nil, mpvMd5: $0.path)
       }
       let controller = AppDelegate.shared.historyWindow
+      // The shared history is read on its queue once first touched, so the test reads and changes it once the read has ended.
+      _ = HistoryController.shared
+      await QueueHold.reached(HistoryController.queue, limit: holdLimit).release()
       let history = HistoryController.shared.history
       HistoryController.shared.history = entries
       cleanUp = {
@@ -4712,7 +4715,7 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("The app's folders are made on the folder queue, returning while the queue is held, and a first-run flag is written and removed there after them")
+  @Test("The app's folders are made on the folder queue, returning while the queue is held, and a first-run flag is looked for, written and removed there after them")
   func appFoldersDoNotWait() async throws {
     let fm = FileManager.default
     let folder = Utility.screenshotCacheURL
@@ -4732,16 +4735,21 @@ struct PlayerPlaybackTests {
     let hold = await QueueHold.reached(Utility.folderQueue, limit: Self.holdLimit)
     var made = false
     Utility.makeFolders { made = true }
-    let firstRun = FirstRunManager.isFirstRun(for: key)
+    var firstRun: Bool?
+    FirstRunManager.isFirstRun(for: key) { firstRun = $0 }
     await Self.drainMain()
-    let madeWhileHeld = hold.limitPassed || made || fm.fileExists(atPath: folder.path) || fm.fileExists(atPath: flag.path)
+    let madeWhileHeld = hold.limitPassed || made || firstRun != nil || fm.fileExists(atPath: folder.path)
+      || fm.fileExists(atPath: flag.path)
     hold.release()
-    #expect(!madeWhileHeld, "The app's folders or a first-run flag were made on the main thread")
-    #expect(firstRun)
-    try await Self.waitUntil { made }
+    #expect(!madeWhileHeld, "The app's folders or a first-run flag were looked for or made on the main thread")
+    try await Self.waitUntil { made && firstRun != nil }
+    #expect(firstRun == true)
     #expect(fm.fileExists(atPath: folder.path))
-    try await Self.waitUntil { fm.fileExists(atPath: flag.path) }
-    #expect(!FirstRunManager.isFirstRun(for: key))
+    #expect(fm.fileExists(atPath: flag.path))
+    var nextRun: Bool?
+    FirstRunManager.isFirstRun(for: key) { nextRun = $0 }
+    try await Self.waitUntil { nextRun != nil }
+    #expect(nextRun == false)
     let removalHold = await QueueHold.reached(Utility.folderQueue, limit: Self.holdLimit)
     FirstRunManager.unsetFirstRun(for: key)
     await Self.drainMain()
@@ -5733,6 +5741,9 @@ struct PlayerPlaybackTests {
     defer { try? FileManager.default.removeItem(at: folder) }
     let (file, missing) = (folder.appendingPathComponent("a.mp4"), folder.appendingPathComponent("missing.mp4"))
     let entries = [file, missing].map { PlaybackHistory(url: $0, duration: 4, title: nil, mpvMd5: $0.path) }
+    // The shared history is read on its queue once first touched, so the test reads and changes it once the read has ended.
+    _ = HistoryController.shared
+    await QueueHold.reached(HistoryController.queue, limit: Self.holdLimit).release()
     let history = HistoryController.shared.history
     defer { HistoryController.shared.history = history }
     // Whether each file exists is answered by the recorder, which records whether the main thread asked.
@@ -5799,6 +5810,58 @@ struct PlayerPlaybackTests {
     #expect(items.allSatisfy { window.validateMenuItem($0) })
     #expect(!files.onMainThread.isEmpty)
     #expect(!files.onMainThread.contains(true), "The History window looked at whether a file exists on the main thread")
+  }
+
+  enum HistoryChange: String, CaseIterable, Sendable {
+    case read, remove, removeAll
+  }
+
+  @Test("Each change to the playback history reads, archives and writes the history file on the history queue, returning while the queue is held, after which the history and its file hold the change",
+        arguments: HistoryChange.allCases)
+  func historyChangeDoesNotWait(_ change: HistoryChange) async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let plist = folder.appendingPathComponent("history.plist")
+    let entries = ["a", "b", "c"].map { folder.appendingPathComponent("\($0).mp4") }
+      .map { PlaybackHistory(url: $0, duration: 4, title: nil, mpvMd5: $0.path) }
+    try NSKeyedArchiver.archivedData(withRootObject: entries, requiringSecureCoding: true).write(to: plist)
+    func stored() throws -> [URL] {
+      let object = try NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, PlaybackHistory.self], from: Data(contentsOf: plist))
+      return try #require(object as? [PlaybackHistory]).map(\.url)
+    }
+    var controller: HistoryController?
+    if change != .read {
+      let read = HistoryController(plistFileURL: plist)
+      await QueueHold.reached(HistoryController.queue, limit: Self.holdLimit).release()
+      controller = read
+    }
+    // The History window removes entries the history holds, an entry being equal only to itself.
+    let removed = controller.map { [$0.history[1]] } ?? []
+    let hold = await QueueHold.reached(HistoryController.queue, limit: Self.holdLimit)
+    switch change {
+    case .read:
+      controller = HistoryController(plistFileURL: plist)
+    case .remove:
+      controller?.remove(removed)
+    case .removeAll:
+      controller?.removeAll()
+    }
+    let history = try #require(controller)
+    // A history or a file changed while the queue is held was read, archived or written on the main thread.
+    let shownWhileHeld = history.history.map(\.url)
+    let storedWhileHeld = try stored()
+    let changedWhileHeld = hold.limitPassed || shownWhileHeld != (change == .read ? [] : entries.map(\.url))
+      || storedWhileHeld != entries.map(\.url)
+    hold.release()
+    #expect(!changedWhileHeld, "The playback history was read, archived or written on the main thread")
+    let expected: [URL]
+    switch change {
+    case .read: expected = entries.map(\.url)
+    case .remove: expected = [entries[0].url, entries[2].url]
+    case .removeAll: expected = []
+    }
+    try await Self.waitUntil { history.tasksOutstanding == 0 && history.history.map(\.url) == expected }
+    #expect(try stored() == expected)
   }
 
   @Test("Pasting files into the playlist searches their folders on the player's open queue, returning while the queue is held, then adds the playable files")
