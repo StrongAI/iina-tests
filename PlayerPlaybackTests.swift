@@ -1291,6 +1291,24 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The launch logs the configuration mpv was built with, reading it in a request that returns before mpv handles it, then the configuration is logged")
+  func mpvConfigurationLogDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      try await Self.withSettings([.logLevel: Logger.Level.verbose.rawValue]) {
+        // The log lines made before the launch's logging is run, the configuration logged after them being the one it logs.
+        let logged = Logger.buffer.count
+        let prefix = "Configuration when building mpv: "
+        func loggedConfiguration() -> Bool {
+          Logger.buffer.dropFirst(logged).contains { $0.message.hasPrefix(prefix) && $0.message.count > prefix.count }
+        }
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) { AppDelegate.logMPVConfiguration(of: player.mpv) }
+        #expect(returnedWhileHeld, "The launch read mpv's configuration on the main thread")
+        try await Self.waitUntil { loggedConfiguration() }
+      }
+    }
+  }
+
   @Test("The mpv options given on the command line are set in requests that return before mpv handles them")
   func commandLineOptionsDoNotWait() async throws {
     try await Self.withPlayer { player, _ in
