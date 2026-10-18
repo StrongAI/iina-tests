@@ -2121,7 +2121,13 @@ struct PlayerPlaybackTests {
     let player = PlayerCore()
     player.label = "iinaTests-playback-\(Self.playerCount)"
     Self.playerCount += 1
+    var initialized = false
+    let listener = player.events.addListener(EventRecorder { _ in initialized = true }, for: .mpvInitialized)
+    defer { player.events.removeListener(listener, for: .mpvInitialized) }
     player.startMPV()
+    // The handle is destroyed once mpv's start has returned, as the app destroys it only after the player's video, whose renderer
+    // is made after the start, see MPVController.mpvInitRendering. A start still running would set options on the nil handle.
+    try await Self.waitUntil { initialized }
     // The hold's client is closed once the core is let go, so that mpv shutting down waits for no client but the player's.
     do {
       let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
