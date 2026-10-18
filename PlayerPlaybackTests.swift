@@ -4314,6 +4314,23 @@ struct PlayerPlaybackTests {
     UserDefaults.standard.set(stored, forKey: key)
   }
 
+  @Test("The About window reads its contribution and credits texts on its queue, returning while the queue is held, then shows them")
+  func aboutTextsDoNotWait() async throws {
+    let contribution = try #require(AboutWindowController.readText("Contribution")).string
+    let credits = try #require(AboutWindowController.readText("Credits")).string
+    let about = AboutWindowController()
+    Self.keptObjects.append(about)
+    let hold = await QueueHold.reached(AboutWindowController.queue, limit: Self.holdLimit)
+    _ = about.window
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let shownWhileHeld = hold.limitPassed || about.detailTextView.string == contribution
+      || about.creditsTextView.string == credits
+    hold.release()
+    #expect(!shownWhileHeld, "The About window read its texts on the main thread")
+    try await Self.waitUntil { about.detailTextView.string == contribution && about.creditsTextView.string == credits }
+    about.close()
+  }
+
   @Test("Saving the log window's logs joins them and writes the file on the log save queue, returning while the queue is held, then the file holds the logs")
   func logSaveDoesNotWait() async throws {
     let folder = try Self.makeFolder()
