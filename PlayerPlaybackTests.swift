@@ -952,10 +952,15 @@ struct PlayerPlaybackTests {
   @Test("Removing the black bars beside the video, leaving legacy full screen and showing the thumbnail under the mouse size to the video as mpv reported it, returning before mpv is asked, then the video or the thumbnail has the video's aspect",
         arguments: VideoSizeRequest.allCases)
   func videoSizeReadDoesNotWait(_ request: VideoSizeRequest) async throws {
-    let settings: [Preference.Key: Any] = request == .blackBars ? [.unlockWindowAspectRatio: true]
-      : request == .legacyFullScreenExit ? [.useLegacyFullScreen: true] : [:]
-    try await Self.withSettings(settings) {
+    let settings: [String: Any] = request == .blackBars ? [Preference.Key.unlockWindowAspectRatio.rawValue: true]
+      : request == .legacyFullScreenExit ? [Preference.Key.useLegacyFullScreen.rawValue: true] : [:]
+    do {
       try await Self.withPlayer { player, _ in
+        // The settings are changed and restored on the main thread, where the window observes them.
+        let defaults = UserDefaults.standard
+        let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        defaults.setVolatileDomain(arguments.merging(settings) { $1 }, forName: UserDefaults.argumentDomain)
+        defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
         let window: MainWindowController = player.mainWindow
         let nsWindow = try #require(window.window)
         // The files are 64 by 48 pixels.
@@ -1672,6 +1677,16 @@ struct PlayerPlaybackTests {
     _ = control.sendAction(control.action, to: control.target)
   }
 
+  /// Make an event of `type` the app's current event, as a click makes it while the action of the control clicked runs, without
+  /// sending it to any view.
+  private static func makeCurrentEvent(_ type: NSEvent.EventType) throws {
+    let event = try #require(NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+                                                context: nil, eventNumber: 0, clickCount: 1, pressure: 0))
+    NSApp.postEvent(event, atStart: true)
+    let current = NSApp.nextEvent(matching: .any, until: .distantPast, inMode: .default, dequeue: true)
+    try #require(current?.type == type && NSApp.currentEvent?.type == type)
+  }
+
   /// A control of a player's window, sidebar or menu that asks `mpv` for a setting, or a view that shows a setting: each is a site
   /// that must not wait for `mpv` on the main thread.
   enum ControlRequest: String, CaseIterable, Sendable {
@@ -1679,6 +1694,7 @@ struct PlayerPlaybackTests {
     case secondSubVisibilitySwitch, subPosSlider, subScaleReset, subScaleSlider, subFontSizePicker, subBorderSizePicker
     case subTextColorWell, subBackColorWell, subBorderColorWell, aspectSegment, rotationSegment, hwdecSwitch, speedEdit
     case speedReset, videoEqualizerReset, videoEqualizerSlider, audioDelayEdit, audioDelayReset, subDelayEdit, subDelayReset
+    case audioDelaySlider, subDelaySlider, scrollVolume
     case audioDelayShown, subDelayShown, subPosShown, subScaleShown, subTextStyleShown, speedShown, osdChapterShown
     case menuSubFont, chooseSubFont, subFontButton, loopButton, loopShown
   }
@@ -1867,6 +1883,25 @@ struct PlayerPlaybackTests {
         mpv.setDouble(MPVOption.Audio.audioDelay, 0.5)
         ask = { view.resetButtonAction() }
         applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0 }
+      case .audioDelaySlider, .subDelaySlider:
+        let isAudio = request == .audioDelaySlider
+        let pane: NSView = isAudio ? Self.kept(SidebarAudioPane(player: player)) : Self.kept(SidebarSubtitlesPane(player: player))
+        let view = try Self.sliderView(notifiedBy: isAudio ? .iinaAudioDelayChanged : .iinaSubDelayChanged, under: pane)
+        let option = isAudio ? MPVOption.Audio.audioDelay : MPVOption.Subtitles.subDelay
+        view.slider.doubleValue = 0.5
+        // The slider sets the delay once the mouse that drags it goes up.
+        try Self.makeCurrentEvent(.leftMouseUp)
+        ask = { view.sliderAction() }
+        applied = { mpv.getDouble(option) == 0.5 }
+      case .scrollVolume:
+        // A mouse wheel turned up over the window raises the volume, see the vertical scroll action of the settings.
+        let volume = mpv.getDouble(MPVOption.Audio.volume)
+        let scroll = try #require(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: 1, wheel2: 0,
+                                          wheel3: 0))
+        scroll.timestamp = CGEventTimestamp(DispatchTime.now().uptimeNanoseconds)
+        let event = try #require(NSEvent(cgEvent: scroll))
+        ask = { window.scrollWheel(with: event) }
+        applied = { mpv.getDouble(MPVOption.Audio.volume) != volume }
       case .audioDelayShown:
         // The view shows mpv's delay once the player has stored it, then is cleared, so that what it shows next is what the request
         // shows.
