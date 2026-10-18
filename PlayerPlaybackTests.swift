@@ -1694,7 +1694,7 @@ struct PlayerPlaybackTests {
     case secondSubVisibilitySwitch, subPosSlider, subScaleReset, subScaleSlider, subFontSizePicker, subBorderSizePicker
     case subTextColorWell, subBackColorWell, subBorderColorWell, aspectSegment, rotationSegment, hwdecSwitch, speedEdit
     case speedReset, videoEqualizerReset, videoEqualizerSlider, audioDelayEdit, audioDelayReset, subDelayEdit, subDelayReset
-    case audioDelaySlider, subDelaySlider, scrollVolume
+    case audioDelaySlider, subDelaySlider, scrollVolume, scrollSpeed
     case audioDelayShown, subDelayShown, subPosShown, subScaleShown, subTextStyleShown, speedShown, osdChapterShown
     case menuSubFont, chooseSubFont, subFontButton, loopButton, loopShown
   }
@@ -1893,15 +1893,20 @@ struct PlayerPlaybackTests {
         try Self.makeCurrentEvent(.leftMouseUp)
         ask = { view.sliderAction() }
         applied = { mpv.getDouble(option) == 0.5 }
-      case .scrollVolume:
-        // A mouse wheel turned up over the window raises the volume, see the vertical scroll action of the settings.
-        let volume = mpv.getDouble(MPVOption.Audio.volume)
+      case .scrollVolume, .scrollSpeed:
+        // A mouse wheel turned over the window changes the volume, see the vertical scroll action of the settings, or the speed when
+        // that is the action.
+        let option = request == .scrollVolume ? MPVOption.Audio.volume : MPVOption.PlaybackControl.speed
+        if request == .scrollSpeed {
+          window.verticalScrollAction = .playbackSpeed
+        }
+        let value = mpv.getDouble(option)
         let scroll = try #require(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: 1, wheel2: 0,
                                           wheel3: 0))
         scroll.timestamp = CGEventTimestamp(DispatchTime.now().uptimeNanoseconds)
         let event = try #require(NSEvent(cgEvent: scroll))
         ask = { window.scrollWheel(with: event) }
-        applied = { mpv.getDouble(MPVOption.Audio.volume) != volume }
+        applied = { mpv.getDouble(option) != value }
       case .audioDelayShown:
         // The view shows mpv's delay once the player has stored it, then is cleared, so that what it shows next is what the request
         // shows.
@@ -4642,6 +4647,80 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Refreshing a player's EDR mode for an SDR video with tone mapping disabled resets target-peak, tone-mapping and tone-mapping-param to the defaults the mpv option defaults answer in request order, the main thread going on while the defaults' queue is held, then the options have their defaults")
+  func edrRefreshDefaultsDoNotWait() async throws {
+    try await Self.withSettings([.enableToneMapping: false]) {
+      try await Self.withPlayer { player, _ in
+        player.syncUITimer?.invalidate()
+        let mpv: MPVController = player.mpv
+        let view = player.mainWindow.videoView
+        let names = [MPVOption.GPURendererOptions.targetPeak, MPVOption.GPURendererOptions.toneMapping,
+                     MPVOption.GPURendererOptions.toneMappingParam]
+        // The options are given other values first, so that values other than these show the refresh reset them.
+        let given = ["100", "clip", "0.5"]
+        for (name, value) in zip(names, given) {
+          mpv.setString(name, value)
+        }
+        let hold = await QueueHold.reached(MPVOptionDefaults.shared.queue, limit: Self.holdLimit)
+        // The view takes the display it is on for one it has moved to, so that it refreshes its EDR mode on the main thread once mpv
+        // has answered the video's parameters. A read asked after them is answered after them, and the main thread runs the refresh
+        // before the work queued after that answer.
+        view.currentDisplay = nil
+        view.updateDisplayLink()
+        var answered = false
+        mpv.getNodesAsync([MPVOption.Window.title]) { _ in answered = true }
+        try await Self.waitUntil { answered }
+        await Self.drainMain()
+        let returnedWhileHeld = !hold.limitPassed
+        hold.release()
+        #expect(returnedWhileHeld, "Resetting the tone mapping options waited on the main thread for the mpv option defaults")
+        try await Self.waitUntil { zip(names, given).allSatisfy { mpv.getString($0) != $1 } }
+      }
+    }
+  }
+
+  @Test("Requesting EDR mode for an HDR video on a screen with EDR sets the video layer's color space and mpv's ICC profile, target and screenshot options without waiting for mpv, returning while its core is held, then the options are set")
+  func edrModeRequestDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let mpv: MPVController = player.mpv
+      let view = player.mainWindow.videoView
+      player.info.hdrEnabled = true
+      // The options the request sets are given other values first, so that the values it sets show it ran.
+      mpv.setString(MPVOption.GPURendererOptions.targetPrim, "bt.709")
+      mpv.setString(MPVOption.GPURendererOptions.targetTrc, "srgb")
+      mpv.setFlag(MPVOption.Screenshot.screenshotTagColorspace, false)
+      var enabled: Bool?
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        enabled = view.requestEdrMode(primaries: "bt.2020", edrPotential: 2)
+      }
+      #expect(returnedWhileHeld, "Requesting EDR mode waited for mpv on the main thread")
+      #expect(enabled == true && view.videoLayer.wantsExtendedDynamicRangeContent)
+      try await Self.waitUntil {
+        mpv.getString(MPVOption.GPURendererOptions.targetPrim) == "bt.2020"
+          && mpv.getString(MPVOption.GPURendererOptions.targetTrc) == "pq"
+          && mpv.getFlag(MPVOption.Screenshot.screenshotTagColorspace)
+      }
+    }
+  }
+
+  @Test("Stopping a player's display link returns while a display link callback in progress waits to read whether the video view is uninitialized, then the display link is stopped once the callback has returned")
+  func displayLinkStopDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let view = player.mainWindow.videoView
+      view.startDisplayLink()
+      let link = try #require(view.link)
+      try await Self.waitUntil { CVDisplayLinkIsRunning(link) }
+      // The test holds whether the view is uninitialized for writing, as uninitializing the view holds it, until a callback is waiting
+      // to read it.
+      let hold = await WriteLockHold.reached(view.$isUninited, limit: Self.holdLimit)
+      view.stopDisplayLink()
+      let returnedWhileHeld = !hold.limitPassed
+      hold.release()
+      #expect(returnedWhileHeld, "Stopping the display link waited on the main thread for a display link callback in progress")
+      try await Self.waitUntil { !CVDisplayLinkIsRunning(link) }
+    }
+  }
+
   @Test("A player whose mpv has shut down stops its video view's display link, frees mpv's renderer and destroys its mpv handle without waiting for mpv, returning while mpv's core is held, then the renderer is freed once the core is let go")
   func videoUninitDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
@@ -4717,8 +4796,48 @@ struct PlayerPlaybackTests {
       try await Self.waitUntil {
         mpv.mpvRenderContext != nil && mpv.getString(MPVOption.Window.forceWindow) == "immediate"
       }
+      // The display link is started on the view's display link queue, after the stop asked for before.
       let link = try #require(view.link)
-      #expect(CVDisplayLinkIsRunning(link))
+      try await Self.waitUntil { CVDisplayLinkIsRunning(link) }
+    } catch {
+      player.shutdown()
+      throw error
+    }
+    // Shutting the player down uninitializes its video, freeing the renderer and destroying the handle.
+    player.shutdown()
+    try await Self.waitUntil { player.info.state == .shutDown && mpv.mpvRenderContext == nil && view.isUninited }
+  }
+
+  @Test("Loading a player's window while its mpv waits to read its config file makes the video layer and initializes the video without waiting for mpv, the layer's OpenGL context being made in request order by the options mpv started with, then once mpv has started the layer has its context and mpv's renderer exists")
+  func videoLayerMadeDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    // mpv reads mpv.conf from the user's config folder as it initializes, and the file it includes, which the test holds.
+    let defaults = UserDefaults.standard
+    let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+    let configured: [String: Any] = [Preference.Key.enableAdvancedSettings.rawValue: true,
+                                     Preference.Key.useUserDefinedConfDir.rawValue: true,
+                                     Preference.Key.userDefinedConfDir.rawValue: folder.path,
+                                     Preference.Key.userOptions.rawValue: [[String]]()]
+    defaults.setVolatileDomain(arguments.merging(Self.settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
+    defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
+    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    let player = PlayerCore()
+    player.label = "iinaTests-playback-\(Self.playerCount)"
+    Self.playerCount += 1
+    player.startMPV()
+    Self.current = player
+    defer { Self.current = nil }
+    let mpv: MPVController = player.mpv
+    // Loading the window with no file opened makes the video view and its layer and initializes the video. The window is loaded
+    // before the view is asked for, as the app loads it, since the view is made from the window's content view.
+    _ = player.mainWindow.window
+    let view = player.mainWindow.videoView
+    let returnedWhileHeld = !hold.limitPassed && view.videoLayer.cglContext == nil
+    hold.release()
+    do {
+      #expect(returnedWhileHeld, "Making a player's video layer waited on the main thread for mpv to start")
+      try await Self.waitUntil { view.videoLayer.cglContext != nil && mpv.mpvRenderContext != nil }
     } catch {
       player.shutdown()
       throw error
@@ -6856,6 +6975,59 @@ private final class QueueHold: @unchecked Sendable {
   }
 
   /// Whether the limit passed before the hold was released, the queue having gone on.
+  var limitPassed: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return passed
+  }
+
+  func release() {
+    released.signal()
+  }
+}
+
+/// A hold of a value for writing, as uninitializing a video view holds `isUninited`, taken on a thread other than the calling one: while
+/// it is in place a thread reading the value waits, until the hold is released or its limit passes. `@unchecked Sendable` because its
+/// state is read and written only under `lock`.
+private final class WriteLockHold<Value>: @unchecked Sendable {
+  private let held: ReadWriteAtomic<Value>
+  private let reached = DispatchSemaphore(value: 0)
+  private let released = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var passed = false
+
+  /// Time the value is held before the hold is reported reached, so that a thread that reads it now and then, such as a display link
+  /// callback, is waiting to read it by then.
+  private static var settle: TimeInterval { 0.1 }
+
+  /// Hold `held` for writing, returning once it has been held for `settle` without blocking the calling thread meanwhile.
+  static func reached(_ held: ReadWriteAtomic<Value>, limit: DispatchTimeInterval) async -> WriteLockHold {
+    let hold = WriteLockHold(holding: held, limit: limit)
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        hold.reached.wait()
+        continuation.resume()
+      }
+    }
+    return hold
+  }
+
+  private init(holding held: ReadWriteAtomic<Value>, limit: DispatchTimeInterval) {
+    self.held = held
+    DispatchQueue.global(qos: .userInitiated).async {
+      self.held.withWriteLock { _ in
+        Thread.sleep(forTimeInterval: Self.settle)
+        self.reached.signal()
+        if self.released.wait(timeout: .now() + limit) == .timedOut {
+          self.lock.lock()
+          self.passed = true
+          self.lock.unlock()
+        }
+      }
+    }
+  }
+
+  /// Whether the limit passed before the hold was released, the value having been let go.
   var limitPassed: Bool {
     lock.lock()
     defer { lock.unlock() }
