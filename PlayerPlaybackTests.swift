@@ -1174,6 +1174,8 @@ struct PlayerPlaybackTests {
           player.mpv.setFilters(MPVProperty.vf, filters: [hflip])
           try await Self.waitUntil { flipped() }
           controller.reloadTable()
+          // The window lists the filters once mpv has answered.
+          try await Self.waitUntil { controller.filters == [hflip] }
           controller.currentFiltersTableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
         // The saved filter's checkbox is stood for by a checkbox in the saved filter's row.
@@ -1197,6 +1199,31 @@ struct PlayerPlaybackTests {
         #expect(returnedWhileHeld, "The filter window's \(request) waited for mpv")
         try await Self.waitUntil { flipped() == (request != .removeFilter) }
       }
+    }
+  }
+
+  @Test("The video filter window reads the filters mpv has as it loads and as it reloads in requests that return before mpv handles them, then lists them")
+  func filterWindowReadsDoNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      player.syncUITimer?.invalidate()
+      // The window asks the last active player.
+      let lastActive = PlayerCore.lastActive
+      PlayerCore.lastActive = player
+      defer { PlayerCore.lastActive = lastActive }
+      let hflip = try #require(MPVFilter(rawString: "hflip"))
+      player.mpv.setFilters(MPVProperty.vf, filters: [hflip])
+      try await Self.waitUntil { player.mpv.getFilters(MPVProperty.vf) == [hflip] }
+      let controller = FilterWindowController(filterType: MPVProperty.vf, autosaveName: "iinaTestsVideoFilterReads")
+      Self.keptObjects.append(controller)
+      let loadedWhileHeld = try await Self.returnsWhileHeld(player) { _ = controller.window }
+      #expect(loadedWhileHeld, "The filter window read mpv's filters on the main thread as it loaded")
+      try await Self.waitUntil { controller.filters == [hflip] }
+      controller.filters = []
+      let reloadedWhileHeld = try await Self.returnsWhileHeld(player) { controller.reloadTable() }
+      #expect(reloadedWhileHeld, "The filter window read mpv's filters on the main thread as it reloaded")
+      try await Self.waitUntil { controller.filters == [hflip] }
+      player.mpv.setFilters(MPVProperty.vf, filters: [])
+      controller.close()
     }
   }
 
