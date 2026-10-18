@@ -4331,6 +4331,23 @@ struct PlayerPlaybackTests {
     about.close()
   }
 
+  @Test("The debug dump writes its file on the folder queue, returning while the queue is held, then the file holds the players' dump")
+  func debugDumpDoesNotWait() async throws {
+    try await Self.withPlayer { _, folder in
+      let path = folder.appendingPathComponent("iina-debug-dump.txt").path
+      let hold = await QueueHold.reached(Utility.folderQueue, limit: Self.holdLimit)
+      var written: Bool?
+      AppDelegate.writeDebugDump(to: path) { written = $0 }
+      await Self.drainMain()
+      let writtenWhileHeld = hold.limitPassed || written != nil || FileManager.default.fileExists(atPath: path)
+      hold.release()
+      #expect(!writtenWhileHeld, "The debug dump was written on the main thread")
+      try await Self.waitUntil { written != nil }
+      #expect(written == true)
+      #expect(try !String(contentsOfFile: path, encoding: .utf8).isEmpty)
+    }
+  }
+
   @Test("Saving the log window's logs joins them and writes the file on the log save queue, returning while the queue is held, then the file holds the logs")
   func logSaveDoesNotWait() async throws {
     let folder = try Self.makeFolder()
