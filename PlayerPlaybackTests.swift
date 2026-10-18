@@ -4652,7 +4652,7 @@ struct PlayerPlaybackTests {
     await withCheckedContinuation { continuation in defaults.versions { continuation.resume(returning: ($0, $1)) } }
   }
 
-  @Test("The About window and a plugin's getVersion read the mpv version while the mpv option defaults' queue is held, returning before it is read, then the window shows it and the plugin's promise settles with it")
+  @Test("The About window, a plugin's getVersion and the launch's logging of the dependencies read the mpv version while the mpv option defaults' queue is held, returning before it is read, then the window shows it, the plugin's promise settles with it and the libass version is logged")
   func versionReadsDoNotWait() async throws {
     try await Self.withPlayer { player, folder in
       let shared = await Self.versions(of: MPVOptionDefaults.shared)
@@ -4662,15 +4662,19 @@ struct PlayerPlaybackTests {
       let about = AboutWindowController()
       Self.keptObjects.append(about)
       let hold = await QueueHold.reached(MPVOptionDefaults.shared.queue, limit: Self.holdLimit)
+      // The log lines made before the launch's logging is run, the versions logged after them being the ones it logs.
+      let logged = Logger.buffer.count
+      func loggedLibass() -> Bool { Logger.buffer.dropFirst(logged).contains { $0.message == "libass \(shared.libass)" } }
       _ = about.window
       instance.js.evaluateScript("iina.core.getVersion().then(v => { globalThis.iinaTestsMpv = v.mpv })")
+      AppDelegate.logDependencyVersions()
       let returnedWhileHeld = !hold.limitPassed && about.mpvVersionLabel.stringValue != shared.mpv
-        && instance.js.objectForKeyedSubscript("iinaTestsMpv").isUndefined
+        && instance.js.objectForKeyedSubscript("iinaTestsMpv").isUndefined && !loggedLibass()
       hold.release()
       #expect(returnedWhileHeld, "Reading the mpv version waited for the mpv option defaults")
       try await Self.waitUntil {
         about.mpvVersionLabel.stringValue == shared.mpv
-          && instance.js.objectForKeyedSubscript("iinaTestsMpv").toString() == shared.mpv
+          && instance.js.objectForKeyedSubscript("iinaTestsMpv").toString() == shared.mpv && loggedLibass()
       }
       about.close()
     }
