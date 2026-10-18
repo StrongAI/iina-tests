@@ -896,6 +896,114 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A site that asks for the A-B loop, from the menu or the window, or that moves one of its points with a play slider knob.
+  enum ABLoopRequest: String, CaseIterable, Sendable {
+    case menu, window, knobA, knobB
+  }
+
+  @Test("The A-B loop menu item and the window's A-B loop return before mpv runs the command, then the play slider shows the A point mpv answers; a move of a play slider loop knob returns before mpv sets the point, then mpv has it",
+        arguments: ABLoopRequest.allCases)
+  func abLoopSiteDoesNotWait(_ request: ABLoopRequest) async throws {
+    try await Self.withPlayer { player, _ in
+      let window: MainWindowController = player.mainWindow
+      let slider: PlaySlider = try #require(window.playSlider)
+      // The full length of the file, which replaces the length mpv first reports, see FullLength, and from which the knobs are placed.
+      try await Self.waitUntil { player.info.videoDuration?.second ?? 0 >= 4 - 1e-6 }
+      let duration = try #require(player.info.videoDuration?.second)
+      switch request {
+      case .menu, .window:
+        player.seek(absoluteSecond: 1)
+        try await Self.waitForPosition(1, of: player)
+        let handler = MainMenuActionHandler(playerCore: player)
+        slider.abLoopA.isHidden = true
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+          if request == .menu { handler.menuABLoop(.dummy) } else { window.abLoop() }
+        }
+        #expect(returnedWhileHeld, "Asking for the A-B loop from the \(request) waited for mpv")
+        try await Self.waitUntil { !slider.abLoopA.isHidden }
+        #expect(player.info.abLoopStatus == .aSet)
+        #expect(abs(slider.abLoopA.doubleValue - 100 / duration) < 11 / duration)
+        #expect(slider.abLoopB.isHidden)
+      case .knobA, .knobB:
+        // Both points are set, as two A-B loop commands set them, so that either knob moves its point.
+        player.mpv.setDouble(MPVOption.PlaybackControl.abLoopA, 1)
+        player.mpv.setDouble(MPVOption.PlaybackControl.abLoopB, 3)
+        try await Self.waitUntil { player.info.abLoopA == 1 && player.info.abLoopB == 3 }
+        player.info.abLoopStatus = .bSet
+        let knob = request == .knobA ? slider.abLoopA : slider.abLoopB
+        let option = request == .knobA ? MPVOption.PlaybackControl.abLoopA : MPVOption.PlaybackControl.abLoopB
+        // The knob is moved to the middle of the play slider, between the points, as dragging it does, which posts that it changed.
+        // A point moved past the other would have mpv play on to the next file, which resets the points.
+        knob.doubleValue = 50
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+          NotificationCenter.default.post(Notification(name: .iinaPlaySliderLoopKnobChanged, object: knob))
+        }
+        #expect(returnedWhileHeld, "Moving the \(request) of the play slider waited for mpv")
+        try await Self.waitUntil { abs(player.mpv.getDouble(option) - duration / 2) < 1e-6 }
+      }
+    }
+  }
+
+  /// A site that sizes the window or a view to the video, as mpv reported its size and rotation.
+  enum VideoSizeRequest: String, CaseIterable, Sendable {
+    case blackBars, legacyFullScreenExit, thumbnailPeek
+  }
+
+  @Test("Removing the black bars beside the video, leaving legacy full screen and showing the thumbnail under the mouse size to the video as mpv reported it, returning before mpv is asked, then the video or the thumbnail has the video's aspect",
+        arguments: VideoSizeRequest.allCases)
+  func videoSizeReadDoesNotWait(_ request: VideoSizeRequest) async throws {
+    let settings: [Preference.Key: Any] = request == .blackBars ? [.unlockWindowAspectRatio: true]
+      : request == .legacyFullScreenExit ? [.useLegacyFullScreen: true] : [:]
+    try await Self.withSettings(settings) {
+      try await Self.withPlayer { player, _ in
+        let window: MainWindowController = player.mainWindow
+        let nsWindow = try #require(window.window)
+        // The files are 64 by 48 pixels.
+        let aspect = 64.0 / 48.0
+        switch request {
+        case .blackBars:
+          // The window is made twice as wide as the video fills, leaving black bars beside it.
+          let frame = nsWindow.frame
+          nsWindow.setFrame(NSRect(origin: frame.origin, size: NSSize(width: frame.width * 2, height: frame.height)), display: true)
+          let container = try #require(window.videoViewContainer)
+          let containerAspect: () -> Double = { container.frame.width / container.frame.height }
+          try #require(containerAspect() > aspect + 0.1)
+          let returnedWhileHeld = try await Self.returnsWhileHeld(player) { window.removeVideoViewBlackBars() }
+          #expect(returnedWhileHeld, "Removing the black bars beside the video waited for mpv")
+          try await Self.waitUntil { abs(containerAspect() - aspect) < 0.02 }
+        case .legacyFullScreenExit:
+          let inFullScreen = {
+            if case .fullscreen = window.fsState { return true }
+            return false
+          }
+          window.toggleWindowFullScreen()
+          try await Self.waitUntil(inFullScreen)
+          let returnedWhileHeld = try await Self.returnsWhileHeld(player) { window.toggleWindowFullScreen() }
+          #expect(returnedWhileHeld, "Leaving legacy full screen waited for mpv")
+          try await Self.waitUntil { window.fsState == .windowed }
+        case .thumbnailPeek:
+          // A thumbnail is ready for the start of the file, as the thumbnail generator would make it.
+          let thumbnail = FFThumbnail()
+          thumbnail.image = NSImage(size: NSSize(width: 64, height: 48))
+          thumbnail.realTime = 0
+          player.info.thumbnails = [thumbnail]
+          player.info.thumbnailsReady = true
+          let peek = try #require(window.thumbnailPeekView)
+          peek.isHidden = true
+          let slider = try #require(window.playSlider)
+          let point = slider.convert(NSPoint(x: slider.bounds.midX, y: slider.bounds.midY), to: nil)
+          let event = try #require(NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [], timestamp: 0,
+                                                      windowNumber: nsWindow.windowNumber, context: nil, eventNumber: 0,
+                                                      clickCount: 0, pressure: 0))
+          let returnedWhileHeld = try await Self.returnsWhileHeld(player) { window.mouseMoved(with: event) }
+          #expect(returnedWhileHeld, "Showing the thumbnail under the mouse waited for mpv")
+          #expect(!peek.isHidden)
+          #expect(abs(peek.frame.width / peek.frame.height - aspect) < 0.02)
+        }
+      }
+    }
+  }
+
   @Test("Reloading the subtitles returns before mpv handles it, the track list mpv answers after the reloads being stored")
   func reloadAllSubsDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
@@ -943,6 +1051,34 @@ struct PlayerPlaybackTests {
         }, ["a", "b", "c"]),
         ("reordering the playlist", { player.playlistReorder(newPlaylist: player.info.playlist.reversed()) }, ["c", "b", "a"]),
         ("clearing the playlist", { player.clearPlaylist() }, ["b"]),
+      ]
+      for (name, edit, playlist) in edits {
+        await Self.readPlaylist(of: player)
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player, edit)
+        #expect(returnedWhileHeld, "Playlist edit \(name) waited for mpv")
+        await Self.readPlaylist(of: player)
+        #expect(player.info.playlist.map(\.filename) == playlist.map(path), "After \(name)")
+      }
+    }
+  }
+
+  @Test("The playlist pane's sorts, clear button and drag of an entry within it, and a plugin's move of an entry, return before mpv makes the edit, mpv making the edits in the order they are asked")
+  func playlistPaneEditsDoNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      // The last entry is dragged to the top of the table it is shown in.
+      let drag = try FileDrop(rows: IndexSet([2]), from: pane.tableView)
+      let edits: [(name: String, edit: () -> Void, playlist: [String])] = [
+        ("sorting by name, descending", { pane.sortNameDesecnding() }, ["c", "b", "a"]),
+        ("sorting by path, ascending", { pane.sortPathAscending() }, ["a", "b", "c"]),
+        ("dragging an entry", { _ = pane.tableView(pane.tableView, acceptDrop: drag, row: 0, dropOperation: .above) },
+         ["c", "a", "b"]),
+        ("a plugin moving an entry", { _ = instance.js.evaluateScript("iina.playlist.move(0, 2)") }, ["a", "c", "b"]),
+        ("clearing the playlist", { pane.clearPlaylistBtnAction(NSButton()) }, ["b"]),
       ]
       for (name, edit, playlist) in edits {
         await Self.readPlaylist(of: player)
@@ -6400,6 +6536,8 @@ private final class FileDrop: NSObject, NSDraggingInfo {
   var draggingFormation: NSDraggingFormation = .default
   var animatesToDestination = false
   var numberOfValidItemsForDrop = 0
+  /// The view the drag began in, if it began in the app.
+  private weak var source: NSView?
 
   init(_ urls: [URL]) {
     super.init()
@@ -6414,6 +6552,15 @@ private final class FileDrop: NSObject, NSDraggingInfo {
     draggingPasteboard.setString(link.absoluteString, forType: .nsURL)
   }
 
+  /// A drag of playlist rows within the table they are shown in, carrying their indexes as the playlist pane copies them.
+  init(rows: IndexSet, from table: NSTableView) throws {
+    source = table
+    super.init()
+    draggingPasteboard.declareTypes([.iinaPlaylistItem], owner: nil)
+    draggingPasteboard.setData(try NSKeyedArchiver.archivedData(withRootObject: rows, requiringSecureCoding: true),
+                               forType: .iinaPlaylistItem)
+  }
+
   deinit {
     draggingPasteboard.releaseGlobally()
   }
@@ -6423,7 +6570,7 @@ private final class FileDrop: NSObject, NSDraggingInfo {
   var draggingLocation: NSPoint { .zero }
   var draggedImageLocation: NSPoint { .zero }
   var draggedImage: NSImage? { nil }
-  var draggingSource: Any? { nil }
+  var draggingSource: Any? { source }
   var draggingSequenceNumber: Int { 0 }
   var springLoadingHighlight: NSSpringLoadingHighlight { .none }
 
