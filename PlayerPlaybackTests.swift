@@ -5945,6 +5945,23 @@ struct PlayerPlaybackTests {
     #expect(try stored() == expected)
   }
 
+  @Test("Deleting the files of history entries moves them to the Trash on the History window's data queue, returning while the queue is held, then the files are gone")
+  func historyFilesTrashDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let files = ["a", "b"].map { folder.appendingPathComponent("iinaTests-\(UUID().uuidString)-\($0).mp4") }
+    try files.forEach { try Data().write(to: $0) }
+    let hold = await QueueHold.reached(HistoryWindowController.dataQueue, limit: Self.holdLimit)
+    var trashed = false
+    HistoryWindowController.trash(files) { trashed = true }
+    await Self.drainMain()
+    let trashedWhileHeld = hold.limitPassed || trashed || files.contains { !FileManager.default.fileExists(atPath: $0.path) }
+    hold.release()
+    #expect(!trashedWhileHeld, "The History window moved a file to the Trash on the main thread")
+    try await Self.waitUntil { trashed }
+    #expect(!files.contains { FileManager.default.fileExists(atPath: $0.path) })
+  }
+
   @Test("Pasting files into the playlist searches their folders on the player's open queue, returning while the queue is held, then adds the playable files")
   func playlistPasteDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
