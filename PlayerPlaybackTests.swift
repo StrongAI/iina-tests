@@ -4285,6 +4285,35 @@ struct PlayerPlaybackTests {
     #expect(crop.localizedName != crop.name)
   }
 
+  @Test("The user's equalizer presets are decoded on their queue, returning while the queue is held, then held decoded and a change to them stored there")
+  func userEQPresetsDoNotWait() async throws {
+    let key = Preference.Key.userEQPresets.rawValue
+    let stored = UserDefaults.standard.data(forKey: key)
+    let (eqs, loaded) = (EQProfile.userEQs, EQProfile.isLoaded)
+    let name = "iinaTests-\(UUID().uuidString)"
+    let gains: [Double] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    UserDefaults.standard.set(try JSONEncoder().encode([name: EQProfile(gains)]), forKey: key)
+    (EQProfile.isLoaded, EQProfile.userEQs) = (false, [:])
+    let hold = await QueueHold.reached(EQProfile.queue, limit: Self.holdLimit)
+    var decoded = false
+    EQProfile.load { decoded = true }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let decodedWhileHeld = hold.limitPassed || decoded || EQProfile.isLoaded || !EQProfile.userEQs.isEmpty
+    hold.release()
+    #expect(!decodedWhileHeld, "The user's equalizer presets were decoded on the main thread")
+    try await Self.waitUntil { decoded }
+    #expect(EQProfile.userEQs[name]?.gains == gains)
+    EQProfile.userEQs[name] = nil
+    await QueueHold.reached(EQProfile.queue, limit: Self.holdLimit).release()
+    let left = try JSONDecoder().decode([String: EQProfile].self, from: try #require(UserDefaults.standard.data(forKey: key)))
+    #expect(left[name] == nil)
+    // What the account held is put back once the queue has stored the change.
+    EQProfile.isLoaded = false
+    EQProfile.userEQs = eqs
+    EQProfile.isLoaded = loaded
+    UserDefaults.standard.set(stored, forKey: key)
+  }
+
   @Test("Saving the log window's logs joins them and writes the file on the log save queue, returning while the queue is held, then the file holds the logs")
   func logSaveDoesNotWait() async throws {
     let folder = try Self.makeFolder()
