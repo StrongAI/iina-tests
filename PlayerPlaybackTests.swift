@@ -2492,6 +2492,11 @@ struct PlayerPlaybackTests {
       }
       controller.reloadData()
       let outlineView = controller.outlineView
+      // The entries are shown once the window has read them.
+      try await Self.waitUntil {
+        Set((0..<outlineView.numberOfRows).compactMap { (outlineView.item(atRow: $0) as? PlaybackHistory)?.url })
+          == Set(entries.map(\.url))
+      }
       outlineView.selectRowIndexes(IndexSet(integersIn: 0..<outlineView.numberOfRows), byExtendingSelection: false)
       ask = { controller.showInFinderAction(nil) }
       expected = [.revealInFinder([file])]
@@ -4247,6 +4252,27 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Opening a folder checks whether it is a Blu-ray folder and finds its playable files on the player's open queue, returning while the queue is held, then opens them")
+  func openFolderDoesNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let subfolder = folder.appendingPathComponent("more")
+      try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true)
+      let file = subfolder.appendingPathComponent("d.mp4")
+      try FileManager.default.copyItem(at: folder.appendingPathComponent("c.mp4"), to: file)
+      let hold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
+      player.openURLs([subfolder])
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      // An open ends on the main thread once its files are found, so an open ended while the queue is held looked at the folder on
+      // the main thread.
+      let foundWhileHeld = hold.limitPassed || player.opensFindingFiles.isEmpty
+      hold.release()
+      #expect(!foundWhileHeld, "Opening a folder looked at the folder on the main thread")
+      try await Self.waitUntil {
+        player.info.currentURL?.path == file.path && player.info.state == .paused && !player.info.pausedForLoading
+      }
+    }
+  }
+
   @Test("Loading the key bindings lists the input configs and reads the current one on the key bindings queue, returning while the queue is held, then sets its bindings")
   func keyBindingsLoadDoesNotWait() async throws {
     // The bindings are emptied, so that bindings set while the queue is held show they were read on the main thread.
@@ -5518,6 +5544,151 @@ struct PlayerPlaybackTests {
         controller.close()
       }
     }
+  }
+
+  @Test("Restoring the recent documents resolves their saved bookmarks on the recent documents queue, returning while the queue is held, then lists the documents they resolve to")
+  func recentDocumentsRestoreDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("recent.mp4")
+    try Data().write(to: file)
+    let bookmark = try file.bookmarkData()
+    // The documents are listed by the recorder, not in the recent-documents list the installed app shares.
+    let recent = RecentDocumentsRecorder()
+    let (documents, note) = (AppDelegate.recentDocumentURLs, AppDelegate.noteRecentDocumentURL)
+    AppDelegate.recentDocumentURLs = recent.documents
+    AppDelegate.noteRecentDocumentURL = recent.note
+    defer { (AppDelegate.recentDocumentURLs, AppDelegate.noteRecentDocumentURL) = (documents, note) }
+    try await Self.withSettings([.enableRecentDocumentsWorkaround: true, .recordRecentFiles: true,
+                                 .recentDocuments: [bookmark]]) {
+      let hold = await QueueHold.reached(AppDelegate.recentDocumentsQueue, limit: Self.holdLimit)
+      AppDelegate.shared.restoreRecentDocuments()
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      // A document listed while the queue is held had its bookmark resolved on the main thread.
+      let listedWhileHeld = hold.limitPassed || !recent.documents().isEmpty
+      hold.release()
+      #expect(!listedWhileHeld, "Restoring the recent documents resolved their bookmarks on the main thread")
+      try await Self.waitUntil { !recent.documents().isEmpty }
+      #expect(recent.documents().map { $0.resolvingSymlinksInPath().path } == [file.resolvingSymlinksInPath().path])
+    }
+  }
+
+  @Test("Saving the recent documents makes their bookmarks on the recent documents queue, returning while the queue is held, then saves the bookmarks")
+  func recentDocumentsSaveDoesNotWait() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("recent.mp4")
+    try Data().write(to: file)
+    let documents = AppDelegate.recentDocumentURLs
+    AppDelegate.recentDocumentURLs = { [file] }
+    defer { AppDelegate.recentDocumentURLs = documents }
+    // The bookmarks are saved in the app's own settings, whose saved list is put back as it was.
+    let key = Preference.Key.recentDocuments.rawValue
+    let defaults = UserDefaults.standard
+    let saved = defaults.persistentDomain(forName: Bundle.main.bundleIdentifier!)?[key]
+    defaults.removeObject(forKey: key)
+    defer {
+      if let saved {
+        defaults.set(saved, forKey: key)
+      } else {
+        defaults.removeObject(forKey: key)
+      }
+    }
+    try await Self.withSettings([.enableRecentDocumentsWorkaround: true]) {
+      let hold = await QueueHold.reached(AppDelegate.recentDocumentsQueue, limit: Self.holdLimit)
+      AppDelegate.shared.saveRecentDocuments()
+      try await Task.sleep(for: Self.heldAnswerWindow)
+      // A list saved while the queue is held had its bookmarks made on the main thread.
+      let savedWhileHeld = hold.limitPassed || !(defaults.array(forKey: key) ?? []).isEmpty
+      hold.release()
+      #expect(!savedWhileHeld, "Saving the recent documents made their bookmarks on the main thread")
+      try await Self.waitUntil { !(defaults.array(forKey: key) ?? []).isEmpty }
+      let bookmark = try #require(defaults.array(forKey: key)?.first as? Data)
+      var isStale = false
+      let resolved = try URL(resolvingBookmarkData: bookmark, bookmarkDataIsStale: &isStale)
+      #expect(resolved.resolvingSymlinksInPath().path == file.resolvingSymlinksInPath().path)
+    }
+  }
+
+  /// A site that shows the History window's entries: each must read, search and group the history and find which of its files exist
+  /// off the main thread.
+  enum HistoryWindowLoad: String, CaseIterable, Sendable {
+    case open, reload, search
+  }
+
+  @Test("Each site that shows the History window's entries reads, searches and groups the history and finds which files exist on the window's data queue, returning while the queue is held, then shows the entries, a missing file dimmed and offered neither to play, to show in Finder nor to trash",
+        arguments: HistoryWindowLoad.allCases)
+  func historyWindowDataDoesNotWait(_ load: HistoryWindowLoad) async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let (file, missing) = (folder.appendingPathComponent("a.mp4"), folder.appendingPathComponent("missing.mp4"))
+    let entries = [file, missing].map { PlaybackHistory(url: $0, duration: 4, title: nil, mpvMd5: $0.path) }
+    let history = HistoryController.shared.history
+    defer { HistoryController.shared.history = history }
+    // Whether each file exists is answered by the recorder, which records whether the main thread asked.
+    let files = FileExistenceRecorder(existing: [file])
+    let fileExists = HistoryWindowController.fileExists
+    HistoryWindowController.fileExists = files.exists
+    defer { HistoryWindowController.fileExists = fileExists }
+    func shown(_ controller: HistoryWindowController?) -> Set<URL> {
+      guard let outlineView = controller?.outlineView else { return [] }
+      return Set((0..<outlineView.numberOfRows).compactMap { (outlineView.item(atRow: $0) as? PlaybackHistory)?.url })
+    }
+    // Reloading shows an entry added since the window was opened; searching for "mp4" leaves out a third entry.
+    let other = PlaybackHistory(url: folder.appendingPathComponent("b.mkv"), duration: 4, title: nil, mpvMd5: "b.mkv")
+    HistoryController.shared.history = load == .reload ? [entries[0]] : entries + [other]
+    var controller: HistoryWindowController?
+    if load != .open {
+      let opened = HistoryWindowController()
+      Self.keptObjects.append(opened)
+      try await Self.waitUntil { shown(opened) == Set(HistoryController.shared.history.map(\.url)) }
+      controller = opened
+    }
+    let shownBefore = shown(controller)
+    let hold = await QueueHold.reached(HistoryWindowController.dataQueue, limit: Self.holdLimit)
+    switch load {
+    case .open:
+      HistoryController.shared.history = entries
+      let opened = HistoryWindowController()
+      Self.keptObjects.append(opened)
+      controller = opened
+    case .reload:
+      HistoryController.shared.history = entries
+      controller?.reloadData()
+    case .search:
+      let field = NSSearchField()
+      field.stringValue = "mp4"
+      controller?.searchFieldAction(field)
+    }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    // Entries shown differently while the queue is held were read, searched or grouped on the main thread.
+    let shownWhileHeld = hold.limitPassed || shown(controller) != shownBefore
+    hold.release()
+    #expect(!shownWhileHeld, "The History window read, searched or grouped the history on the main thread")
+    let window = try #require(controller)
+    try await Self.waitUntil { shown(window) == Set(entries.map(\.url)) }
+    let outlineView = window.outlineView
+    let row = { (url: URL) in
+      (0..<outlineView.numberOfRows).first { (outlineView.item(atRow: $0) as? PlaybackHistory)?.url == url }
+    }
+    let missingRow = try #require(row(missing)), fileRow = try #require(row(file))
+    let missingCell = try #require(outlineView.view(atColumn: 0, row: missingRow, makeIfNecessary: true) as? HistoryFilenameCellView)
+    let fileCell = try #require(outlineView.view(atColumn: 0, row: fileRow, makeIfNecessary: true) as? HistoryFilenameCellView)
+    #expect(missingCell.textField?.textColor == .disabledControlTextColor)
+    #expect(fileCell.textField?.textColor == .controlTextColor)
+    // The menu offers to play, show in Finder and trash the entry whose file exists, and not the one whose file is missing.
+    let menu = NSMenu()
+    window.menuNeedsUpdate(menu)
+    let actions = [#selector(HistoryWindowController.playAction(_:)), #selector(HistoryWindowController.showInFinderAction(_:)),
+                   #selector(HistoryWindowController.deleteFileAction(_:))]
+    let items = actions.compactMap { action in menu.items.first { $0.action == action } }
+    try #require(items.count == actions.count)
+    outlineView.selectRowIndexes(IndexSet(integer: missingRow), byExtendingSelection: false)
+    #expect(items.allSatisfy { !window.validateMenuItem($0) })
+    outlineView.selectRowIndexes(IndexSet(integer: fileRow), byExtendingSelection: false)
+    #expect(items.allSatisfy { window.validateMenuItem($0) })
+    #expect(!files.onMainThread.isEmpty)
+    #expect(!files.onMainThread.contains(true), "The History window looked at whether a file exists on the main thread")
   }
 
   @Test("Pasting files into the playlist searches their folders on the player's open queue, returning while the queue is held, then adds the playable files")
@@ -7314,6 +7485,54 @@ private final class IconLookupRecorder: @unchecked Sendable {
     made.append(Thread.isMainThread)
     lock.unlock()
     return icon
+  }
+}
+
+/// Stands for the recent-documents list the installed app shares, recording each document listed from the main thread.
+/// `@unchecked Sendable` because its state is read and written only under `lock`.
+private final class RecentDocumentsRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var listed: [URL] = []
+
+  /// The documents listed, in the order they were listed.
+  func documents() -> [URL] {
+    lock.lock()
+    defer { lock.unlock() }
+    return listed
+  }
+
+  /// List `document`.
+  func note(_ document: URL) {
+    lock.lock()
+    listed.append(document)
+    lock.unlock()
+  }
+}
+
+/// Answers whether a file exists from a set of the files that do, recording for each answer whether the main thread asked, in place
+/// of looking at the file system. `@unchecked Sendable`: answers are given on any thread, and every access to `asked` holds `lock`.
+private final class FileExistenceRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private let existing: Set<URL>
+  private var asked: [Bool] = []
+
+  init(existing: Set<URL>) {
+    self.existing = existing
+  }
+
+  /// Whether the main thread asked each question, in the order they were asked.
+  var onMainThread: [Bool] {
+    lock.lock()
+    defer { lock.unlock() }
+    return asked
+  }
+
+  /// Whether the file at `url` exists, recording whether the main thread asked.
+  func exists(_ url: URL) -> Bool {
+    lock.lock()
+    asked.append(Thread.isMainThread)
+    lock.unlock()
+    return existing.contains(url)
   }
 }
 
