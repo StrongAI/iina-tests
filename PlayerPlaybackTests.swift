@@ -4267,6 +4267,24 @@ struct PlayerPlaybackTests {
     #expect(KeyBindingTranslator.readableCommand(fromAction: ["seek", "5"]) != "seek 5")
   }
 
+  @Test("The filter presets read their localized names on their queue, returning while the queue is held, then name a preset with them")
+  func filterPresetNamesDoNotWait() async throws {
+    let strings = FilterPreset.l10nDic
+    defer { FilterPreset.l10nDic = strings }
+    FilterPreset.l10nDic = [:]
+    let crop = try #require(FilterPreset.vfPresets.first { $0.name == "crop" })
+    let hold = await QueueHold.reached(FilterPreset.queue, limit: Self.holdLimit)
+    var loaded = false
+    FilterPreset.load { loaded = true }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let loadedWhileHeld = hold.limitPassed || loaded || !FilterPreset.l10nDic.isEmpty
+    hold.release()
+    #expect(!loadedWhileHeld, "The filter presets read their localized names on the main thread")
+    try await Self.waitUntil { loaded }
+    #expect(crop.localizedName == FilterPreset.l10nDic["crop"])
+    #expect(crop.localizedName != crop.name)
+  }
+
   @Test("Saving the log window's logs joins them and writes the file on the log save queue, returning while the queue is held, then the file holds the logs")
   func logSaveDoesNotWait() async throws {
     let folder = try Self.makeFolder()
