@@ -6296,6 +6296,41 @@ struct PlayerPlaybackTests {
     #expect(plugin.enabled)
   }
 
+  /// A site that unpacks a plugin package with a process it waits for: each must not wait for the process on the main thread.
+  enum PluginPackageUnpack: String, CaseIterable, Sendable {
+    case install, defaultPlugins
+  }
+
+  @Test("Each site that unpacks a plugin package returns while the package file is held, the process unpacking it waiting for the file off the main thread, then installs and enables the plugin once the file is answered",
+        arguments: PluginPackageUnpack.allCases)
+  func pluginPackageUnpackDoesNotWait(_ site: PluginPackageUnpack) async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.unpack-\(site.rawValue)-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let packages = folder.appendingPathComponent("packages")
+    try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true)
+    let package = try Self.makePluginPackage(in: packages, identifier: identifier, version: "1.0")
+    let hold = try FileHold(package, contents: try Data(contentsOf: package), limit: Self.holdLimit)
+    defer { hold.release() }
+    let ended = Box<Bool>()
+    switch site {
+    case .install:
+      let manager = PluginManager(window: NSWindow())
+      Task { await manager.install(localPackageURL: package, handler: { _ in ended.value = true }) }
+    case .defaultPlugins:
+      JavascriptPlugin.installPackages(in: packages.path) { _ in ended.value = true }
+    }
+    try await Task.sleep(for: Self.heldAnswerWindow)
+    let unpackedWhileHeld = hold.limitPassed || ended.value != nil || Self.installedPlugin(identifier) != nil
+    hold.answer()
+    #expect(!unpackedWhileHeld, "Unpacking a plugin package waited on the main thread for the process unpacking it")
+    try await Self.waitUntil { ended.value != nil }
+    let plugin = try #require(Self.installedPlugin(identifier))
+    #expect(plugin.version == "1.0")
+    #expect(plugin.enabled)
+  }
+
   @Test("Installing a plugin from GitHub finds, downloads and unpacks it on the plugin install queue, returning while the queue is held, then installs and enables the plugin")
   func pluginGitHubInstallDoesNotWait() async throws {
     let folder = try Self.makeFolder()
@@ -7143,14 +7178,15 @@ private final class ConfigListingHold: @unchecked Sendable {
 }
 
 /// Holds a file by putting a named pipe in its place, so that a read of the file made while it is held does not get the file's
-/// contents: opening the pipe to read it waits until the hold answers the read with them, which it does once `limit` has passed, or
-/// never if it is released first, and Foundation's file readers refuse the pipe. `@unchecked Sendable` because its state is read and
-/// written only under `lock`.
+/// contents: opening the pipe to read it waits until the hold answers the read with them, which it does once `limit` has passed or
+/// once `answer()` is called, or never if it is released first, and Foundation's file readers refuse the pipe. `@unchecked Sendable`
+/// because its state is read and written only under `lock`.
 private final class FileHold: @unchecked Sendable {
   private let url: URL
   private let contents: Data
   private let lock = NSLock()
   private var released = false
+  private var answered = false
   private var passed = false
 
   init(_ url: URL, contents: Data, limit: DispatchTimeInterval) throws {
@@ -7158,21 +7194,23 @@ private final class FileHold: @unchecked Sendable {
     self.contents = contents
     try FileManager.default.removeItem(at: url)
     guard mkfifo(url.path, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + limit) { [self] in answerRead() }
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + limit) { [self] in answerRead(atLimit: true) }
   }
 
-  /// Answer the first read of the file that waits, unless the hold is released before one does.
-  private func answerRead() {
+  /// Answer the first read of the file that waits, unless the hold is released before one does or a read has been answered.
+  /// - Parameter atLimit: Whether `limit` has passed.
+  private func answerRead(atLimit: Bool) {
     while true {
       lock.lock()
-      if released {
+      if released || answered {
         lock.unlock()
         return
       }
       // Opening the pipe to write without waiting fails while no read waits on it.
       let descriptor = open(url.path, O_WRONLY | O_NONBLOCK)
       if descriptor >= 0 {
-        passed = true
+        answered = true
+        passed = atLimit
         lock.unlock()
         _ = fcntl(descriptor, F_SETFL, 0)
         _ = contents.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
@@ -7189,6 +7227,12 @@ private final class FileHold: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return passed
+  }
+
+  /// Let go of the hold by answering the read of the file that waits, or the first one made, now rather than once the limit has
+  /// passed, leaving the pipe in the file's place.
+  func answer() {
+    DispatchQueue.global(qos: .userInitiated).async { [self] in answerRead(atLimit: false) }
   }
 
   /// Release the hold, putting the file back in the pipe's place.
