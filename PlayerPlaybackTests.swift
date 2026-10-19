@@ -4939,6 +4939,38 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A change that has a player's window refresh its EDR mode: a tone mapping setting the window observes, or a display's color space.
+  enum EDRRefreshTrigger: String, CaseIterable, Sendable {
+    case toneMappingSetting, colorSpace
+  }
+
+  @Test("A tone mapping setting the player's window observes, and a display's color space changing, each refresh its EDR mode without waiting for mpv, returning while its core is held, then the tone mapping options are set",
+        arguments: EDRRefreshTrigger.allCases)
+  func edrRefreshTriggersDoNotWait(_ trigger: EDRRefreshTrigger) async throws {
+    try await Self.withSettings([.enableToneMapping: true, .enableToneMappingTargetPeakOverride: false,
+                                 .enableToneMappingParamOverride: false]) {
+      try await Self.withPlayer { player, _ in
+        let mpv: MPVController = player.mpv
+        // The options the refresh sets are given other values first, so that the values it sets show it ran.
+        mpv.setString(MPVOption.GPURendererOptions.targetPeak, "100")
+        mpv.setString(MPVOption.GPURendererOptions.toneMapping, "clip")
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+          switch trigger {
+          case .toneMappingSetting:
+            Preference.set(true, for: .enableToneMappingParamOverride)
+          case .colorSpace:
+            NotificationCenter.default.post(name: NSScreen.colorSpaceDidChangeNotification, object: nil)
+          }
+        }
+        #expect(returnedWhileHeld, "Refreshing the EDR mode for \(trigger) waited for mpv on the main thread")
+        try await Self.waitUntil {
+          mpv.getString(MPVOption.GPURendererOptions.targetPeak) == "auto"
+            && mpv.getString(MPVOption.GPURendererOptions.toneMapping) == "auto"
+        }
+      }
+    }
+  }
+
   @Test("Refreshing a player's EDR mode for an SDR video with tone mapping disabled resets target-peak, tone-mapping and tone-mapping-param to the defaults the mpv option defaults answer in request order, the main thread going on while the defaults' queue is held, then the options have their defaults")
   func edrRefreshDefaultsDoNotWait() async throws {
     try await Self.withSettings([.enableToneMapping: false]) {
