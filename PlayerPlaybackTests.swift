@@ -3531,6 +3531,43 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A set or command a plugin asks of mpv that mpv.set or mpv.command refuses.
+  enum PluginMpvRefusal: String, CaseIterable, Sendable {
+    case setWithoutPermission, commandWithoutPermission, setUnsupportedValue
+  }
+
+  @Test("A plugin without the file system permission that sets a property or runs a command outside the safe ones, or that sets a value mpv.set does not take, is thrown an error and mpv is not asked",
+        arguments: PluginMpvRefusal.allCases)
+  func pluginMpvRequestRefused(_ refusal: PluginMpvRefusal) async throws {
+    try await Self.withPlayer { player, folder in
+      let mpv: MPVController = player.mpv
+      // The plugin is kept, since its instance holds it weakly and reads it when the instance is let go.
+      let plugin = try Self.makePlugin(in: folder, permissions: refusal == .setUnsupportedValue ? ["file-system"] : [])
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      // user-data is neither a safe option nor set by a safe command, so each request would set it if it were not refused.
+      let request: String
+      let message: String
+      switch refusal {
+      case .setWithoutPermission:
+        request = "iina.mpv.set('user-data/iinaTests', 'refused')"
+        message = "mpv.set: user-data/iinaTests needs the file system permission."
+      case .commandWithoutPermission:
+        request = "iina.mpv.command('set', ['user-data/iinaTests', 'refused'])"
+        message = "mpv.command: set needs the file system permission."
+      case .setUnsupportedValue:
+        request = "iina.mpv.set('user-data/iinaTests', undefined)"
+        message = "mpv.set only supports numbers, strings, booleans and objects."
+      }
+      let thrown = instance.js.evaluateScript("try { \(request); null } catch (error) { error.message }")
+      #expect(thrown?.toString() == message, "\(refusal) was not refused")
+      // mpv handles requests in the order they are made, so once a later set is applied a refused request was never made of mpv.
+      mpv.setDoubleAsync(MPVOption.PlaybackControl.speed, 1.25)
+      try await Self.waitUntil { mpv.getDouble(MPVOption.PlaybackControl.speed) == 1.25 }
+      #expect(mpv.getString("user-data/iinaTests") == nil, "mpv was asked for \(refusal)")
+    }
+  }
+
   @Test("A started file's date last opened is written off the main thread, the start returning while the queue writing it is held")
   func fileStartedWritesOffMain() async throws {
     try await Self.withPlayer { player, folder in
@@ -4273,8 +4310,12 @@ struct PlayerPlaybackTests {
         let subtitles = try Self.writeSubtitles(["b"], in: folder)
         player.loadExternalSubFile(subtitles[0])
         try await Self.waitUntil { player.info.sid != 0 }
+        // A change of the track list also stores the track selected, but tells the windows nothing of it, so the windows are told of
+        // the change once the player has stored the track mpv reported.
+        var told = false
+        player.observe(.iinaSIDChanged) { [unowned player] _ in told = told || player.info.sid == 0 }
         mpv.setStringAsync(MPVOption.TrackSelection.sid, "no")
-        try await Self.waitUntil { player.info.sid == 0 }
+        try await Self.waitUntil { player.info.sid == 0 && told }
       case .chapter:
         // The test files have no chapters. mpv makes a chapter of each part of an edit list, so the player plays a list of two files.
         // Their paths hold no separator of the list, so they are given as they are: a length-prefixed path holds a '%' that
