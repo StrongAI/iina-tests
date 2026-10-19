@@ -309,4 +309,115 @@ struct MPVAsyncRequestTests {
     try await waitForCodes(2)
     #expect(codes == [0, 0])
   }
+
+  /// A property `mpv` holds as an integer, a double, a flag, a string or a node, read by the synchronous reader for its type.
+  enum TypedRead: String, CaseIterable, Sendable {
+    case integer, double, flag, string, node
+
+    var name: String {
+      switch self {
+      case .integer: MPVOption.OSD.osdLevel
+      case .double, .node: MPVOption.PlaybackControl.speed
+      case .flag: MPVOption.PlaybackControl.pause
+      case .string: MPVOption.Window.title
+      }
+    }
+
+    /// The `index`th value, as a raw command string writes it and as the read describes it. The second value is not the property's
+    /// value on a started core, so that only a read made after the second command string reads it.
+    func value(_ index: Int) -> String {
+      switch self {
+      case .integer: String(index)
+      case .double, .node: String(1 + Double(index) / 4)
+      case .flag: index % 2 == 0 ? "yes" : "no"
+      case .string: "iinaTests-\(index)"
+      }
+    }
+
+    /// What a read that reaches no `mpv` answers, described.
+    var unread: String? {
+      switch self {
+      case .integer: "0"
+      case .double: "0.0"
+      case .flag: "no"
+      case .string, .node: nil
+      }
+    }
+
+    /// Read the property with the synchronous reader for its type, waiting for `mpv`, and describe the value.
+    func read(on mpv: MPVController) -> String? {
+      switch self {
+      case .integer: String(mpv.getInt(name))
+      case .double: String(mpv.getDouble(name))
+      case .flag: mpv.getFlag(name) ? "yes" : "no"
+      case .string: mpv.getString(name)
+      case .node: mpv.getNode(name).map { String(describing: $0) }
+      }
+    }
+  }
+
+  @Test("An integer, double, flag, string or node property read before mpv is initialized reads as a failed read reads, asking no mpv",
+        arguments: TypedRead.allCases)
+  func typedReadBeforeInitialized(_ property: TypedRead) {
+    let player = Self.unstartedPlayer()
+    #expect(property.read(on: player.mpv) == property.unread)
+  }
+
+  @Test("An integer, double, flag, string or node property read while raw command strings are in flight is read by mpv after them",
+        arguments: TypedRead.allCases)
+  func typedReadHeldBehindRawCommands(_ property: TypedRead) async throws {
+    let player = Self.startedPlayer()
+    let mpv: MPVController = player.mpv
+    let hold = try MPVCoreHold(mpv, limit: Self.holdLimit)
+    // As in typedSetHeldBehindRawCommands, the second command string waits behind queue work the test lets go, so that a read made at
+    // once reaches mpv before the second command string and reads the value of the first.
+    var codes: [Int32] = []
+    let queueHold = DispatchSemaphore(value: 0)
+    mpv.command(rawString: "set \(property.name) \(property.value(1))") { codes.append($0) }
+    mpv.inRequestOrder { queueHold.wait() }
+    mpv.command(rawString: "set \(property.name) \(property.value(2))") { codes.append($0) }
+    // The read waits for mpv, so it is made off the main thread, on which the command strings are answered.
+    let read = OffMainRead(property, of: mpv)
+    hold.release()
+    func waitUntil(_ condition: () -> Bool) async throws {
+      let deadline = ContinuousClock.now + Self.faultTimeout
+      while !condition() && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+      }
+    }
+    // mpv has handled the first command string, and a read made at once with it, before the queue is let go.
+    try await waitUntil { codes.count == 1 }
+    let heldWhileQueued = !read.done
+    queueHold.signal()
+    try await waitUntil { read.done }
+    #expect(heldWhileQueued, "A read made while command strings were in flight was not held behind them")
+    #expect(read.value == property.value(2))
+    try await waitUntil { codes.count == 2 }
+    #expect(codes == [0, 0])
+  }
+}
+
+/// A synchronous read a test makes on a global queue, since it waits for `mpv`. `@unchecked Sendable` because the controller is
+/// read only by that queue's work, and the answer is read and written only under `lock`.
+private final class OffMainRead: @unchecked Sendable {
+  private let lock = NSLock()
+  private let property: MPVAsyncRequestTests.TypedRead
+  private let mpv: MPVController
+  private var answer: (done: Bool, value: String?) = (false, nil)
+
+  /// Whether the read has returned.
+  var done: Bool { lock.withLock { answer.done } }
+
+  /// What the read answered, described, once it has returned.
+  var value: String? { lock.withLock { answer.value } }
+
+  /// Read `property` of `mpv` on a global queue.
+  init(_ property: MPVAsyncRequestTests.TypedRead, of mpv: MPVController) {
+    self.property = property
+    self.mpv = mpv
+    DispatchQueue.global().async { [self] in
+      let value = self.property.read(on: self.mpv)
+      lock.withLock { answer = (true, value) }
+    }
+  }
 }

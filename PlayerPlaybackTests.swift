@@ -2495,6 +2495,36 @@ struct PlayerPlaybackTests {
     try await Self.waitUntil { destroyed.wait(timeout: .now()) == .success }
   }
 
+  @Test("Properties read on the queue mpv's events are read on, after the main thread has set the player's mpv handle to nil and before the queue destroys the handle, read as a failed read reads instead of handing mpv no handle")
+  func eventQueueReadsAfterHandleCleared() async throws {
+    // A player with no window, whose video is never initialized, so that nothing but the test clears and destroys its handle.
+    let player = PlayerCore()
+    player.label = "iinaTests-playback-\(Self.playerCount)"
+    Self.playerCount += 1
+    var initialized = false
+    let listener = player.events.addListener(EventRecorder { _ in initialized = true }, for: .mpvInitialized)
+    defer { player.events.removeListener(listener, for: .mpvInitialized) }
+    player.startMPV()
+    try await Self.waitUntil { initialized }
+    player.info.state = .shuttingDown
+    player.mpv.mpvQuit()
+    // The events' queue reads a video reconfiguration, as mpv's event has it read, and a string, a double and a node once the handle
+    // is cleared and before its destruction, queued behind the reads. Reads made so for events in runs 43244, 43257 and 43264 handed
+    // mpv no handle and crashed the test host.
+    let reads = EventQueueReads(player)
+    player.mpv.mpvDestroy()
+    reads.start()
+    try await Self.waitUntil { reads.made != nil }
+    let made = try #require(reads.made)
+    #expect(made.reconfig.dwidth == 0 && made.reconfig.dheight == 0 && made.reconfig.videoParamsRotation == 0
+            && made.reconfig.rotation == 0 && !made.reconfig.coreIdle)
+    #expect(made.path == nil && made.position == 0 && made.tracks == nil)
+    // Work queued on the events' queue after the handle's destruction runs once the handle is destroyed.
+    let destroyed = DispatchSemaphore(value: 0)
+    player.mpv.queue.async { destroyed.signal() }
+    try await Self.waitUntil { destroyed.wait(timeout: .now()) == .success }
+  }
+
   @Test("A player window whose video was uninitialized as its player shut down reaches no mpv handle when the window changes screen")
   func screenChangeAfterShutdownReachesNoMPV() async throws {
     var shutDownPlayer: PlayerCore?
@@ -7922,6 +7952,38 @@ private final class EventRecorder: EventCallable {
 
   func call(withArguments args: [Any]) {
     MainActor.assumeIsolated { block(args) }
+  }
+}
+
+/// Properties a test reads on the queue for reading a player's `mpv` events, as an event has them read, once the test starts them.
+/// `@unchecked Sendable` because the player is read only by that queue's work, and the reads are read and written only under `lock`.
+private final class EventQueueReads: @unchecked Sendable {
+  typealias Reads = (reconfig: PlayerCore.VideoReconfig, path: String?, position: Double, tracks: Any?)
+
+  private let lock = NSLock()
+  private let player: PlayerCore
+  private let started = DispatchSemaphore(value: 0)
+  private var reads: Reads?
+
+  /// What the reads answered, once they have returned.
+  var made: Reads? { lock.withLock { reads } }
+
+  /// Queue the reads on the queue for reading `player`'s `mpv` events, where they wait until `start()` is called: a video
+  /// reconfiguration, the path, the position and the track list.
+  init(_ player: PlayerCore) {
+    self.player = player
+    player.mpv.queue.async { [self] in
+      started.wait()
+      let mpv: MPVController = self.player.mpv
+      let answered = (self.player.readVideoReconfig(), mpv.getString(MPVProperty.path), mpv.getDouble(MPVProperty.timePos),
+                      mpv.getNode(MPVProperty.trackList))
+      lock.withLock { reads = answered }
+    }
+  }
+
+  /// Let the reads run.
+  func start() {
+    started.signal()
   }
 }
 
