@@ -1095,6 +1095,35 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("The playlist pane's delete, remove button and context menu remove, and a plugin's remove of an entry, return before mpv removes the entry, mpv removing it before the playlist is read again")
+  func playlistRemovalsDoNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
+      let pane = Self.kept(SidebarPlaylistPane(player: player))
+      let plugin = try Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let removals: [(name: String, remove: () -> Void)] = [
+        ("the pane's delete", { pane.delete(NSMenuItem()) }),
+        ("the pane's remove button", { pane.removeBtnAction(NSButton()) }),
+        ("the pane's context menu remove", { pane.contextMenuRemove(NSMenuItem()) }),
+        ("a plugin removing an entry", { _ = instance.js.evaluateScript("iina.playlist.remove(3)") }),
+      ]
+      for (name, remove) in removals {
+        // The entry removed is one appended for it, not the one playing, selected in the table and as the context menu targets it.
+        player.appendToPlaylist(path("d"))
+        await Self.readPlaylist(of: player)
+        pane.tableView.reloadData()
+        pane.tableView.selectRowIndexes(IndexSet([3]), byExtendingSelection: false)
+        pane.selectedRows = IndexSet([3])
+        let returnedWhileHeld = try await Self.returnsWhileHeld(player, remove)
+        #expect(returnedWhileHeld, "Removing an entry with \(name) waited for mpv")
+        await Self.readPlaylist(of: player)
+        #expect(player.info.playlist.map(\.filename) == ["a", "b", "c"].map(path), "After removing an entry with \(name)")
+      }
+    }
+  }
+
   @Test("A drag of a folder is answered from its name, without the main thread reading the folder")
   func dragAnsweredByName() async throws {
     try await Self.withPlayer { player, folder in
