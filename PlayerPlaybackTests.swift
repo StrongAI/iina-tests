@@ -4971,6 +4971,23 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("Lowering the most the volume may be below a player's volume, as its window observes the setting, lowers the volume without waiting for mpv, returning while its core is held, then mpv has set the volume to the new most")
+  func maxVolumeLoweringDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let mpv: MPVController = player.mpv
+      mpv.setDouble(MPVOption.Audio.volume, 80)
+      try await Self.waitUntil { player.info.volume == 80 }
+      // The window's observer is called as the setting's change calls it, the most the volume may be falling below the volume.
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        player.mainWindow.observeValue(forKeyPath: Preference.Key.maxVolume.rawValue, of: UserDefaults.standard,
+                                       change: [.newKey: 50], context: nil)
+      }
+      #expect(returnedWhileHeld, "Lowering the most the volume may be below the player's volume waited for mpv on the main thread")
+      try await Self.waitUntil { mpv.getDouble(MPVOption.Audio.volume) == 50 }
+      #expect(player.mainWindow.volumeSlider.maxValue == 50)
+    }
+  }
+
   @Test("Refreshing a player's EDR mode for an SDR video with tone mapping disabled resets target-peak, tone-mapping and tone-mapping-param to the defaults the mpv option defaults answer in request order, the main thread going on while the defaults' queue is held, then the options have their defaults")
   func edrRefreshDefaultsDoNotWait() async throws {
     try await Self.withSettings([.enableToneMapping: false]) {
