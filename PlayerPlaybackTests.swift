@@ -2970,13 +2970,13 @@ struct PlayerPlaybackTests {
         expected = [.open(link)]
       }
     case .titlebarShowFolder:
-      // Each item of the menu of the path of the file shown in the title shows the folder it names in Finder.
+      // Choosing a folder in the menu of the path of the file shown in the title shows the next item of the path, selected, in Finder.
       let player = try #require(player)
       let titlebar = kept(Titlebar(mainWindow: player.mainWindow))
       let item = NSMenuItem()
       item.representedObject = folder
       ask = { _ = NSApp.sendAction(NSSelectorFromString("revealInFinder:"), to: titlebar, from: item) }
-      expected = [.showFolderInFinder(folder.path)]
+      expected = [.revealInFinder([folder])]
     }
     defer { cleanUp() }
     let (returnedWhileHeld, made) = await workspaceRequestsWhileHeld(ask)
@@ -5167,7 +5167,7 @@ struct PlayerPlaybackTests {
   enum UtilitiesClear: String, CaseIterable, Sendable {
     case watchLater, history, thumbnailCache
 
-    /// The folder, or for the history the file, that clearing removes.
+    /// The folder clearing empties, or for the history the file clearing writes empty.
     var url: URL {
       switch self {
       case .watchLater: return Utility.watchLaterURL
@@ -5177,10 +5177,16 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("A utilities settings page clears the saved playback progress, the playback history or the thumbnail cache on the file removal queue, returning while the queue is held, then shows it cleared", arguments: KeyBindingConfigPage.allCases, UtilitiesClear.allCases)
+  @Test("A utilities settings page clears the saved playback progress or the thumbnail cache on the file removal queue and the playback history on the history queue, returning while the queue is held, then shows it cleared", arguments: KeyBindingConfigPage.allCases, UtilitiesClear.allCases)
   func utilitiesClearDoesNotWait(_ page: KeyBindingConfigPage, _ clear: UtilitiesClear) async throws {
     let fm = FileManager.default
     let url = clear.url
+    // Clearing the history empties the history the shared history controller holds, which is put back once the test is done. The
+    // controller reads the account's history file first.
+    _ = HistoryController.shared
+    await QueueHold.reached(HistoryController.queue, limit: Self.holdLimit).release()
+    let history = HistoryController.shared.history
+    defer { HistoryController.shared.history = history }
     // What the account holds there is set aside while the test clears its own, and put back once the test is done.
     let aside = url.deletingLastPathComponent().appendingPathComponent("\(url.lastPathComponent).iinaTests-\(UUID().uuidString)")
     let setAside = (try? fm.moveItem(at: url, to: aside)) != nil
@@ -5189,11 +5195,20 @@ struct PlayerPlaybackTests {
       if setAside { try? fm.moveItem(at: aside, to: url) }
       if clear != .history { Utility.createDirIfNotExist(url: url) }
     }
-    // A file that clearing removes.
+    // A file that clearing removes, or for the history a file holding no history, which clearing writes empty.
     let marker = clear == .history ? url : url.appendingPathComponent("iinaTests-\(UUID().uuidString)")
     if clear != .history { try fm.createDirectory(at: url, withIntermediateDirectories: true) }
     try Data([1]).write(to: marker)
-    try await Self.restoringSettings([Preference.Key.iinaLastPlayedFilePath.rawValue]) {
+    // Whether what clearing changes is cleared: the history file holds no entry, and anything else's marker is removed.
+    func cleared() -> Bool {
+      guard clear == .history else { return !fm.fileExists(atPath: marker.path) }
+      guard let data = try? Data(contentsOf: url),
+            let object = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, PlaybackHistory.self], from: data)
+      else { return false }
+      return (object as? [PlaybackHistory])?.isEmpty == true
+    }
+    try await Self.restoringSettings([Preference.Key.iinaLastPlayedFilePath.rawValue,
+                                      Preference.Key.iinaLastPlayedFilePosition.rawValue]) {
       let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.titled], backing: .buffered,
                             defer: false)
       Self.keptObjects.append(window)
@@ -5232,16 +5247,22 @@ struct PlayerPlaybackTests {
           shown = { true }
         }
       }
-      let hold = await QueueHold.reached(Utility.removalQueue, limit: Self.holdLimit)
+      Preference.set(marker, for: .iinaLastPlayedFilePath)
+      Preference.set(4.0, for: .iinaLastPlayedFilePosition)
+      let hold = await QueueHold.reached(clear == .history ? HistoryController.queue : Utility.removalQueue, limit: Self.holdLimit)
       ask()
       try await Self.answerSheet(of: window, with: .alertFirstButtonReturn)
       await Self.drainMain()
-      let clearedWhileHeld = hold.limitPassed || !fm.fileExists(atPath: marker.path)
+      let clearedWhileHeld = hold.limitPassed || cleared()
       hold.release()
       #expect(!clearedWhileHeld, "The \(page) utilities page cleared the \(clear) on the main thread")
-      try await Self.waitUntil { !fm.fileExists(atPath: marker.path) }
+      try await Self.waitUntil { cleared() }
       try await Self.waitUntil { shown() }
-      if clear != .history {
+      if clear == .history {
+        // Clearing the history forgets the last played file.
+        #expect(Preference.url(for: .iinaLastPlayedFilePath) == nil)
+        #expect(Preference.double(for: .iinaLastPlayedFilePosition) == 0)
+      } else {
         #expect(fm.fileExists(atPath: url.path))
       }
       if let sheet = window.attachedSheet { window.endSheet(sheet) }
