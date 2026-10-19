@@ -4977,16 +4977,27 @@ struct PlayerPlaybackTests {
         arguments: EDRRefreshTrigger.allCases)
   func edrRefreshTriggersDoNotWait(_ trigger: EDRRefreshTrigger) async throws {
     // The setting the test changes is put back as it was stored, and cleared first, so that setting it is a change whatever was stored.
+    // It is kept out of the argument domain, whose value would hide the stored one the test sets.
     let changed = Preference.Key.enableToneMappingParamOverride.rawValue
     try await Self.restoringSettings([changed]) {
       UserDefaults.standard.removeObject(forKey: changed)
-      try await Self.withSettings([.enableToneMapping: true, .enableToneMappingTargetPeakOverride: false,
-                                   .enableToneMappingParamOverride: false]) {
+      try await Self.withSettings([.enableToneMapping: true, .enableToneMappingTargetPeakOverride: false]) {
         try await Self.withPlayer { player, _ in
           let mpv: MPVController = player.mpv
-          // The options the refresh sets are given other values first, so that the values it sets show it ran.
-          mpv.setString(MPVOption.GPURendererOptions.targetPeak, "100")
-          mpv.setString(MPVOption.GPURendererOptions.toneMapping, "clip")
+          // The refreshes opening the file asked for finish first: a read asked after their reads is answered after them, and the
+          // main thread asks for their options before the work queued after that answer.
+          var answered = false
+          mpv.getNodesAsync([MPVOption.Window.title]) { _ in answered = true }
+          try await Self.waitUntil { answered }
+          await Self.drainMain()
+          // The options the refresh sets are given other values first, so that the values it sets show it ran. They are set without
+          // waiting, so that mpv sets them after the options those refreshes asked for, which a set that waits could overtake.
+          mpv.setStringAsync(MPVOption.GPURendererOptions.targetPeak, "100")
+          mpv.setStringAsync(MPVOption.GPURendererOptions.toneMapping, "clip")
+          try await Self.waitUntil {
+            mpv.getString(MPVOption.GPURendererOptions.targetPeak) == "100"
+              && mpv.getString(MPVOption.GPURendererOptions.toneMapping) == "clip"
+          }
           let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
             switch trigger {
             case .toneMappingSetting:
