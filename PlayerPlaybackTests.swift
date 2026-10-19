@@ -1404,37 +1404,24 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("The position sync the JavaScript status waits on stores the position mpv answers while the time is not kept up to date, and asks nothing while it is")
-  func positionSyncWaiting() async throws {
-    try await Self.withPlayer { player, _ in
-      player.seek(percent: 50, forceExact: true)
-      try await Self.waitForPosition(2, of: player)
-      let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { _ in }
-      player.syncUITimer = timer
-      // A position mpv does not hold shows whether the sync stores what mpv answers.
-      player.info.videoPosition = VideoTime(0)
-      player.syncPositionIfNeededWaiting()
-      #expect(player.info.videoPosition?.second == 0)
-      timer.invalidate()
-      player.syncPositionIfNeededWaiting()
-      #expect(abs((player.info.videoPosition?.second ?? 0) - 2) < 0.11)
-    }
-  }
-
-  @Test("The waiting position sync asks nothing of mpv for a player no longer active")
-  func positionSyncWaitingInactive() async throws {
+  @Test("The position sync asks nothing of mpv for a player no longer active, completing at once")
+  func positionSyncInactive() async throws {
     try await Self.withPlayer { player, _ in
       player.mainWindow.close()
       try await Self.waitUntil { player.info.state == .idle }
       player.syncUITimer?.invalidate()
       player.info.videoPosition = VideoTime(1)
-      player.syncPositionIfNeededWaiting()
+      var synced = false
+      let waiting = player.mpv.replyCallbacks.count
+      player.syncPositionIfNeeded { synced = true }
+      #expect(synced)
+      #expect(player.mpv.replyCallbacks.count == waiting)
       #expect(player.info.videoPosition?.second == 1)
     }
   }
 
-  @Test("For a stream read over the network the waiting position sync also stores the duration mpv answers")
-  func positionSyncWaitingNetwork() async throws {
+  @Test("For a stream read over the network the position sync also stores the duration mpv answers")
+  func positionSyncNetwork() async throws {
     try await Self.withPlayer { player, folder in
       let server = try await LocalStreamServer(serving: folder.appendingPathComponent("a.mp4"))
       defer { server.stop() }
@@ -1447,7 +1434,9 @@ struct PlayerPlaybackTests {
       try await Self.waitUntil { player.mpv.getFlag(MPVProperty.demuxerCacheIdle) }
       player.syncUITimer?.invalidate()
       player.info.videoDuration = VideoTime(-1)
-      player.syncPositionIfNeededWaiting()
+      var synced = false
+      player.syncPositionIfNeeded { synced = true }
+      try await Self.waitUntil { synced }
       #expect(player.info.videoDuration?.second == player.mpv.getDouble(MPVProperty.duration))
     }
   }
@@ -3862,7 +3851,7 @@ struct PlayerPlaybackTests {
     }
   }
 
-  @Test("A plugin's status position and duration are answered at once, the position being the one mpv holds while the time is not kept up to date")
+  @Test("A plugin's status position and duration are promises returned while mpv's core is held, settled with the position mpv holds while the time is not kept up to date")
   func statusPositionAndDuration() async throws {
     try await Self.withPlayer { player, folder in
       player.seek(percent: 50, forceExact: true)
@@ -3870,13 +3859,46 @@ struct PlayerPlaybackTests {
       player.syncUITimer?.invalidate()
       let plugin = try Self.makePlugin(in: folder)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
-      // A position mpv does not hold shows whether the getter answers with the position mpv holds.
+      // A position mpv does not hold shows whether the getter settles with the position mpv holds.
       player.info.videoPosition = VideoTime(0)
-      let position = try #require(instance.js.evaluateScript("iina.core.status.position")).toDouble()
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        instance.js.evaluateScript("""
+          globalThis.status = {};
+          iina.core.status.position.then(value => { status.position = value; });
+          iina.core.status.duration.then(value => { status.duration = value; });
+          """)
+      }
+      #expect(returnedWhileHeld, "A plugin's status position or duration waited for mpv")
+      try await Self.waitUntil { instance.js.evaluateScript("status.duration !== undefined")?.toBool() == true }
+      let position = try #require(instance.js.evaluateScript("status.position")).toDouble()
       #expect(abs(position - 2) < 0.11)
       #expect(player.info.videoPosition?.second == position)
-      let duration = try #require(instance.js.evaluateScript("iina.core.status.duration")).toDouble()
-      #expect(duration == player.info.videoDuration?.second)
+      #expect(instance.js.evaluateScript("status.duration")?.toDouble() == player.info.videoDuration?.second)
+    }
+  }
+
+  @Test("Each getter of a plugin's mpv API returns a promise while mpv's core is held, settled with the value mpv answers")
+  func mpvGettersDoNotWait() async throws {
+    try await Self.withPlayer { player, folder in
+      player.syncUITimer?.invalidate()
+      let plugin = try Self.makePlugin(in: folder)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+        instance.js.evaluateScript("""
+          globalThis.answers = {};
+          iina.mpv.getFlag("pause").then(value => { answers.flag = value; });
+          iina.mpv.getNumber("volume").then(value => { answers.number = value; });
+          iina.mpv.getString("filename").then(value => { answers.string = value; });
+          iina.mpv.getNative("track-list").then(value => { answers.native = value; });
+          """)
+      }
+      #expect(returnedWhileHeld, "A getter of a plugin's mpv API waited for mpv")
+      try await Self.waitUntil { instance.js.evaluateScript("answers.native !== undefined")?.toBool() == true }
+      #expect(instance.js.evaluateScript("answers.flag")?.toBool() == player.mpv.getFlag("pause"))
+      #expect(instance.js.evaluateScript("answers.number")?.toDouble() == player.mpv.getDouble("volume"))
+      #expect(instance.js.evaluateScript("answers.string")?.toString() == player.mpv.getString("filename"))
+      let tracks = try #require(player.mpv.getNode("track-list") as? [Any])
+      #expect(instance.js.evaluateScript("answers.native.length")?.toInt32() == Int32(tracks.count))
     }
   }
 
