@@ -4976,25 +4976,30 @@ struct PlayerPlaybackTests {
   @Test("A tone mapping setting the player's window observes, and a display's color space changing, each refresh its EDR mode without waiting for mpv, returning while its core is held, then the tone mapping options are set",
         arguments: EDRRefreshTrigger.allCases)
   func edrRefreshTriggersDoNotWait(_ trigger: EDRRefreshTrigger) async throws {
-    try await Self.withSettings([.enableToneMapping: true, .enableToneMappingTargetPeakOverride: false,
-                                 .enableToneMappingParamOverride: false]) {
-      try await Self.withPlayer { player, _ in
-        let mpv: MPVController = player.mpv
-        // The options the refresh sets are given other values first, so that the values it sets show it ran.
-        mpv.setString(MPVOption.GPURendererOptions.targetPeak, "100")
-        mpv.setString(MPVOption.GPURendererOptions.toneMapping, "clip")
-        let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
-          switch trigger {
-          case .toneMappingSetting:
-            Preference.set(true, for: .enableToneMappingParamOverride)
-          case .colorSpace:
-            NotificationCenter.default.post(name: NSScreen.colorSpaceDidChangeNotification, object: nil)
+    // The setting the test changes is put back as it was stored, and cleared first, so that setting it is a change whatever was stored.
+    let changed = Preference.Key.enableToneMappingParamOverride.rawValue
+    try await Self.restoringSettings([changed]) {
+      UserDefaults.standard.removeObject(forKey: changed)
+      try await Self.withSettings([.enableToneMapping: true, .enableToneMappingTargetPeakOverride: false,
+                                   .enableToneMappingParamOverride: false]) {
+        try await Self.withPlayer { player, _ in
+          let mpv: MPVController = player.mpv
+          // The options the refresh sets are given other values first, so that the values it sets show it ran.
+          mpv.setString(MPVOption.GPURendererOptions.targetPeak, "100")
+          mpv.setString(MPVOption.GPURendererOptions.toneMapping, "clip")
+          let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
+            switch trigger {
+            case .toneMappingSetting:
+              Preference.set(true, for: .enableToneMappingParamOverride)
+            case .colorSpace:
+              NotificationCenter.default.post(name: NSScreen.colorSpaceDidChangeNotification, object: nil)
+            }
           }
-        }
-        #expect(returnedWhileHeld, "Refreshing the EDR mode for \(trigger) waited for mpv on the main thread")
-        try await Self.waitUntil {
-          mpv.getString(MPVOption.GPURendererOptions.targetPeak) == "auto"
-            && mpv.getString(MPVOption.GPURendererOptions.toneMapping) == "auto"
+          #expect(returnedWhileHeld, "Refreshing the EDR mode for \(trigger) waited for mpv on the main thread")
+          try await Self.waitUntil {
+            mpv.getString(MPVOption.GPURendererOptions.targetPeak) == "auto"
+              && mpv.getString(MPVOption.GPURendererOptions.toneMapping) == "auto"
+          }
         }
       }
     }
