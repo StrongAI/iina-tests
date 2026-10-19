@@ -24,6 +24,9 @@ struct MPVAsyncRequestTests {
   /// Fault threshold for a hold on a core that the test releases itself, not an estimate of how long the hold lasts.
   private static let holdLimit: DispatchTimeInterval = .seconds(30)
 
+  /// Fault threshold for a wait on mpv's answers, not an estimate of how long they take.
+  private static let faultTimeout: Duration = .seconds(30)
+
   /// A player whose `mpv` core was never started.
   private static func unstartedPlayer() -> PlayerCore {
     let player = PlayerCore()
@@ -278,23 +281,32 @@ struct MPVAsyncRequestTests {
   func typedSetHeldBehindRawCommands(_ property: TypedProperty) async throws {
     let player = Self.startedPlayer()
     let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
-    // The first command string waits for the core on the queue command strings are run on, and the second waits behind it there.
+    // The first command string waits for the core on the queue command strings are run on, work queued after it there waits until it
+    // is let go, and the second command string waits behind that work, so that mpv is asked the second only once the test lets the
+    // queue go. A set sent at once would reach mpv before the second command string and be undone by it.
     var codes: [Int32] = []
-    for index in 1...2 {
-      player.mpv.command(rawString: "set \(property.name) \(property.value(index))") { codes.append($0) }
-    }
+    let queueHold = DispatchSemaphore(value: 0)
+    player.mpv.command(rawString: "set \(property.name) \(property.value(1))") { codes.append($0) }
+    player.mpv.inRequestOrder { queueHold.wait() }
+    player.mpv.command(rawString: "set \(property.name) \(property.value(2))") { codes.append($0) }
     property.set(3, on: player.mpv)
     let returnedWhileHeld = !hold.hasLetGo
     hold.release()
     #expect(returnedWhileHeld, "Setting a property while command strings were in flight waited for mpv")
+    // The command strings are answered on the main thread, which this test runs on.
+    func waitForCodes(_ count: Int) async throws {
+      let deadline = ContinuousClock.now + Self.faultTimeout
+      while codes.count < count && ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+      }
+    }
+    // mpv has handled the first command string, and a set sent at once with it, before the queue is let go.
+    try await waitForCodes(1)
+    queueHold.signal()
     // A read asked now is held behind the command strings and the set as well, so it is answered after them.
     let read = await Self.described(property.name, of: player)
     #expect(read.value == property.value(3))
-    // The command strings are answered on the main thread, which this test runs on.
-    let deadline = ContinuousClock.now + .seconds(30)
-    while codes.count < 2 && ContinuousClock.now < deadline {
-      try await Task.sleep(for: .milliseconds(20))
-    }
+    try await waitForCodes(2)
     #expect(codes == [0, 0])
   }
 }

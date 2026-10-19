@@ -4157,7 +4157,8 @@ struct PlayerPlaybackTests {
         // The inspector shows the path while the player is active, so that clearing what it read shows in its row.
         var inspector: InspectorWindowController?
         defer { inspector?.close() }
-        func watchedRow() -> String? {
+        // A closure rather than a local function, so that it is isolated to the main actor the test runs on.
+        let watchedRow = { () -> String? in
           guard let table = inspector?.watchTableView else { return nil }
           let cell = table.view(atColumn: table.column(withIdentifier: .value), row: 0, makeIfNecessary: true) as? NSTableCellView
           return cell?.textField?.stringValue
@@ -4276,8 +4277,10 @@ struct PlayerPlaybackTests {
         try await Self.waitUntil { player.info.sid == 0 }
       case .chapter:
         // The test files have no chapters. mpv makes a chapter of each part of an edit list, so the player plays a list of two files.
+        // Their paths hold no separator of the list, so they are given as they are: a length-prefixed path holds a '%' that
+        // PlayerCore.fileStarted cannot make a URL of (bug://iina/player/file/start/url/unwrap).
         let parts = ["a", "c"].map { folder.appendingPathComponent("\($0).mp4").path }
-        let list = "edl://" + parts.map { "%\($0.utf8.count)%\($0)" }.joined(separator: ";")
+        let list = "edl://" + parts.joined(separator: ";")
         mpv.asyncCommand(.loadfile, args: [list], replyUserdata: 0)
         try await Self.waitUntil { player.info.state.loaded && player.info.chapters.count == 2 }
         mpv.setIntAsync(MPVProperty.chapter, 1)
