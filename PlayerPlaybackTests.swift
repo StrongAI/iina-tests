@@ -634,6 +634,20 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A loaded file's A-B loop points are read from mpv when mpv reports it loaded, a point mpv holds as not set reading as zero")
+  func loadedFileLoopReadFromMpv() async throws {
+    try await Self.withPlayer { player, _ in
+      #expect(player.mpv.getString(MPVOption.PlaybackControl.abLoopA) == "no")
+      #expect(player.mpv.getString(MPVOption.PlaybackControl.abLoopB) == "no")
+      // Loop points cached on the main thread that mpv does not hold show that the read asks mpv instead of passing them on.
+      player.info.abLoopA = 1
+      player.info.abLoopB = 2
+      let read = Self.readLoadedFile(of: player)
+      #expect(read.abLoopA == 0)
+      #expect(read.abLoopB == 0)
+    }
+  }
+
   /// `read` with the window floating on top, which mpv does not hold.
   private static func onTop(_ read: PlayerCore.LoadedFile) -> PlayerCore.LoadedFile {
     PlayerCore.LoadedFile(width: read.width, height: read.height, duration: read.duration, position: read.position,
