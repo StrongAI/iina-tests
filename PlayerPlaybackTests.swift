@@ -5100,6 +5100,30 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A player's video layer asked on the main thread whether it can draw answers no without the view's uninit lock or mpv's renderer, returning while the lock is held for writing, then the layer draws on its queue")
+  func layerCanDrawDoesNotWait() async throws {
+    try await Self.withPlayer { player, _ in
+      let view = player.mainWindow.videoView
+      let layer = view.videoLayer
+      let context = try #require(layer.cglContext)
+      let pixelFormat = try #require(CGLGetPixelFormat(context))
+      // Uninitializing the view holds its uninit lock for writing, which a read of the lock on the main thread would wait for.
+      let hold = await WriteLockHold.reached(view.$isUninited, limit: Self.holdLimit)
+      let canDraw = layer.canDraw(inCGLContext: context, pixelFormat: pixelFormat, forLayerTime: 0, displayTime: nil)
+      let returnedWhileHeld = !hold.limitPassed
+      hold.release()
+      #expect(returnedWhileHeld, "Asking the video layer on the main thread whether it can draw waited for the view's uninit lock")
+      #expect(!canDraw, "The video layer drew on the main thread")
+      // A snapshot is taken from the next frame the layer's queue draws, which it draws only once its own canDraw answers yes.
+      let captured = Box<Bool>()
+      Task { @MainActor in
+        _ = await layer.captureSnapshot()
+        captured.value = true
+      }
+      try await Self.waitUntil { captured.value == true }
+    }
+  }
+
   @Test("Initializing a player's video creates mpv's renderer with its video layer's OpenGL context and sets force-window once the renderer exists, without waiting for mpv, returning while mpv's core is held, then the renderer exists and force-window is set")
   func videoInitDoesNotWait() async throws {
     let player = PlayerCore()
