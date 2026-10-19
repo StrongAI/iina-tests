@@ -4142,6 +4142,274 @@ struct PlayerPlaybackTests {
     }
   }
 
+  /// A change `mpv` reports, or the inspector's read of the watched properties, once the player is no longer active.
+  enum InactiveReport: String, CaseIterable, Sendable {
+    case audioTrack, subtitleTrack, chapter, ontop, fullscreen, windowScale, fileStarted, mediaTitle, metadata, watchedProperties
+  }
+
+  @Test("A change mpv reports once the player is no longer active, and the inspector's read of the watched properties then, leave the player and its window as they were and ask nothing of mpv",
+        arguments: InactiveReport.allCases)
+  func reportWhenInactive(_ report: InactiveReport) async throws {
+    // Legacy full screen is entered in the window itself, so a full screen change that is not ignored shows in the window at once.
+    try await Self.withSettings([.useLegacyFullScreen: true]) {
+      try await Self.withPlayer { player, folder in
+        let window: MainWindowController = player.mainWindow
+        // The inspector shows the path while the player is active, so that clearing what it read shows in its row.
+        var inspector: InspectorWindowController?
+        defer { inspector?.close() }
+        func watchedRow() -> String? {
+          guard let table = inspector?.watchTableView else { return nil }
+          let cell = table.view(atColumn: table.column(withIdentifier: .value), row: 0, makeIfNecessary: true) as? NSTableCellView
+          return cell?.textField?.stringValue
+        }
+        if report == .watchedProperties {
+          PlayerCore.lastActive = player
+          let shown = InspectorWindowController()
+          Self.keptObjects.append(shown)
+          shown.showWindow(nil)
+          inspector = shown
+          let watched = try #require(player.mpv.getString(MPVProperty.path))
+          shown.watchProperties = [MPVProperty.path]
+          shown.watchTableView.reloadData()
+          shown.dynamicUpdate()
+          try await Self.waitUntil { watchedRow() == watched }
+        }
+        window.close()
+        try await Self.waitUntil { player.info.state == .idle }
+        await Self.drainMain()
+        var notified = false
+        for name: Notification.Name in [.iinaAIDChanged, .iinaSIDChanged, .iinaChapterListChanged, .iinaMediaTitleChanged] {
+          player.observe(name) { _ in notified = true }
+        }
+        switch report {
+        case .audioTrack:
+          let aid = player.info.aid
+          player.aidChanged(7)
+          await Self.drainMain()
+          #expect(player.info.aid == aid)
+        case .subtitleTrack:
+          let sid = player.info.sid
+          player.sidChanged(7)
+          await Self.drainMain()
+          #expect(player.info.sid == sid)
+        case .chapter:
+          let chapter = player.info.chapter
+          player.chapterChanged(7)
+          await Self.drainMain()
+          #expect(player.info.chapter == chapter)
+        case .ontop:
+          player.ontopChanged(true)
+          await Self.drainMain()
+          #expect(!window.isOntop)
+        case .fullscreen:
+          player.fullscreenChanged(true)
+          await Self.drainMain()
+          #expect(window.fsState == .windowed)
+        case .windowScale:
+          let frame = window.window?.frame
+          player.windowScaleChanged(player.info.cachedWindowScale * 2)
+          await Self.drainMain()
+          #expect(window.window?.frame == frame)
+        case .fileStarted:
+          let url = player.info.currentURL
+          let other = folder.appendingPathComponent("a.mp4").path
+          let name = "com.apple.lastuseddate#PS"
+          removexattr(other, name, 0)
+          player.fileStarted(path: other)
+          // A date last opened is written on the player's background queue, so this runs after any write the start asked for.
+          await withCheckedContinuation { continuation in player.backgroundQueue.async { continuation.resume() } }
+          #expect(player.info.currentURL == url)
+          #expect(getxattr(other, name, nil, 0, 0, 0) < 0)
+        case .mediaTitle:
+          player.mediaTitleChanged("iinaTests-title")
+          await Self.drainMain()
+          // The title is stored as mpv reported it, for when the player is active again.
+          #expect(player.info.mediaTitle == "iinaTests-title")
+        case .metadata:
+          player.metadataChanged(["title": "iinaTests-file"], ofChapter: false)
+          player.metadataChanged(["title": "iinaTests-chapter"], ofChapter: true)
+          await Self.drainMain()
+          // The tags are stored as mpv reported them, for when the player is active again.
+          #expect(player.info.metadata == ["title": "iinaTests-file"])
+          #expect(player.info.chapterMetadata == ["title": "iinaTests-chapter"])
+        case .watchedProperties:
+          let shown = try #require(inspector)
+          // What was read while the player was active is cleared and the row drawn again at once, with the error a row shows for a
+          // player that is not active, while the core is held, since nothing is asked of mpv.
+          let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+          shown.dynamicUpdate()
+          await Self.drainMain()
+          let clearedWhileHeld = !hold.hasLetGo && watchedRow() == NSLocalizedString("inspector.error", comment: "Error")
+          hold.release()
+          try await Self.waitUntil { hold.hasLetGo }
+          #expect(clearedWhileHeld, "The inspector asked mpv for the watched properties of a player that is not active")
+        }
+        #expect(!notified, "A change reported once the player was no longer active was told to the windows")
+      }
+    }
+  }
+
+  /// A change asked of `mpv` without waiting, which `mpv` then reports to the player.
+  enum ReportedChange: String, CaseIterable, Sendable {
+    case audioTrack, subtitleTrack, chapter, ontop, windowScale
+  }
+
+  @Test("A change asked of mpv without waiting, which mpv reports through MPVController's property-change handler, is stored by the player and shown in its window as mpv reported it",
+        arguments: ReportedChange.allCases)
+  func reportedChangeStored(_ change: ReportedChange) async throws {
+    try await Self.withPlayer { player, folder in
+      let mpv: MPVController = player.mpv
+      let window: MainWindowController = player.mainWindow
+      switch change {
+      case .audioTrack:
+        // The test files have no audio, so the player is given an audio file, which mpv selects and reports, then none is selected.
+        let audio = try Self.writeSilence("d", in: folder)
+        player.loadExternalAudioFile(audio)
+        try await Self.waitUntil { player.info.aid != 0 && !window.muteButton.isHidden }
+        mpv.setIntAsync(MPVOption.TrackSelection.aid, 0)
+        try await Self.waitUntil { player.info.aid == 0 && window.muteButton.isHidden }
+      case .subtitleTrack:
+        let subtitles = try Self.writeSubtitles(["b"], in: folder)
+        player.loadExternalSubFile(subtitles[0])
+        try await Self.waitUntil { player.info.sid != 0 }
+        mpv.setStringAsync(MPVOption.TrackSelection.sid, "no")
+        try await Self.waitUntil { player.info.sid == 0 }
+      case .chapter:
+        // The test files have no chapters. mpv makes a chapter of each part of an edit list, so the player plays a list of two files.
+        let parts = ["a", "c"].map { folder.appendingPathComponent("\($0).mp4").path }
+        let list = "edl://" + parts.map { "%\($0.utf8.count)%\($0)" }.joined(separator: ";")
+        mpv.asyncCommand(.loadfile, args: [list], replyUserdata: 0)
+        try await Self.waitUntil { player.info.state.loaded && player.info.chapters.count == 2 }
+        mpv.setIntAsync(MPVProperty.chapter, 1)
+        try await Self.waitUntil { player.info.chapter == 1 }
+      case .ontop:
+        mpv.setFlagAsync(MPVOption.Window.ontop, true)
+        try await Self.waitUntil { window.isOntop }
+        mpv.setFlagAsync(MPVOption.Window.ontop, false)
+        try await Self.waitUntil { !window.isOntop }
+      case .windowScale:
+        // The video is 64 wide, so the window is 512 wide at a window scale of 8.
+        mpv.setDoubleAsync(MPVOption.Window.windowScale, 8)
+        try await Self.waitUntil { window.window.map { abs($0.frame.width - 512) < 1 } ?? false }
+      }
+    }
+  }
+
+  @Test("A media title is the one mpv last reported, or else the path of the file, with or without its extension")
+  func mediaTitleRead() async throws {
+    try await Self.withPlayer { player, _ in
+      let path = try #require(player.info.currentURL).path
+      player.info.mediaTitle = "iinaTests-title"
+      #expect(player.getMediaTitle() == "iinaTests-title")
+      player.info.mediaTitle = nil
+      #expect(player.getMediaTitle() == path)
+      #expect(player.getMediaTitle(withExtension: false) == (path as NSString).deletingPathExtension)
+    }
+  }
+
+  @Test("Music metadata are the title, album and artist mpv last reported, the current chapter's title and performer taking the place of the file's once chapters are stored, tags matched ignoring case")
+  func musicMetadataRead() async throws {
+    try await Self.withPlayer { player, _ in
+      player.info.mediaTitle = "iinaTests-title"
+      player.info.metadata = ["ALBUM": "iinaTests-album", "Artist": "iinaTests-artist"]
+      player.info.chapterMetadata = ["performer": "iinaTests-performer"]
+      player.info.chapters = []
+      let file = player.getMusicMetadata()
+      #expect(file.title == "iinaTests-title" && file.album == "iinaTests-album" && file.artist == "iinaTests-artist")
+      player.info.chapters = [MPVChapter(title: "iinaTests-chapter", startTime: 0, index: 0)]
+      player.info.chapter = 0
+      let chapter = player.getMusicMetadata()
+      #expect(chapter.title == "iinaTests-chapter" && chapter.album == "iinaTests-album" && chapter.artist == "iinaTests-performer")
+    }
+  }
+
+  @Test("A media title and tags mpv reports for an active player are stored and told to its windows")
+  func titleReportStored() async throws {
+    try await Self.withPlayer { player, _ in
+      await Self.drainMain()
+      var notices = 0
+      player.observe(.iinaMediaTitleChanged) { _ in notices += 1 }
+      player.mediaTitleChanged("iinaTests-title")
+      player.metadataChanged(["title": "iinaTests-file"], ofChapter: false)
+      player.metadataChanged(["title": "iinaTests-chapter"], ofChapter: true)
+      #expect(player.info.mediaTitle == "iinaTests-title")
+      #expect(player.info.metadata == ["title": "iinaTests-file"])
+      #expect(player.info.chapterMetadata == ["title": "iinaTests-chapter"])
+      try await Self.waitUntil { notices >= 3 }
+    }
+  }
+
+  /// A main window controller whose window cannot be loaded, its nib being one the app does not have.
+  private final class WindowlessMainWindow: MainWindowController {
+    override var windowNibName: NSNib.Name { "iinaTests-NoSuchWindow" }
+  }
+
+  @Test("Updating mpv's window parameters for a main window controller that has no window leaves the window scale as it was")
+  func windowParametersWithoutWindow() async throws {
+    try await Self.withPlayer { player, _ in
+      let controller = WindowlessMainWindow(playerCore: player)
+      Self.keptObjects.append(controller)
+      let scale = player.info.cachedWindowScale
+      controller.updateWindowParametersForMPV(withFrame: NSRect(x: 0, y: 0, width: 999, height: 999))
+      #expect(controller.window == nil)
+      #expect(player.info.cachedWindowScale == scale)
+    }
+  }
+
+  /// A file whose thumbnails are not asked of FFmpeg.
+  enum UngeneratedThumbnails: String, CaseIterable, Sendable {
+    case networkResource, remoteVolume, cached
+  }
+
+  @Test("Thumbnails are not asked of FFmpeg for a stream or a file on a remote volume, and are read from the cache for a file whose cache is current, the volume and cache being checked on the player's thumbnail queue",
+        arguments: UngeneratedThumbnails.allCases)
+  func thumbnailsNotGenerated(_ file: UngeneratedThumbnails) async throws {
+    try await Self.withPlayer { player, _ in
+      try await Self.withSettings([.enableThumbnailPreview: true, .enableThumbnailForRemoteFiles: false,
+                                   .maxThumbnailPreviewCacheSize: 500]) {
+        let queue = try #require(player.ffmpegController.value(forKey: "queue") as? OperationQueue)
+        player.ffmpegController.cancelThumbnailGeneration()
+        queue.isSuspended = true
+        defer {
+          player.ffmpegController.cancelThumbnailGeneration()
+          queue.isSuspended = false
+        }
+        let url = try #require(player.info.currentURL)
+        // A cache name no cache file has, so that the thumbnails would be asked of FFmpeg if the file were checked as a local one.
+        let name = UUID().uuidString
+        player.info.mpvMd5 = name
+        let cache = Utility.thumbnailCacheURL.appendingPathComponent(name)
+        defer {
+          player.info.currentURL = url
+          player.info.isNetworkResource = false
+          try? FileManager.default.removeItem(at: cache)
+        }
+        switch file {
+        case .networkResource:
+          player.info.isNetworkResource = true
+        case .remoteVolume:
+          // macOS mounts the automounter's home map at this path, a volume that is not local.
+          player.info.currentURL = URL(fileURLWithPath: "/System/Volumes/Data/home", isDirectory: true)
+        case .cached:
+          let thumbnail = FFThumbnail()
+          thumbnail.realTime = 1
+          thumbnail.image = NSImage(size: NSSize(width: 8, height: 6), flipped: false) { rect in
+            NSColor.red.setFill()
+            rect.fill()
+            return true
+          }
+          ThumbnailCache.write([thumbnail], forName: name, forVideo: url)
+        }
+        player.generateThumbnails()
+        // The thumbnail queue is serial, so this runs once the volume and the cache have been checked.
+        await withCheckedContinuation { continuation in player.thumbnailQueue.async { continuation.resume() } }
+        #expect(!queue.operations.contains { !$0.isCancelled }, "FFmpeg was asked for the thumbnails of a \(file) file")
+        #expect(player.info.thumbnailsReady == (file == .cached))
+        #expect(player.info.thumbnails.count == (file == .cached ? 1 : 0))
+      }
+    }
+  }
+
   @Test("A secondary subtitle track selected in mpv is stored once mpv reports the change, taking the track id it reported")
   func secondarySidSelected() async throws {
     try await Self.withPlayer { player, folder in

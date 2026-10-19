@@ -210,4 +210,91 @@ struct MPVAsyncRequestTests {
     #expect(await Self.flag(MPVOption.PlaybackControl.pause, of: player).value == true)
     #expect(hold.hasLetGo)
   }
+
+  /// A property `mpv` holds as an integer, a double or a string, set by the setter for its type.
+  enum TypedProperty: String, CaseIterable, Sendable {
+    case integer, double, string
+
+    var name: String {
+      switch self {
+      case .integer: MPVOption.OSD.osdLevel
+      case .double: MPVOption.PlaybackControl.speed
+      case .string: MPVOption.Window.title
+      }
+    }
+
+    /// The `index`th value, as a raw command string writes it and as `mpv` answers it when it is described.
+    func value(_ index: Int) -> String {
+      switch self {
+      case .integer: String(index)
+      case .double: String(1 + Double(index) / 4)
+      case .string: "iinaTests-\(index)"
+      }
+    }
+
+    /// Set the `index`th value without waiting for `mpv`.
+    func set(_ index: Int, on mpv: MPVController) {
+      switch self {
+      case .integer: mpv.setIntAsync(name, index)
+      case .double: mpv.setDoubleAsync(name, 1 + Double(index) / 4)
+      case .string: mpv.setStringAsync(name, value(index))
+      }
+    }
+  }
+
+  /// Ask `mpv` for a property as a node and wait for the reply.
+  /// - Returns: The value replied with, described, and whether the reply arrived on the main thread.
+  private static func described(_ name: String, of player: PlayerCore) async -> (value: String?, onMain: Bool) {
+    await withCheckedContinuation { continuation in
+      player.mpv.getNodesAsync([name]) { values in
+        continuation.resume(returning: (values[0].map { String(describing: $0) }, Thread.isMainThread))
+      }
+    }
+  }
+
+  @Test("Integer, double and string properties set before mpv is initialized are not sent")
+  func typedSetBeforeInitialized() {
+    let player = Self.unstartedPlayer()
+    for property in TypedProperty.allCases {
+      property.set(1, on: player.mpv)
+    }
+    #expect(player.mpv.mpv == nil)
+  }
+
+  @Test("An integer, double or string property set without waiting is seen by a read asked for after it",
+        arguments: TypedProperty.allCases)
+  func typedSetThenRead(_ property: TypedProperty) async {
+    let player = Self.startedPlayer()
+    for index in 1...2 {
+      property.set(index, on: player.mpv)
+      let read = await Self.described(property.name, of: player)
+      #expect(read.value == property.value(index))
+      #expect(!read.onMain)
+    }
+  }
+
+  @Test("An integer, double or string property set without waiting while raw command strings are in flight returns at once and is set by mpv after them",
+        arguments: TypedProperty.allCases)
+  func typedSetHeldBehindRawCommands(_ property: TypedProperty) async throws {
+    let player = Self.startedPlayer()
+    let hold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
+    // The first command string waits for the core on the queue command strings are run on, and the second waits behind it there.
+    var codes: [Int32] = []
+    for index in 1...2 {
+      player.mpv.command(rawString: "set \(property.name) \(property.value(index))") { codes.append($0) }
+    }
+    property.set(3, on: player.mpv)
+    let returnedWhileHeld = !hold.hasLetGo
+    hold.release()
+    #expect(returnedWhileHeld, "Setting a property while command strings were in flight waited for mpv")
+    // A read asked now is held behind the command strings and the set as well, so it is answered after them.
+    let read = await Self.described(property.name, of: player)
+    #expect(read.value == property.value(3))
+    // The command strings are answered on the main thread, which this test runs on.
+    let deadline = ContinuousClock.now + .seconds(30)
+    while codes.count < 2 && ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(codes == [0, 0])
+  }
 }
