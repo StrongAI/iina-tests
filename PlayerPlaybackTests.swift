@@ -6760,6 +6760,15 @@ struct PlayerPlaybackTests {
     return (!installedWhileHeld, reported.value)
   }
 
+  @Test("The app hosting the tests keeps its plugins in a folder of its own, so that it has read none of the user's plugins")
+  func testHostReadsNoUserPlugins() async throws {
+    let userFolder = Utility.appSupportDirUrl.appendingPathComponent(AppData.pluginsFolder, isDirectory: true).standardizedFileURL
+    #expect(Utility.pluginsURL.standardizedFileURL.path != userFolder.path,
+            "The app hosting the tests keeps its plugins in the user's plugins folder")
+    let read = JavascriptPlugin.plugins.filter { $0.root.standardizedFileURL.path.hasPrefix(userFolder.path + "/") }
+    #expect(read.isEmpty, "The app hosting the tests read the user's plugins \(read.map { $0.identifier })")
+  }
+
   @Test("Reading the plugins folder again reads it on the plugin install queue, returning while the queue is held, then replaces the plugin list with the plugins read")
   func pluginListReadDoesNotWait() async throws {
     let folder = try Self.makeFolder()
