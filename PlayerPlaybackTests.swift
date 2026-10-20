@@ -2172,13 +2172,15 @@ struct PlayerPlaybackTests {
         // The settings are changed in the argument domain, and mpv is told of each as it is told when a setting changes.
         let defaults = UserDefaults.standard
         let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        // The color mpv shows is read before the settings change, since a change in the argument domain is also told to the defaults'
+        // observers, which may ask mpv for it before the request does.
+        let color = mpv.getString(MPVOption.Subtitles.subColor)
         let settings: [Preference.Key: Any] = [.subMarginY: 40, .subBlur: 0.5, .subItalic: true, .subLang: "fr",
                                                .subTextColorString: "1.0/0.0/0.0/1.0",
                                                .subAlignX: Preference.SubAlignX.left.rawValue]
         defaults.setVolatileDomain(arguments.merging(settings.map { ($0.key.rawValue, $0.value) }) { $1 },
                                    forName: UserDefaults.argumentDomain)
         cleanUp = { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
-        let color = mpv.getString(MPVOption.Subtitles.subColor)
         ask = {
           for key in settings.keys {
             mpv.observeValue(forKeyPath: key.rawValue, of: defaults, change: [.oldKey: 0, .newKey: 1], context: nil)
@@ -4376,9 +4378,11 @@ struct PlayerPlaybackTests {
         mpv.setFlagAsync(MPVOption.Window.ontop, false)
         try await Self.waitUntil { !window.isOntop }
       case .windowScale:
-        // The video is 64 wide, so the window is 512 wide at a window scale of 8.
-        mpv.setDoubleAsync(MPVOption.Window.windowScale, 8)
-        try await Self.waitUntil { window.window.map { abs($0.frame.width - 512) < 1 } ?? false }
+        // The video is 64 wide, so the window is 1024 wide at a window scale of 16, or 512 wide where it shows the video's pixels
+        // at the display's own on a display with two of them to a point.
+        let backing = window.window.map { Preference.bool(for: .usePhysicalResolution) ? $0.backingScaleFactor : 1 } ?? 1
+        mpv.setDoubleAsync(MPVOption.Window.windowScale, 16)
+        try await Self.waitUntil { window.window.map { abs($0.frame.width - 1024 / backing) < 1 } ?? false }
       }
     }
   }
