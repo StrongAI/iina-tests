@@ -2009,11 +2009,11 @@ struct PlayerPlaybackTests {
         ask = { view.customEditFinishedAction() }
         applied = { mpv.getDouble(MPVOption.Subtitles.subDelay) == 0.5 }
       case .subDelayReset:
-        // The reset button of the subtitle delay resets the audio delay.
+        // The reset button of the subtitle delay resets the subtitle delay.
         let view = try Self.sliderView(notifiedBy: .iinaSubDelayChanged, under: Self.kept(SidebarSubtitlesPane(player: player)))
-        mpv.setDouble(MPVOption.Audio.audioDelay, 0.5)
+        mpv.setDouble(MPVOption.Subtitles.subDelay, 0.5)
         ask = { view.resetButtonAction() }
-        applied = { mpv.getDouble(MPVOption.Audio.audioDelay) == 0 }
+        applied = { mpv.getDouble(MPVOption.Subtitles.subDelay) == 0 }
       case .audioDelaySlider, .subDelaySlider:
         let isAudio = request == .audioDelaySlider
         let pane: NSView = isAudio ? Self.kept(SidebarAudioPane(player: player)) : Self.kept(SidebarSubtitlesPane(player: player))
