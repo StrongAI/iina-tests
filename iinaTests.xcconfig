@@ -1,0 +1,19 @@
+//
+//  iinaTests.xcconfig
+//  iina
+//
+//  The unit tests run inside IINA.app, so that they can test the app's own code. This project sits at iinaTests/ in an
+//  IINA checkout, so the checkout's deps folder is one level up.
+//
+
+BUNDLE_LOADER = $(TEST_HOST)
+GENERATE_INFOPLIST_FILE = YES
+HEADER_SEARCH_PATHS = $(inherited) $(SRCROOT)/../deps/include
+// Some tests call libmpv directly, see MPVCoreHold. At run time they use the copy of libmpv in IINA.app.
+LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/../Frameworks
+LIBRARY_SEARCH_PATHS = $(inherited) $(SRCROOT)/../deps/lib
+MACOSX_DEPLOYMENT_TARGET = 14.0
+OTHER_LDFLAGS = $(inherited) -lmpv.2
+PRODUCT_BUNDLE_IDENTIFIER = com.colliderli.$(TARGET_NAME)
+PRODUCT_NAME = $(TARGET_NAME)
+TEST_HOST = $(BUILT_PRODUCTS_DIR)/IINA.app/Contents/MacOS/IINA

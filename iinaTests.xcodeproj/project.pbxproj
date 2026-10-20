@@ -1,0 +1,304 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXContainerItemProxy section */
+		F1E57000000000000000000A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F1E570000000000000000007 /* iina.xcodeproj */;
+			proxyType = 2;
+			remoteGlobalIDString = 84EB1ED61D2F51D3004FA5A1;
+			remoteInfo = iina;
+		};
+		F1E57000000000000000000B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F1E570000000000000000007 /* iina.xcodeproj */;
+			proxyType = 1;
+			remoteGlobalIDString = 84EB1ED51D2F51D3004FA5A1;
+			remoteInfo = iina;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		F1E570000000000000000005 /* iinaTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = iinaTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F1E570000000000000000006 /* iinaTests.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = iinaTests.xcconfig; sourceTree = "<group>"; };
+		F1E570000000000000000007 /* iina.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; name = iina.xcodeproj; path = ../iina.xcodeproj; sourceTree = "<group>"; };
+		F1E570000000000000000012 /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
+		F1E570000000000000000013 /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
+		F1E570000000000000000014 /* Beta.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Beta.xcconfig; sourceTree = "<group>"; };
+		F1E570000000000000000015 /* Nightly.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Nightly.xcconfig; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		F1E570000000000000000004 /* Tests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Tests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F1E57000000000000000000F /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		F1E570000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				F1E570000000000000000004 /* Tests */,
+				F1E570000000000000000006 /* iinaTests.xcconfig */,
+				F1E570000000000000000011 /* IINA Configs */,
+				F1E570000000000000000007 /* iina.xcodeproj */,
+				F1E570000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		F1E570000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F1E570000000000000000005 /* iinaTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F1E570000000000000000008 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F1E570000000000000000009 /* IINA.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F1E570000000000000000011 /* IINA Configs */ = {
+			isa = PBXGroup;
+			children = (
+				F1E570000000000000000012 /* Debug.xcconfig */,
+				F1E570000000000000000013 /* Release.xcconfig */,
+				F1E570000000000000000014 /* Beta.xcconfig */,
+				F1E570000000000000000015 /* Nightly.xcconfig */,
+			);
+			name = "IINA Configs";
+			path = ../Configs;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		F1E57000000000000000000D /* iinaTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F1E57000000000000000001B /* Build configuration list for PBXNativeTarget "iinaTests" */;
+			buildPhases = (
+				F1E57000000000000000000E /* Sources */,
+				F1E57000000000000000000F /* Frameworks */,
+				F1E570000000000000000010 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				F1E57000000000000000000C /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				F1E570000000000000000004 /* Tests */,
+			);
+			name = iinaTests;
+			packageProductDependencies = (
+			);
+			productName = iinaTests;
+			productReference = F1E570000000000000000005 /* iinaTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		F1E570000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastSwiftUpdateCheck = 2650;
+				LastUpgradeCheck = 2650;
+				ORGANIZATIONNAME = StrongAI;
+				TargetAttributes = {
+					F1E57000000000000000000D = {
+						CreatedOnToolsVersion = 26.6;
+					};
+				};
+			};
+			buildConfigurationList = F1E570000000000000000016 /* Build configuration list for PBXProject "iinaTests" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = F1E570000000000000000002;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = F1E570000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectReferences = (
+				{
+					ProductGroup = F1E570000000000000000008 /* Products */;
+					ProjectRef = F1E570000000000000000007 /* iina.xcodeproj */;
+				},
+			);
+			projectRoot = "";
+			targets = (
+				F1E57000000000000000000D /* iinaTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXReferenceProxy section */
+		F1E570000000000000000009 /* IINA.app */ = {
+			isa = PBXReferenceProxy;
+			fileType = wrapper.application;
+			path = IINA.app;
+			remoteRef = F1E57000000000000000000A /* PBXContainerItemProxy */;
+			sourceTree = BUILT_PRODUCTS_DIR;
+		};
+/* End PBXReferenceProxy section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F1E570000000000000000010 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F1E57000000000000000000E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		F1E57000000000000000000C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = iina;
+			targetProxy = F1E57000000000000000000B /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		F1E570000000000000000017 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000012 /* Debug.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
+				DEAD_CODE_STRIPPING = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+			};
+			name = Debug;
+		};
+		F1E570000000000000000018 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000013 /* Release.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
+				DEAD_CODE_STRIPPING = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+			};
+			name = Release;
+		};
+		F1E570000000000000000019 /* Beta */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000014 /* Beta.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
+				DEAD_CODE_STRIPPING = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+			};
+			name = Beta;
+		};
+		F1E57000000000000000001A /* Nightly */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000015 /* Nightly.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
+				DEAD_CODE_STRIPPING = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+			};
+			name = Nightly;
+		};
+		F1E57000000000000000001C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000006 /* iinaTests.xcconfig */;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		F1E57000000000000000001D /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000006 /* iinaTests.xcconfig */;
+			buildSettings = {
+			};
+			name = Release;
+		};
+		F1E57000000000000000001E /* Beta */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000006 /* iinaTests.xcconfig */;
+			buildSettings = {
+			};
+			name = Beta;
+		};
+		F1E57000000000000000001F /* Nightly */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = F1E570000000000000000006 /* iinaTests.xcconfig */;
+			buildSettings = {
+			};
+			name = Nightly;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F1E570000000000000000016 /* Build configuration list for PBXProject "iinaTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F1E570000000000000000017 /* Debug */,
+				F1E570000000000000000018 /* Release */,
+				F1E570000000000000000019 /* Beta */,
+				F1E57000000000000000001A /* Nightly */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F1E57000000000000000001B /* Build configuration list for PBXNativeTarget "iinaTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F1E57000000000000000001C /* Debug */,
+				F1E57000000000000000001D /* Release */,
+				F1E57000000000000000001E /* Beta */,
+				F1E57000000000000000001F /* Nightly */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = F1E570000000000000000001 /* Project object */;
+}
