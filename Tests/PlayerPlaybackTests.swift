@@ -1659,7 +1659,7 @@ struct PlayerPlaybackTests {
                     outlineColor: color(MPVOption.Subtitles.subOutlineColor), backColor: color(MPVOption.Subtitles.subBackColor),
                     videoTracks: player.info.videoTracks.count)
       let ask: () -> Void
-      let applied: () -> Bool
+      let applied: () async -> Bool
       switch request {
       case .mute, .menuMute:
         ask = request == .mute ? { player.toggleMute() } : { handler.menuToggleMute(item()) }
@@ -1787,9 +1787,9 @@ struct PlayerPlaybackTests {
         applied = { mpv.getString(MPVOption.Subtitles.subCodepage) == "cp1252" }
       case .menuSnapshot:
         mpv.setString(MPVOption.Screenshot.screenshotDir, folder.path)
-        let files = try FileManager.default.contentsOfDirectory(atPath: folder.path).count
+        let files = try await Self.onFileSystem { try FileManager.default.contentsOfDirectory(atPath: folder.path).count }
         ask = { handler.menuSnapshot(item()) }
-        applied = { (try? FileManager.default.contentsOfDirectory(atPath: folder.path).count) ?? files > files }
+        applied = { (try? await Self.onFileSystem { try FileManager.default.contentsOfDirectory(atPath: folder.path).count }) ?? files > files }
       case .chosenSub, .externalSub, .externalSubDelayed:
         let subtitle = folder.appendingPathComponent("b.srt")
         try await Self.onFileSystem { try "1\n00:00:00,000 --> 00:00:04,000\nSubtitle\n".write(to: subtitle, atomically: true, encoding: .utf8) }
