@@ -45,18 +45,37 @@ struct PlayerPlaybackTests {
 
   private static var playerCount = 0
 
-  /// A folder holding `a.mp4`, `b.mp4` and `c.mp4`, each a copy of `fragmented.mp4`.
-  private static func makeFolder() throws -> URL {
-    let source = try #require(Bundle(for: PlayerPlaybackTestsBundle.self).url(forResource: "fragmented", withExtension: "mp4"))
-    // Not under the temporary directory, whose path goes through the /var symlink, so that the path of the opened file and the
-    // paths of the files found in its folder have the same form.
-    let caches = try #require(FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first)
-    let folder = caches.appendingPathComponent("iinaTests-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    for name in ["a", "b", "c"] {
-      try FileManager.default.copyItem(at: source, to: folder.appendingPathComponent("\(name).mp4"))
+  /// A folder holding `a.mp4`, `b.mp4` and `c.mp4`, each a copy of `fragmented.mp4`, made off the main thread, which does no file
+  /// I/O.
+  private static func makeFolder() async throws -> URL {
+    let folder = try await onFileSystem { () -> URL? in
+      // Not under the temporary directory, whose path goes through the /var symlink, so that the path of the opened file and the
+      // paths of the files found in its folder have the same form.
+      guard let source = Bundle(for: PlayerPlaybackTestsBundle.self).url(forResource: "fragmented", withExtension: "mp4"),
+            let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
+      let folder = caches.appendingPathComponent("iinaTests-\(UUID().uuidString)")
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+      for name in ["a", "b", "c"] {
+        try FileManager.default.copyItem(at: source, to: folder.appendingPathComponent("\(name).mp4"))
+      }
+      return folder
     }
-    return folder
+    return try #require(folder)
+  }
+
+  /// Do `work` with the file system off the main thread, which does no file I/O.
+  private static func onFileSystem<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+    try await Task.detached(operation: work).value
+  }
+
+  /// Remove the item at `url` off the main thread, which does no file I/O, leaving nothing to remove as it is.
+  private static func removeItem(_ url: URL) async {
+    await Task.detached { try? FileManager.default.removeItem(at: url) }.value
+  }
+
+  /// Whether there is an item at `url`, asked off the main thread, which does no file I/O.
+  private static func fileExists(_ url: URL) async -> Bool {
+    await Task.detached { FileManager.default.fileExists(atPath: url.path) }.value
   }
 
   /// Open `b.mp4` of a new folder in a new player under the test settings, run `body` once the play state of the file has been
@@ -66,8 +85,8 @@ struct PlayerPlaybackTests {
     let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
     defaults.setVolatileDomain(arguments.merging(settings) { $1 }, forName: UserDefaults.argumentDomain)
     defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
-    let folder = try makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await makeFolder()
+    defer { await Self.removeItem(folder) }
 
     let player = PlayerCore()
     // Like PlayerCore.createPlayerCore, label the player before it logs anything, since its log subsystem is named after it.
@@ -101,6 +120,15 @@ struct PlayerPlaybackTests {
   private static func waitUntil(_ condition: () -> Bool) async throws {
     let deadline = ContinuousClock.now + faultTimeout
     while !condition() {
+      try #require(ContinuousClock.now < deadline, "Waited \(faultTimeout) for the player: \(current?.testState ?? "")")
+      try await Task.sleep(for: .milliseconds(20))
+    }
+  }
+
+  /// Wait until `condition`, which asks the file system off the main thread, holds, failing the test once the fault threshold passes.
+  private static func waitUntil(_ condition: () async -> Bool) async throws {
+    let deadline = ContinuousClock.now + faultTimeout
+    while !(await condition()) {
       try #require(ContinuousClock.now < deadline, "Waited \(faultTimeout) for the player: \(current?.testState ?? "")")
       try await Task.sleep(for: .milliseconds(20))
     }
@@ -458,7 +486,7 @@ struct PlayerPlaybackTests {
       }
       // A subtitle file is not a playable file, so none is opened and the subtitle file is loaded instead.
       let subtitle = folder.appendingPathComponent("a.srt")
-      try "1\n00:00:00,000 --> 00:00:01,000\nIINA\n".write(to: subtitle, atomically: true, encoding: .utf8)
+      try await Self.onFileSystem { try "1\n00:00:00,000 --> 00:00:01,000\nIINA\n".write(to: subtitle, atomically: true, encoding: .utf8) }
       #expect(player.openFromPasteboard(FileDrop([subtitle])))
       try await Self.waitUntil { player.info.subTracks.contains { $0.externalFilename == subtitle.path } }
       #expect(player.info.currentURL?.path == videos[0].path)
@@ -542,7 +570,7 @@ struct PlayerPlaybackTests {
       #expect(!player.info.shouldAutoLoadFiles)
       // A cue sheet is a playlist file, whose entries mpv reads itself.
       let cue = folder.appendingPathComponent("b.cue")
-      try "FILE \"b.mp4\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".write(to: cue, atomically: true, encoding: .utf8)
+      try await Self.onFileSystem { try "FILE \"b.mp4\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".write(to: cue, atomically: true, encoding: .utf8) }
       player.openURLs([cue]) { counts.append($0) }
       try await Self.waitUntil {
         player.info.currentURL?.path == cue.path && player.info.state == .paused && !player.info.pausedForLoading
@@ -1027,7 +1055,7 @@ struct PlayerPlaybackTests {
   func reloadAllSubsDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
       let subtitle = folder.appendingPathComponent("b.srt")
-      try "1\n00:00:00,000 --> 00:00:04,000\nSubtitle\n".write(to: subtitle, atomically: true, encoding: .utf8)
+      try await Self.onFileSystem { try "1\n00:00:00,000 --> 00:00:04,000\nSubtitle\n".write(to: subtitle, atomically: true, encoding: .utf8) }
       player.loadExternalSubFile(subtitle)
       try await Self.waitUntil { player.info.subTracks.count == 1 }
       // A track list mpv does not hold shows that the player stores the list mpv answers.
@@ -1143,7 +1171,7 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       // Read, an empty folder holds nothing that can be opened, so a drag answered from what the folder holds is refused.
       let empty = folder.appendingPathComponent("empty")
-      try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+      try await Self.onFileSystem { try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true) }
       #expect(player.acceptFromPasteboard(FileDrop([empty])) == .copy)
       #expect(player.acceptFromPasteboard(FileDrop([empty]), isPlaylist: true) == .copy)
       #expect(player.acceptFromPasteboard(FileDrop([folder.appendingPathComponent("b.srt")]), isPlaylist: true) == [])
@@ -1176,12 +1204,12 @@ struct PlayerPlaybackTests {
         let lut = folder.appendingPathComponent("look.cube")
         // The identity 3D LUT of size 2, red changing fastest.
         let lattice = (0..<8).map { "\($0 & 1) \(($0 >> 1) & 1) \(($0 >> 2) & 1)" }
-        try (["LUT_3D_SIZE 2"] + lattice).joined(separator: "\n").write(to: lut, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try (["LUT_3D_SIZE 2"] + lattice).joined(separator: "\n").write(to: lut, atomically: true, encoding: .utf8) }
         let lutAddedWhileHeld = try await Self.dropRequestsWhileHeld(player, [lut])
         #expect(lutAddedWhileHeld, "Adding the dropped 3D LUT file waited for mpv")
         try await Self.waitUntil { player.mpv.getFilters(MPVProperty.vf).contains { $0.label == "iina_quickl3d" } }
         let subtitle = folder.appendingPathComponent("b.srt")
-        try "1\n00:00:00,000 --> 00:00:01,000\nIINA\n".write(to: subtitle, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try "1\n00:00:00,000 --> 00:00:01,000\nIINA\n".write(to: subtitle, atomically: true, encoding: .utf8) }
         let subtitleAddedWhileHeld = try await Self.dropRequestsWhileHeld(player, [subtitle])
         #expect(subtitleAddedWhileHeld, "Loading the dropped subtitle file waited for mpv")
         try await Self.waitUntil { player.info.subTracks.contains { $0.externalFilename == subtitle.path } }
@@ -1539,11 +1567,11 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       let playlists = ["x", "y"].map { folder.appendingPathComponent("\($0).m3u") }
       for playlist in playlists {
-        try "".write(to: playlist, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try "".write(to: playlist, atomically: true, encoding: .utf8) }
       }
       #expect(!player.openFromPasteboard(FileDrop(playlists)))
       let cue = folder.appendingPathComponent("b.cue")
-      try "FILE \"b.mp4\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".write(to: cue, atomically: true, encoding: .utf8)
+      try await Self.onFileSystem { try "FILE \"b.mp4\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n".write(to: cue, atomically: true, encoding: .utf8) }
       #expect(player.openFromPasteboard(FileDrop([cue])))
       try await Self.waitUntil {
         player.info.currentURL?.path == cue.path && player.info.state == .paused && !player.info.pausedForLoading
@@ -1764,7 +1792,7 @@ struct PlayerPlaybackTests {
         applied = { (try? FileManager.default.contentsOfDirectory(atPath: folder.path).count) ?? files > files }
       case .chosenSub, .externalSub, .externalSubDelayed:
         let subtitle = folder.appendingPathComponent("b.srt")
-        try "1\n00:00:00,000 --> 00:00:04,000\nSubtitle\n".write(to: subtitle, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try "1\n00:00:00,000 --> 00:00:04,000\nSubtitle\n".write(to: subtitle, atomically: true, encoding: .utf8) }
         switch request {
         case .chosenSub: ask = { player.mainWindow.chosenSubFromMenu(item(FileInfo(subtitle))) }
         // Loading a subtitle chosen in an open panel delays showing it, as the menu and the sidebar ask.
@@ -2227,7 +2255,7 @@ struct PlayerPlaybackTests {
             && target.mpv.getString(MPVOption.TrackSelection.slang) == "fr"
         }
       case .externalAudio, .jsLoadTrack:
-        let audio = try Self.writeSilence("d", in: folder)
+        let audio = try await Self.writeSilence("d", in: folder)
         let tracks = player.info.audioTracks.count
         ask = request == .externalAudio ? { player.loadExternalAudioFile(audio) }
           : script("iina.core.audio.loadTrack(\"\(audio.path)\")")
@@ -2298,8 +2326,8 @@ struct PlayerPlaybackTests {
     defer { zip(keys, stored).forEach { defaults.set($1, forKey: $0) } }
     let caches = try #require(FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first)
     let folder = caches.appendingPathComponent("iinaTests-watch-later-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: folder) }
+    try await Self.onFileSystem { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+    defer { await Self.removeItem(folder) }
     let watchLaterDirectory = try #require(player.mpv.getString("watch-later-directory"))
     player.mpv.setString("watch-later-directory", folder.path)
     player.mpv.setFlag(MPVOption.WatchLater.savePositionOnQuit, true)
@@ -2318,7 +2346,7 @@ struct PlayerPlaybackTests {
         let returnedWhileHeld = try await Self.returnsWhileHeld(player) { player.stop() }
         #expect(returnedWhileHeld, "Stopping waited for mpv")
         try await Self.waitUntil { player.info.state == .idle }
-        let written = try FileManager.default.contentsOfDirectory(atPath: watchLater.path)
+        let written = try await Self.onFileSystem { try FileManager.default.contentsOfDirectory(atPath: watchLater.path) }
         // mpv writes the file's configuration, and entries for the folders it was opened from.
         #expect(!written.isEmpty, "mpv wrote no watch later configuration before stopping")
         #expect(Preference.url(for: .iinaLastPlayedFilePath) == file)
@@ -2445,8 +2473,8 @@ struct PlayerPlaybackTests {
     let keys = [Preference.Key.iinaLastPlayedFilePath.rawValue, Preference.Key.iinaLastPlayedFilePosition.rawValue]
     let stored = keys.map { defaults.object(forKey: $0) }
     defer { zip(keys, stored).forEach { defaults.set($1, forKey: $0) } }
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     // A player with no window, whose video is never initialized, so that mpv is not asked to free its renderer.
     let player = PlayerCore()
     player.label = "iinaTests-playback-\(Self.playerCount)"
@@ -2650,8 +2678,8 @@ struct PlayerPlaybackTests {
         try await Self.checkWorkspaceRequest(request, player: player, folder: folder)
       }
     } else {
-      let folder = try Self.makeFolder()
-      defer { try? FileManager.default.removeItem(at: folder) }
+      let folder = try await Self.makeFolder()
+      defer { await Self.removeItem(folder) }
       try await Self.checkWorkspaceRequest(request, player: nil, folder: folder)
     }
   }
@@ -2818,7 +2846,7 @@ struct PlayerPlaybackTests {
       expected = [.open(try url(help))]
     case .prefShowConfFile:
       let conf = folder.appendingPathComponent("iinaTests.conf")
-      try Data().write(to: conf)
+      try await Self.onFileSystem { try Data().write(to: conf) }
       let controller = PrefKeyBindingViewController()
       controller.currentConfFilePath = conf.path
       ask = { controller.showConfFileAction(controller) }
@@ -3131,8 +3159,8 @@ struct PlayerPlaybackTests {
   private static func checkNewConfigFile(_ request: DeviceOrFileRequest) async throws {
     let name = "iinaTests-\(UUID().uuidString)"
     let taken = Utility.userInputConfDirURL.appendingPathComponent("\(name)-taken.conf")
-    try Data().write(to: taken)
-    defer { try? FileManager.default.removeItem(at: taken) }
+    try await Self.onFileSystem { try Data().write(to: taken) }
+    defer { await Self.removeItem(taken) }
     // The panel asking whether to show the file of a taken name is a sheet on the window of the site.
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320), styleMask: [.titled], backing: .buffered,
                           defer: false)
@@ -3411,8 +3439,8 @@ struct PlayerPlaybackTests {
                                      Preference.Key.userOptions.rawValue: options]
     defaults.setVolatileDomain(arguments.merging(settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
     defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
-    let folder = try makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await makeFolder()
+    defer { await Self.removeItem(folder) }
     let url = folder.appendingPathComponent("b.mp4")
 
     let player = PlayerCore()
@@ -3739,7 +3767,7 @@ struct PlayerPlaybackTests {
 
   /// Write `<name>.wav`, a second of silence, in `folder`.
   /// - Returns: The file written.
-  private static func writeSilence(_ name: String, in folder: URL) throws -> URL {
+  private static func writeSilence(_ name: String, in folder: URL) async throws -> URL {
     let rate: UInt32 = 8000
     let samples = Data(count: Int(rate) * 2)
     var data = Data()
@@ -3761,7 +3789,8 @@ struct PlayerPlaybackTests {
     append(UInt32(samples.count))
     data.append(samples)
     let file = folder.appendingPathComponent("\(name).wav")
-    try data.write(to: file)
+    let wave = data
+    try await onFileSystem { try wave.write(to: file) }
     return file
   }
 
@@ -3906,7 +3935,7 @@ struct PlayerPlaybackTests {
       try await Self.withSettings([.alwaysOpenInNewWindow: true]) {
         // A subtitle file is not opened on its own, so the open finds no file to play.
         let file = folder.appendingPathComponent("a.srt")
-        try "IINA".write(to: file, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try "IINA".write(to: file, atomically: true, encoding: .utf8) }
         let dismisser = ModalWindowDismisser()
         defer { dismisser.stop() }
         #expect(AppDelegate.shared.application(NSApp, openFile: file.path))
@@ -3922,7 +3951,7 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { _, folder in
       try await Self.withSettings([.enableNewSettings: true]) {
         let package = folder.appendingPathComponent("iinaTests.iinaplgz")
-        try "IINA".write(to: package, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try "IINA".write(to: package, atomically: true, encoding: .utf8) }
         let settings = SettingsWindow.default
         #expect(AppDelegate.shared.application(NSApp, openFile: package.path))
         // The package cannot be unpacked, which the plugin settings report in a sheet on their window.
@@ -3962,12 +3991,15 @@ struct PlayerPlaybackTests {
 
   /// Write a subtitle file `<name>.srt` holding one line in `folder` for each of `names`.
   /// - Returns: The files written, in the order of `names`.
-  private static func writeSubtitles(_ names: [String], in folder: URL) throws -> [URL] {
-    try names.map { name in
-      let file = folder.appendingPathComponent("\(name).srt")
-      try "1\n00:00:00,000 --> 00:00:04,000\n\(name)\n".write(to: file, atomically: true, encoding: .utf8)
-      return file
+  private static func writeSubtitles(_ names: [String], in folder: URL) async throws -> [URL] {
+    let files = names.map { folder.appendingPathComponent("\($0).srt") }
+    // The subtitles are written off the main thread, which does no file I/O.
+    try await onFileSystem {
+      for (name, file) in zip(names, files) {
+        try "1\n00:00:00,000 --> 00:00:04,000\n\(name)\n".write(to: file, atomically: true, encoding: .utf8)
+      }
     }
+    return files
   }
 
   @Test("A plugin's status position and duration are promises returned while mpv's core is held, settled with the position mpv holds while the time is not kept up to date")
@@ -3977,6 +4009,7 @@ struct PlayerPlaybackTests {
       try await Self.waitForPosition(2, of: player)
       player.syncUITimer?.invalidate()
       let plugin = try await Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       // A position mpv does not hold shows whether the getter settles with the position mpv holds.
       player.info.videoPosition = VideoTime(0)
@@ -4001,6 +4034,7 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       player.syncUITimer?.invalidate()
       let plugin = try await Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
         instance.js.evaluateScript("""
@@ -4025,6 +4059,7 @@ struct PlayerPlaybackTests {
   func mpvGetStringSettlesNullForAbsentProperty() async throws {
     try await Self.withPlayer { player, folder in
       let plugin = try await Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       _ = instance.js.evaluateScript("""
         globalThis.answer = undefined;
@@ -4039,6 +4074,7 @@ struct PlayerPlaybackTests {
   func mpvGetFlagSettlesFalseForAbsentProperty() async throws {
     try await Self.withPlayer { player, folder in
       let plugin = try await Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       _ = instance.js.evaluateScript("""
         globalThis.answer = undefined;
@@ -4053,6 +4089,7 @@ struct PlayerPlaybackTests {
   func mpvGetNumberSettlesZeroForAbsentProperty() async throws {
     try await Self.withPlayer { player, folder in
       let plugin = try await Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       _ = instance.js.evaluateScript("""
         globalThis.answer = undefined;
@@ -4067,6 +4104,7 @@ struct PlayerPlaybackTests {
   func mpvGetNativeSettlesNullForAbsentProperty() async throws {
     try await Self.withPlayer { player, folder in
       let plugin = try await Self.makePlugin(in: folder)
+      Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       _ = instance.js.evaluateScript("""
         globalThis.answer = undefined;
@@ -4137,7 +4175,7 @@ struct PlayerPlaybackTests {
   func openChosenFiles() async throws {
     try await Self.withPlayer { _, folder in
       try await Self.withSettings([.alwaysOpenInNewWindow: true]) {
-        let subtitle = try Self.writeSubtitles(["a"], in: folder)[0]
+        let subtitle = try await Self.writeSubtitles(["a"], in: folder)[0]
         let dismisser = ModalWindowDismisser()
         defer { dismisser.stop() }
         AppDelegate.shared.openChosenFiles([subtitle])
@@ -4216,7 +4254,7 @@ struct PlayerPlaybackTests {
   @Test("Standard input named on the command line opens in a new player, which enters music mode at once")
   func commandLineStdin() async throws {
     try await Self.withPlayer { _, folder in
-      let data = try Data(contentsOf: folder.appendingPathComponent("a.mp4"))
+      let data = try await Self.onFileSystem { try Data(contentsOf: folder.appendingPathComponent("a.mp4")) }
       // mpv reads standard input as the stream it opens, so standard input is replaced with a pipe the file is written to.
       let pipe = Pipe()
       let standardInput = dup(STDIN_FILENO)
@@ -4410,13 +4448,13 @@ struct PlayerPlaybackTests {
       switch change {
       case .audioTrack:
         // The test files have no audio, so the player is given an audio file, which mpv selects and reports, then none is selected.
-        let audio = try Self.writeSilence("d", in: folder)
+        let audio = try await Self.writeSilence("d", in: folder)
         player.loadExternalAudioFile(audio)
         try await Self.waitUntil { player.info.aid != 0 && !window.muteButton.isHidden }
         mpv.setIntAsync(MPVOption.TrackSelection.aid, 0)
         try await Self.waitUntil { player.info.aid == 0 && window.muteButton.isHidden }
       case .subtitleTrack:
-        let subtitles = try Self.writeSubtitles(["b"], in: folder)
+        let subtitles = try await Self.writeSubtitles(["b"], in: folder)
         player.loadExternalSubFile(subtitles[0])
         try await Self.waitUntil { player.info.sid != 0 }
         // A change of the track list also stores the track selected, but tells the windows nothing of it, so the windows are told of
@@ -4568,7 +4606,7 @@ struct PlayerPlaybackTests {
   @Test("A secondary subtitle track selected in mpv is stored once mpv reports the change, taking the track id it reported")
   func secondarySidSelected() async throws {
     try await Self.withPlayer { player, folder in
-      let subtitles = try Self.writeSubtitles(["b", "c"], in: folder)
+      let subtitles = try await Self.writeSubtitles(["b", "c"], in: folder)
       subtitles.forEach { player.loadExternalSubFile($0) }
       try await Self.waitUntil { player.info.subTracks.count == 2 }
       // mpv adds each subtitle file on a thread of its own and selects the file it adds, so either file's track can be the subtitle
@@ -4586,7 +4624,7 @@ struct PlayerPlaybackTests {
   @Test("Reloading the subtitles selects again the reloaded track of the subtitle file selected before")
   func reloadAllSubsReselects() async throws {
     try await Self.withPlayer { player, folder in
-      let subtitles = try Self.writeSubtitles(["b", "c"], in: folder)
+      let subtitles = try await Self.writeSubtitles(["b", "c"], in: folder)
       subtitles.forEach { player.loadExternalSubFile($0) }
       try await Self.waitUntil { player.info.subTracks.count == 2 }
       let selected = try #require(player.info.subTracks.first { $0.externalFilename == subtitles[0].mpvStr })
@@ -4646,7 +4684,7 @@ struct PlayerPlaybackTests {
         defer { controller.close() }
         // Read, an empty folder holds nothing that can be opened, so a drag answered from what the folder holds is refused.
         let empty = folder.appendingPathComponent("empty")
-        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        try await Self.onFileSystem { try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true) }
         #expect(contentView.draggingEntered(FileDrop([empty])) == .copy)
         let videoView = player.mainWindow.videoView
         #expect(videoView.draggingEntered(FileDrop([empty])) == .copy)
@@ -4654,7 +4692,7 @@ struct PlayerPlaybackTests {
         let lut = folder.appendingPathComponent("look.cube")
         // The identity 3D LUT of size 2, red changing fastest.
         let lattice = (0..<8).map { "\($0 & 1) \(($0 >> 1) & 1) \(($0 >> 2) & 1)" }
-        try (["LUT_3D_SIZE 2"] + lattice).joined(separator: "\n").write(to: lut, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try (["LUT_3D_SIZE 2"] + lattice).joined(separator: "\n").write(to: lut, atomically: true, encoding: .utf8) }
         let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
         let waiting = player.mpv.replyCallbacks.count
         #expect(contentView.performDragOperation(FileDrop([lut])))
@@ -4707,17 +4745,23 @@ struct PlayerPlaybackTests {
       let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let folders = [plugin.dataFolderURL, plugin.tmpFolderURL]
-      #expect(folders.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+      let made = try await Self.onFileSystem { folders.allSatisfy { FileManager.default.fileExists(atPath: $0.path) } }
+      #expect(made)
       // With the folders gone, a path named in them that made them would show the file system read on the script's thread.
-      try folders.forEach { try FileManager.default.removeItem(at: $0) }
-      defer { plugin.makeFolders() }
+      try await Self.onFileSystem { try folders.forEach { try FileManager.default.removeItem(at: $0) } }
+      defer {
+        _ = try? await Self.onFileSystem {
+          try folders.forEach { try FileManager.default.createDirectory(at: $0, withIntermediateDirectories: true) }
+        }
+      }
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let api = try #require(instance.apis["subtitle"] as? JavascriptAPISubtitle)
       let named = [api.parsePath("@data/a.txt"), api.parsePath("@tmp/b.txt")]
       #expect(named.map { $0.path } == [plugin.dataFolderURL.appendingPathComponent("a.txt").standardized.path,
                                      plugin.tmpFolderURL.appendingPathComponent("b.txt").standardized.path])
       #expect(named.allSatisfy { $0.local })
-      #expect(folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) },
+      let left = try await Self.onFileSystem { folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) } }
+      #expect(left,
               "A path a plugin's script named in its data or temporary folder made the folder on the script's thread")
     }
   }
@@ -4751,12 +4795,13 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       let identifier = "io.iina.tests.player-\(load.rawValue)-\(UUID().uuidString)"
       defer { Self.uninstallPlugin(identifier) }
-      let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
+      let package = try await Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
       await PluginManager(window: NSWindow()).install(localPackageURL: package)
       let plugin = try #require(Self.installedPlugin(identifier))
       try #require(plugin.enabled)
       let entry = plugin.root.appendingPathComponent(plugin.entryPath)
-      let hold = try FileHold(entry, contents: try Data(contentsOf: entry), limit: Self.holdLimit)
+      let contents = try await Self.onFileSystem { try Data(contentsOf: entry) }
+      let hold = try FileHold(entry, contents: contents, limit: Self.holdLimit)
       switch load {
       case .loadPlugins: player.loadPlugins()
       case .reloadPlugin: player.reloadPlugin(plugin, forced: true)
@@ -4858,19 +4903,20 @@ struct PlayerPlaybackTests {
       var written: Bool?
       AppDelegate.writeDebugDump(to: path) { written = $0 }
       await Self.drainMain()
-      let writtenWhileHeld = hold.limitPassed || written != nil || FileManager.default.fileExists(atPath: path)
+      let present = await Self.fileExists(URL(filePath: path, directoryHint: .notDirectory))
+      let writtenWhileHeld = hold.limitPassed || written != nil || present
       hold.release()
       #expect(!writtenWhileHeld, "The debug dump was written on the main thread")
       try await Self.waitUntil { written != nil }
       #expect(written == true)
-      #expect(try !String(contentsOfFile: path, encoding: .utf8).isEmpty)
+      #expect(try await !Self.onFileSystem { try String(contentsOfFile: path, encoding: .utf8) }.isEmpty)
     }
   }
 
   @Test("Saving the log window's logs joins them and writes the file on the log save queue, returning while the queue is held, then the file holds the logs")
   func logSaveDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let url = folder.appendingPathComponent("iina.log")
     let logs = ["first line\n", "second line\n"].map {
       Logger.Log(subsystem: "iinaTests", level: .debug, message: $0, date: "", logString: $0)
@@ -4879,52 +4925,55 @@ struct PlayerPlaybackTests {
     var saved: Error?? = .none
     LogWindowController.write(logs, to: url) { saved = .some($0) }
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: url.path)
+    let present = await Self.fileExists(url)
+    let savedWhileHeld = hold.limitPassed || saved != nil || present
     hold.release()
     #expect(!savedWhileHeld, "Saving the logs joined them or wrote the file on the main thread")
     try await Self.waitUntil { saved != nil }
     #expect(saved! == nil)
-    let written = try String(contentsOf: url, encoding: .utf8)
+    let written = try await Self.onFileSystem { try String(contentsOf: url, encoding: .utf8) }
     #expect(written == "first line\nsecond line\n")
   }
 
   @Test("Saving the playlist writes the playlist file on the menu save queue, returning while the queue is held, then the file holds the playlist")
   func playlistSaveDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let url = folder.appendingPathComponent("playlist.m3u8")
     let playlist = ["a.mp4", "b.mp4"].map { folder.appendingPathComponent($0).path + "\n" }.joined()
     let hold = await QueueHold.reached(MainMenuActionHandler.saveQueue, limit: Self.holdLimit)
     var saved: Error?? = .none
     MainMenuActionHandler.write(playlist, to: url) { saved = .some($0) }
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: url.path)
+    let present = await Self.fileExists(url)
+    let savedWhileHeld = hold.limitPassed || saved != nil || present
     hold.release()
     #expect(!savedWhileHeld, "Saving the playlist wrote the file on the main thread")
     try await Self.waitUntil { saved != nil }
     #expect(saved! == nil)
-    let written = try String(contentsOf: url, encoding: .utf8)
+    let written = try await Self.onFileSystem { try String(contentsOf: url, encoding: .utf8) }
     #expect(written == playlist)
   }
 
   @Test("Saving a downloaded subtitle copies it on the menu save queue, returning while the queue is held, then the copy holds the subtitle")
   func downloadedSubtitleSaveDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let subtitle = folder.appendingPathComponent("downloaded.srt")
     let contents = "1\n00:00:00,000 --> 00:00:01,000\nsaved\n"
-    try contents.write(to: subtitle, atomically: true, encoding: .utf8)
+    try await Self.onFileSystem { try contents.write(to: subtitle, atomically: true, encoding: .utf8) }
     let destination = folder.appendingPathComponent("saved.srt")
     let hold = await QueueHold.reached(MainMenuActionHandler.saveQueue, limit: Self.holdLimit)
     var saved: Error?? = .none
     MainMenuActionHandler.copySubtitle(subtitle, to: destination) { saved = .some($0) }
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: destination.path)
+    let present = await Self.fileExists(destination)
+    let savedWhileHeld = hold.limitPassed || saved != nil || present
     hold.release()
     #expect(!savedWhileHeld, "Saving the downloaded subtitle copied it on the main thread")
     try await Self.waitUntil { saved != nil }
     #expect(saved! == nil)
-    let copied = try String(contentsOf: destination, encoding: .utf8)
+    let copied = try await Self.onFileSystem { try String(contentsOf: destination, encoding: .utf8) }
     #expect(copied == contents)
   }
 
@@ -4932,19 +4981,20 @@ struct PlayerPlaybackTests {
   func openSubDownloadSaveDoesNotWait() async throws {
     let filename = "iinaTests-\(UUID().uuidString).srt"
     let file = Utility.tempDirURL.appendingPathComponent(filename)
-    defer { try? FileManager.default.removeItem(at: file) }
+    defer { await Self.removeItem(file) }
     let contents = Data("1\n00:00:00,000 --> 00:00:01,000\nsaved\n".utf8)
     let hold = await QueueHold.reached(OpenSub.Subtitle.saveQueue, limit: Self.holdLimit)
     var saved: Swift.Result<URL, Error>?
     OpenSub.Subtitle.save(contents, as: filename).done { saved = .success($0) }.catch { saved = .failure($0) }
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let savedWhileHeld = hold.limitPassed || saved != nil || FileManager.default.fileExists(atPath: file.path)
+    let present = await Self.fileExists(file)
+    let savedWhileHeld = hold.limitPassed || saved != nil || present
     hold.release()
     #expect(!savedWhileHeld, "Saving the downloaded subtitle wrote it on the main thread")
     try await Self.waitUntil { saved != nil }
     let url = try #require(saved).get()
     #expect(url == file)
-    let written = try Data(contentsOf: file)
+    let written = try await Self.onFileSystem { try Data(contentsOf: file) }
     #expect(written == contents)
   }
 
@@ -4969,9 +5019,9 @@ struct PlayerPlaybackTests {
   func openFolderDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
       let subfolder = folder.appendingPathComponent("more")
-      try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true)
+      try await Self.onFileSystem { try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true) }
       let file = subfolder.appendingPathComponent("d.mp4")
-      try FileManager.default.copyItem(at: folder.appendingPathComponent("c.mp4"), to: file)
+      try await Self.onFileSystem { try FileManager.default.copyItem(at: folder.appendingPathComponent("c.mp4"), to: file) }
       let hold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
       player.openURLs([subfolder])
       try await Task.sleep(for: Self.heldAnswerWindow)
@@ -5082,10 +5132,13 @@ struct PlayerPlaybackTests {
     let name = "iinaTests-\(UUID().uuidString)"
     let folder = Utility.userInputConfDirURL
     let file = folder.appendingPathComponent("\(name).conf")
-    try "x show-text iinaTests\n".write(to: file, atomically: true, encoding: .utf8)
+    try await Self.onFileSystem { try "x show-text iinaTests\n".write(to: file, atomically: true, encoding: .utf8) }
     defer {
-      let files = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
-      files.filter { $0.hasPrefix(name) }.forEach { try? FileManager.default.removeItem(at: folder.appendingPathComponent($0)) }
+      // The configs are removed off the main thread, which does no file I/O.
+      await Task.detached {
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        files.filter { $0.hasPrefix(name) }.forEach { try? FileManager.default.removeItem(at: folder.appendingPathComponent($0)) }
+      }.value
     }
     try await restoringSettings([Preference.Key.currentInputConfigName.rawValue]) {
       try await withSettings([.currentInputConfigName: name]) { try await body(name, file.path) }
@@ -5134,7 +5187,7 @@ struct PlayerPlaybackTests {
       let fm = FileManager.default
       let newName = "\(name)-\(change)"
       let newPath = Utility.userInputConfDirURL.appendingPathComponent("\(newName).conf").path
-      let contents = try String(contentsOfFile: path, encoding: .utf8)
+      let contents = try await Self.onFileSystem { try String(contentsOfFile: path, encoding: .utf8) }
       let read = { (path: String) in try? String(contentsOfFile: path, encoding: .utf8) }
       let source = fm.temporaryDirectory.appendingPathComponent("iinaTests-\(UUID().uuidString)", isDirectory: true)
       defer { try? fm.removeItem(at: source) }
@@ -5161,7 +5214,7 @@ struct PlayerPlaybackTests {
       case .importFile:
         try fm.createDirectory(at: source, withIntermediateDirectories: true)
         let imported = source.appendingPathComponent("\(newName).conf")
-        try contents.write(to: imported, atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try contents.write(to: imported, atomically: true, encoding: .utf8) }
         ask = { shown.importFile(imported) }
         made = { read(newPath) == contents }
       case .delete:
@@ -5180,18 +5233,19 @@ struct PlayerPlaybackTests {
 
   @Test("Deleting a screenshot from its OSD removes the file on the removal queue, returning while the queue is held, then the file is gone")
   func screenshotDeleteDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let file = folder.appendingPathComponent("screenshot.png")
-    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: file)
+    try await Self.onFileSystem { try Data([0x89, 0x50, 0x4E, 0x47]).write(to: file) }
     let osd = ScreenshootOSDView()
     osd.setImage(NSImage(), size: .zero, fileURL: file)
     let hold = await QueueHold.reached(Utility.removalQueue, limit: Self.holdLimit)
     osd.deleteBtnAction(osd)
-    let removedWhileHeld = hold.limitPassed || !FileManager.default.fileExists(atPath: file.path)
+    let gone = await !Self.fileExists(file)
+    let removedWhileHeld = hold.limitPassed || gone
     hold.release()
     #expect(!removedWhileHeld, "Deleting a screenshot removed the file on the main thread")
-    try await Self.waitUntil { !FileManager.default.fileExists(atPath: file.path) }
+    try await Self.waitUntil { await !Self.fileExists(file) }
   }
 
   @Test("Fetching subtitles from Shooter hashes the media file on its hash queue, returning while the queue is held, then fails for a file it cannot read")
@@ -5265,7 +5319,7 @@ struct PlayerPlaybackTests {
     // A file that clearing removes, or for the history a file holding no history, which clearing writes empty.
     let marker = clear == .history ? url : url.appendingPathComponent("iinaTests-\(UUID().uuidString)")
     if clear != .history { try fm.createDirectory(at: url, withIntermediateDirectories: true) }
-    try Data([1]).write(to: marker)
+    try await Self.onFileSystem { try Data([1]).write(to: marker) }
     // Whether what clearing changes is cleared: the history file holds no entry, and anything else's marker is removed.
     func cleared() -> Bool {
       guard clear == .history else { return !fm.fileExists(atPath: marker.path) }
@@ -5664,8 +5718,8 @@ struct PlayerPlaybackTests {
 
   @Test("Loading a player's window while its mpv waits to read its config file makes the video layer and initializes the video without waiting for mpv, the layer's OpenGL context being made in request order by the options mpv started with, then once mpv has started the layer has its context and mpv's renderer exists")
   func videoLayerMadeDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     // mpv reads mpv.conf from the user's config folder as it initializes, and the file it includes, which the test holds.
     let defaults = UserDefaults.standard
     let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
@@ -5703,8 +5757,8 @@ struct PlayerPlaybackTests {
 
   @Test("Starting a player's mpv sets its options and initializes it in request order, returning while mpv waits to read its config file, with the requests made after it unanswered and the plugins not told mpv is initialized, then mpv has read the file and answers them")
   func mpvStartDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     // mpv reads mpv.conf from the user's config folder as it initializes, and the file it includes, which the test holds.
     let defaults = UserDefaults.standard
     let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
@@ -5740,11 +5794,11 @@ struct PlayerPlaybackTests {
 
   @Test("A plugin's global instance makes a player, returning the player's number while the player's mpv waits to read its config file, then the player's mpv has read the file and started")
   func pluginCreatePlayerDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.create-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
-    let package = try Self.makeGlobalPluginPackage(in: folder, identifier: identifier, version: "1.0")
+    let package = try await Self.makeGlobalPluginPackage(in: folder, identifier: identifier, version: "1.0")
     await PluginManager(window: NSWindow()).install(localPackageURL: package)
     let plugin = try #require(Self.installedPlugin(identifier))
     try await Self.waitUntil { plugin.globalInstance != nil }
@@ -5775,8 +5829,8 @@ struct PlayerPlaybackTests {
 
   @Test("Making the mpv option defaults creates, configures and initializes their mpv off the calling thread, returning while that mpv waits to read its config file, then the defaults and versions are read from it once it has started")
   func optionDefaultsStartDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     // The defaults' mpv reads mpv.conf from the folder it is given as it initializes, and the file it includes, which the test holds.
     let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
     let defaults = MPVOptionDefaults(configDir: folder.path)
@@ -5968,14 +6022,15 @@ struct PlayerPlaybackTests {
       // A binary looked up on the script's thread would be rejected at once, the rejection being handled once the script has run,
       // and one started on it would have run in this time.
       try await Task.sleep(for: Self.heldAnswerWindow)
+      let present = await Self.fileExists(marker)
       let lookedUpWhileHeld = hold.limitPassed || !holds("globalThis.missing === null")
-        || FileManager.default.fileExists(atPath: marker.path)
+        || present
       hold.release()
       #expect(!lookedUpWhileHeld, "A plugin's exec looked up its binary or started its process on the script's thread")
       try await Self.waitUntil { holds("globalThis.missing !== null && globalThis.status !== null") }
       #expect(holds("globalThis.missing === -1"))
       #expect(holds("globalThis.status === 0"))
-      #expect(FileManager.default.fileExists(atPath: marker.path))
+      #expect(await Self.fileExists(marker))
     }
   }
 
@@ -6032,12 +6087,17 @@ struct PlayerPlaybackTests {
       Self.keptPlugins.append(plugin)
       let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
         .appendingPathComponent("\(plugin.identifier).plist")
-      let stored = try? Data(contentsOf: file)
+      // The stored preferences are read, replaced and restored off the main thread, which does no file I/O.
+      let stored = await Task.detached { try? Data(contentsOf: file) }.value
       defer {
-        if let stored { try? stored.write(to: file) } else { try? FileManager.default.removeItem(at: file) }
+        await Task.detached {
+          if let stored { try? stored.write(to: file) } else { try? FileManager.default.removeItem(at: file) }
+        }.value
       }
-      try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-      try (["stored": 1] as NSDictionary).write(to: file)
+      try await Self.onFileSystem {
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try (["stored": 1] as NSDictionary).write(to: file)
+      }
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
       let hold = await QueueHold.reached(JavascriptPlugin.preferencesQueue, limit: Self.holdLimit)
@@ -6098,14 +6158,14 @@ struct PlayerPlaybackTests {
 
   @Test("Syncing a plugin's preferences writes its preferences file on the plugins' preferences queue, returning while the queue is held, then writes the values set")
   func pluginPreferencesSyncDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let plugin = try await Self.makePlugin(in: folder)
     Self.keptPlugins.append(plugin)
     let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
       .appendingPathComponent("\(plugin.identifier).plist")
-    try? FileManager.default.removeItem(at: file)
-    defer { try? FileManager.default.removeItem(at: file) }
+    await Self.removeItem(file)
+    defer { await Self.removeItem(file) }
     var loaded = false
     plugin.loadPreferences { loaded = true }
     try await Self.waitUntil { loaded }
@@ -6114,10 +6174,13 @@ struct PlayerPlaybackTests {
     plugin.syncPreferences()
     // A file written on the main thread would have been written once the main queue had run the write.
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let writtenWhileHeld = hold.limitPassed || FileManager.default.fileExists(atPath: file.path)
+    let written = await Self.fileExists(file)
+    let writtenWhileHeld = hold.limitPassed || written
     hold.release()
     #expect(!writtenWhileHeld, "Syncing a plugin's preferences wrote its preferences file on the main thread")
-    try await Self.waitUntil { (NSDictionary(contentsOf: file) as? [String: Any])?["synced"] as? Int == 3 }
+    try await Self.waitUntil {
+      (try? await Self.onFileSystem { (NSDictionary(contentsOf: file) as? [String: Any])?["synced"] as? Int }) == 3
+    }
   }
 
   /// An act of a plugin's preference page that saves the plugin's preferences.
@@ -6127,14 +6190,14 @@ struct PlayerPlaybackTests {
 
   @Test("A plugin's preference page saves the plugin's preferences on the plugins' preferences queue when it closes, changes tab or is dismissed, returning while the queue is held, then writes the values set", arguments: PluginPreferencesSave.allCases)
   func pluginPreferencesSaveDoesNotWait(_ save: PluginPreferencesSave) async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let plugin = try await Self.makePlugin(in: folder)
     Self.keptPlugins.append(plugin)
     let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
       .appendingPathComponent("\(plugin.identifier).plist")
-    try? FileManager.default.removeItem(at: file)
-    defer { try? FileManager.default.removeItem(at: file) }
+    await Self.removeItem(file)
+    defer { await Self.removeItem(file) }
     var loaded = false
     plugin.loadPreferences { loaded = true }
     try await Self.waitUntil { loaded }
@@ -6163,22 +6226,25 @@ struct PlayerPlaybackTests {
     ask()
     // A file written on the main thread would have been written once the main queue had run the write.
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let writtenWhileHeld = hold.limitPassed || FileManager.default.fileExists(atPath: file.path)
+    let written = await Self.fileExists(file)
+    let writtenWhileHeld = hold.limitPassed || written
     hold.release()
     #expect(!writtenWhileHeld, "A plugin's preference page wrote the plugin's preferences file on the main thread when \(save)")
-    try await Self.waitUntil { (NSDictionary(contentsOf: file) as? [String: Any])?["saved"] as? Int == 4 }
+    try await Self.waitUntil {
+      (try? await Self.onFileSystem { (NSDictionary(contentsOf: file) as? [String: Any])?["saved"] as? Int }) == 4
+    }
   }
 
   @Test("A plugin's preference page serializes a value its page asks for on the plugins' preferences queue, returning while the queue is held, then hands the page the value", arguments: KeyBindingConfigPage.allCases)
   func pluginPreferencePageGetDoesNotWait(_ page: KeyBindingConfigPage) async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let plugin = try await Self.makePlugin(in: folder)
     Self.keptPlugins.append(plugin)
     let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
       .appendingPathComponent("\(plugin.identifier).plist")
-    try? FileManager.default.removeItem(at: file)
-    defer { try? FileManager.default.removeItem(at: file) }
+    await Self.removeItem(file)
+    defer { await Self.removeItem(file) }
     var loaded = false
     plugin.loadPreferences { loaded = true }
     try await Self.waitUntil { loaded }
@@ -6262,13 +6328,13 @@ struct PlayerPlaybackTests {
       // A folder of the plugin's own, so that the folder listed holds only the test's files.
       let sub = UUID().uuidString
       let folderURL = plugin.tmpFolderURL.appendingPathComponent(sub)
-      try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-      defer { try? FileManager.default.removeItem(at: folderURL) }
-      func url(_ name: String) -> URL { folderURL.appendingPathComponent(name) }
-      func exists(_ name: String) -> Bool { FileManager.default.fileExists(atPath: url(name).path) }
+      try await Self.onFileSystem { try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true) }
+      defer { await Self.removeItem(folderURL) }
+      @Sendable func url(_ name: String) -> URL { folderURL.appendingPathComponent(name) }
+      func exists(_ name: String) async -> Bool { await Self.fileExists(url(name)) }
       let trashed = "trashed-\(sub).txt"
       for name in ["kept.txt", "deleted.txt", "moved.txt", trashed] {
-        try name.write(to: url(name), atomically: true, encoding: .utf8)
+        try await Self.onFileSystem { try name.write(to: url(name), atomically: true, encoding: .utf8) }
       }
       let dir = "@tmp/\(sub)/"
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
@@ -6294,27 +6360,31 @@ struct PlayerPlaybackTests {
       let passed = hold.limitPassed
       #expect(!passed && holds("answers.exists === undefined"), "A plugin's file.exists looked for the file on the script's thread")
       #expect(!passed && holds("answers.list === undefined"), "A plugin's file.list listed the folder on the script's thread")
-      #expect(!passed && !exists("written.txt") && holds("answers.write === undefined"),
+      #expect(await !exists("written.txt") && !passed && holds("answers.write === undefined"),
               "A plugin's file.write wrote the file on the script's thread")
       #expect(!passed && holds("answers.read === undefined"), "A plugin's file.read read the file on the script's thread")
-      #expect(!passed && exists(trashed), "A plugin's file.trash trashed the file on the script's thread")
-      #expect(!passed && exists("deleted.txt"), "A plugin's file.delete deleted the file on the script's thread")
-      #expect(!passed && exists("moved.txt"), "A plugin's file.move moved the file on the script's thread")
+      #expect(await exists(trashed) && !passed, "A plugin's file.trash trashed the file on the script's thread")
+      #expect(await exists("deleted.txt") && !passed, "A plugin's file.delete deleted the file on the script's thread")
+      #expect(await exists("moved.txt") && !passed, "A plugin's file.move moved the file on the script's thread")
       #expect(!passed && holds("answers.handle === undefined"), "A plugin's file.handle opened the file on the script's thread")
       hold.release()
       try await Self.waitUntil { holds("Object.keys(answers).length === 8") }
       #expect(holds("answers.exists === true"))
       // The folder is listed after the requests asked before it and before those asked after it.
       #expect(holds("answers.list === 'deleted.txt,kept.txt,moved.txt,\(trashed)'"))
-      #expect(try String(contentsOf: url("written.txt"), encoding: .utf8) == "written")
+      #expect(try await Self.onFileSystem { try String(contentsOf: url("written.txt"), encoding: .utf8) } == "written")
       #expect(holds("answers.read === 'kept.txt'"))
-      #expect(!exists(trashed))
-      #expect(!exists("deleted.txt"))
-      #expect(!exists("moved.txt") && exists("moved-to.txt"))
+      #expect(await !exists(trashed))
+      #expect(await !exists("deleted.txt"))
+      #expect(await !exists("moved.txt"))
+      #expect(await exists("moved-to.txt"))
       #expect(holds("answers.handle === 'function'"))
-      if let trash = try? FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: folderURL, create: false) {
-        try? FileManager.default.removeItem(at: trash.appendingPathComponent(trashed))
-      }
+      // The trashed file is removed from the Trash off the main thread, which does no file I/O.
+      await Task.detached {
+        if let trash = try? FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: folderURL, create: false) {
+          try? FileManager.default.removeItem(at: trash.appendingPathComponent(trashed))
+        }
+      }.value
     }
   }
 
@@ -6325,11 +6395,11 @@ struct PlayerPlaybackTests {
       Self.keptPlugins.append(plugin)
       let sub = UUID().uuidString
       let folderURL = plugin.tmpFolderURL.appendingPathComponent(sub)
-      try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-      defer { try? FileManager.default.removeItem(at: folderURL) }
+      try await Self.onFileSystem { try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true) }
+      defer { await Self.removeItem(folderURL) }
       let written = folderURL.appendingPathComponent("written.txt")
-      try "0123456789".write(to: folderURL.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8)
-      try Data().write(to: written)
+      try await Self.onFileSystem { try "0123456789".write(to: folderURL.appendingPathComponent("source.txt"), atomically: true, encoding: .utf8) }
+      try await Self.onFileSystem { try Data().write(to: written) }
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let api = try #require(instance.apis["file"] as? JavascriptAPIFile)
       func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
@@ -6354,7 +6424,7 @@ struct PlayerPlaybackTests {
       // had run.
       try await Task.sleep(for: Self.heldAnswerWindow)
       let passed = hold.limitPassed
-      let writtenWhileHeld = try Data(contentsOf: written)
+      let writtenWhileHeld = try await Self.onFileSystem { try Data(contentsOf: written) }
       #expect(!passed && holds("answers.seekTo === undefined"), "A plugin's handle.seekTo moved in the file on the script's thread")
       #expect(!passed && holds("answers.offset === undefined"), "A plugin's handle.offset told its offset on the script's thread")
       #expect(!passed && holds("answers.read === undefined"), "A plugin's handle.read read the file on the script's thread")
@@ -6369,7 +6439,7 @@ struct PlayerPlaybackTests {
       #expect(holds("answers.read === '234' && answers.readToEnd === '56789'"))
       #expect(holds("answers.seekToEnd === true && answers.endOffset === 10"))
       #expect(holds("answers.write === true && answers.close === true"))
-      #expect(try String(contentsOf: written, encoding: .utf8) == "abc")
+      #expect(try await Self.onFileSystem { try String(contentsOf: written, encoding: .utf8) } == "abc")
     }
   }
 
@@ -6410,7 +6480,7 @@ struct PlayerPlaybackTests {
   func initialWindowDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
       let file = folder.appendingPathComponent("last.mp4")
-      try Data().write(to: file)
+      try await Self.onFileSystem { try Data().write(to: file) }
       try await Self.withSettings([.recordRecentFiles: true, .resumeLastPosition: true,
                                    .iinaLastPlayedFilePath: file.path, .iinaLastPlayedFilePosition: 75.0]) {
         let controller: InitialWindowController = player.initialWindow
@@ -6434,10 +6504,10 @@ struct PlayerPlaybackTests {
 
   @Test("Restoring the recent documents resolves their saved bookmarks on the recent documents queue, returning while the queue is held, then lists the documents they resolve to")
   func recentDocumentsRestoreDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let file = folder.appendingPathComponent("recent.mp4")
-    try Data().write(to: file)
+    try await Self.onFileSystem { try Data().write(to: file) }
     let bookmark = try file.bookmarkData()
     // The documents are listed by the recorder, not in the recent-documents list the installed app shares.
     let recent = RecentDocumentsRecorder()
@@ -6461,10 +6531,10 @@ struct PlayerPlaybackTests {
 
   @Test("Saving the recent documents makes their bookmarks on the recent documents queue, returning while the queue is held, then saves the bookmarks")
   func recentDocumentsSaveDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let file = folder.appendingPathComponent("recent.mp4")
-    try Data().write(to: file)
+    try await Self.onFileSystem { try Data().write(to: file) }
     let documents = AppDelegate.recentDocumentURLs
     AppDelegate.recentDocumentURLs = { [file] }
     defer { AppDelegate.recentDocumentURLs = documents }
@@ -6505,8 +6575,8 @@ struct PlayerPlaybackTests {
   @Test("Each site that shows the History window's entries reads, searches and groups the history and finds which files exist on the window's data queue, returning while the queue is held, then shows the entries, a missing file dimmed and offered neither to play, to show in Finder nor to trash",
         arguments: HistoryWindowLoad.allCases)
   func historyWindowDataDoesNotWait(_ load: HistoryWindowLoad) async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let (file, missing) = (folder.appendingPathComponent("a.mp4"), folder.appendingPathComponent("missing.mp4"))
     let entries = [file, missing].map { PlaybackHistory(url: $0, duration: 4, title: nil, mpvMd5: $0.path) }
     // The shared history is read on its queue once first touched, so the test reads and changes it once the read has ended.
@@ -6587,15 +6657,20 @@ struct PlayerPlaybackTests {
   @Test("Each change to the playback history reads, archives and writes the history file on the history queue, returning while the queue is held, after which the history and its file hold the change",
         arguments: HistoryChange.allCases)
   func historyChangeDoesNotWait(_ change: HistoryChange) async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let plist = folder.appendingPathComponent("history.plist")
     let entries = ["a", "b", "c"].map { folder.appendingPathComponent("\($0).mp4") }
       .map { PlaybackHistory(url: $0, duration: 4, title: nil, mpvMd5: $0.path) }
-    try NSKeyedArchiver.archivedData(withRootObject: entries, requiringSecureCoding: true).write(to: plist)
-    func stored() throws -> [URL] {
-      let object = try NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, PlaybackHistory.self], from: Data(contentsOf: plist))
-      return try #require(object as? [PlaybackHistory]).map(\.url)
+    let archived = try NSKeyedArchiver.archivedData(withRootObject: entries, requiringSecureCoding: true)
+    try await Self.onFileSystem { try archived.write(to: plist) }
+    // The stored history is read and decoded off the main thread, which does no file I/O and no decoding.
+    func stored() async throws -> [URL] {
+      let urls = try await Self.onFileSystem {
+        let object = try NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, PlaybackHistory.self], from: Data(contentsOf: plist))
+        return (object as? [PlaybackHistory])?.map(\.url)
+      }
+      return try #require(urls)
     }
     var controller: HistoryController?
     if change != .read {
@@ -6617,7 +6692,7 @@ struct PlayerPlaybackTests {
     let history = try #require(controller)
     // A history or a file changed while the queue is held was read, archived or written on the main thread.
     let shownWhileHeld = history.history.map(\.url)
-    let storedWhileHeld = try stored()
+    let storedWhileHeld = try await stored()
     let changedWhileHeld = hold.limitPassed || shownWhileHeld != (change == .read ? [] : entries.map(\.url))
       || storedWhileHeld != entries.map(\.url)
     hold.release()
@@ -6629,32 +6704,34 @@ struct PlayerPlaybackTests {
     case .removeAll: expected = []
     }
     try await Self.waitUntil { history.tasksOutstanding == 0 && history.history.map(\.url) == expected }
-    #expect(try stored() == expected)
+    #expect(try await stored() == expected)
   }
 
   @Test("Deleting the files of history entries moves them to the Trash on the History window's data queue, returning while the queue is held, then the files are gone")
   func historyFilesTrashDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let files = ["a", "b"].map { folder.appendingPathComponent("iinaTests-\(UUID().uuidString)-\($0).mp4") }
-    try files.forEach { try Data().write(to: $0) }
+    try await Self.onFileSystem { try files.forEach { try Data().write(to: $0) } }
     let hold = await QueueHold.reached(HistoryWindowController.dataQueue, limit: Self.holdLimit)
     var trashed = false
     HistoryWindowController.trash(files) { trashed = true }
     await Self.drainMain()
-    let trashedWhileHeld = hold.limitPassed || trashed || files.contains { !FileManager.default.fileExists(atPath: $0.path) }
+    let gone = try await Self.onFileSystem { files.contains { !FileManager.default.fileExists(atPath: $0.path) } }
+    let trashedWhileHeld = hold.limitPassed || trashed || gone
     hold.release()
     #expect(!trashedWhileHeld, "The History window moved a file to the Trash on the main thread")
     try await Self.waitUntil { trashed }
-    #expect(!files.contains { FileManager.default.fileExists(atPath: $0.path) })
+    let left = try await Self.onFileSystem { files.contains { FileManager.default.fileExists(atPath: $0.path) } }
+    #expect(!left)
   }
 
   @Test("Pasting files into the playlist searches their folders on the player's open queue, returning while the queue is held, then adds the playable files")
   func playlistPasteDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
       let subfolder = folder.appendingPathComponent("more")
-      try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true)
-      try Data().write(to: subfolder.appendingPathComponent("d.mp4"))
+      try await Self.onFileSystem { try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true) }
+      try await Self.onFileSystem { try Data().write(to: subfolder.appendingPathComponent("d.mp4")) }
       let pane = Self.kept(SidebarPlaylistPane(player: player))
       let count = player.info.$playlist.withLock { $0.count }
       // Adding to the playlist turns shuffling off at once, so shuffling still on shows that nothing was added yet.
@@ -6727,22 +6804,24 @@ struct PlayerPlaybackTests {
           pasteboard.writeObjects(saved)
         }
         let shots = folder.appendingPathComponent("screenshots")
-        try FileManager.default.createDirectory(at: shots, withIntermediateDirectories: true)
+        try await Self.onFileSystem { try FileManager.default.createDirectory(at: shots, withIntermediateDirectories: true) }
         let shot = shots.appendingPathComponent("shot.png")
         let bitmap = try #require(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4, bitsPerSample: 8,
                                                    samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                                                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
-        try #require(bitmap.representation(using: .png, properties: [:])).write(to: shot)
+        let png = try #require(bitmap.representation(using: .png, properties: [:]))
+        try await Self.onFileSystem { try png.write(to: shot) }
         player.mpv.setString(MPVOption.Screenshot.screenshotDir, shots.path)
         let changeCount = pasteboard.changeCount
         let hold = await QueueHold.reached(PlayerCore.screenshotQueue, limit: Self.holdLimit)
         player.screenshotCallback()
         try await Task.sleep(for: Self.heldAnswerWindow)
+        let gone = await !Self.fileExists(shot)
         let handledWhileHeld = hold.limitPassed || pasteboard.changeCount != changeCount
-          || !FileManager.default.fileExists(atPath: shot.path)
+          || gone
         hold.release()
         #expect(!handledWhileHeld, "Handling the screenshot found or decoded it on the main thread")
-        try await Self.waitUntil { !FileManager.default.fileExists(atPath: shot.path) }
+        try await Self.waitUntil { await !Self.fileExists(shot) }
         #expect(pasteboard.changeCount != changeCount)
       }
     }
@@ -6777,9 +6856,9 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       // A folder chosen in the open panel comes as a URL of a folder.
       let subfolder = folder.appendingPathComponent("more", isDirectory: true)
-      try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true)
+      try await Self.onFileSystem { try FileManager.default.createDirectory(at: subfolder, withIntermediateDirectories: true) }
       let file = subfolder.appendingPathComponent("d.mp4")
-      try Data().write(to: file)
+      try await Self.onFileSystem { try Data().write(to: file) }
       let pane = Self.kept(SidebarPlaylistPane(player: player))
       let count = player.info.$playlist.withLock { $0.count }
       // Adding to the playlist turns shuffling off at once, so shuffling still on shows that nothing was added yet.
@@ -6819,9 +6898,9 @@ struct PlayerPlaybackTests {
   /// Make `Utility.trashItem` move files into the folder `Trash` of `folder` in place of the Trash, so that the Trash of the account
   /// running the tests is left untouched.
   /// - Returns: The folder files are moved into, and a function that restores `Utility.trashItem`.
-  private static func useTestTrash(in folder: URL) throws -> (URL, () -> Void) {
+  private static func useTestTrash(in folder: URL) async throws -> (URL, () -> Void) {
     let trash = folder.appendingPathComponent("Trash")
-    try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true)
+    try await Self.onFileSystem { try FileManager.default.createDirectory(at: trash, withIntermediateDirectories: true) }
     let trashItem = Utility.trashItem
     Utility.trashItem = { try FileManager.default.moveItem(at: $0, to: trash.appendingPathComponent($0.lastPathComponent)) }
     return (trash, { Utility.trashItem = trashItem })
@@ -6838,12 +6917,13 @@ struct PlayerPlaybackTests {
       pane.selectedRows = IndexSet([row])
       // Removing a row turns shuffling off at once, so shuffling still on shows that no row was removed yet.
       player.info.isShuffled = true
-      let (trash, restoreTrashItem) = try Self.useTestTrash(in: folder)
+      let (trash, restoreTrashItem) = try await Self.useTestTrash(in: folder)
       defer { restoreTrashItem() }
       let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
       let queueHold = await QueueHold.reached(player.openQueue, limit: Self.holdLimit)
       pane.contextMenuDeleteFile(NSMenuItem())
-      let trashedWhileHeld = queueHold.limitPassed || !FileManager.default.fileExists(atPath: file.path)
+      let gone = await !Self.fileExists(file)
+      let trashedWhileHeld = queueHold.limitPassed || gone
       queueHold.release()
       // Once the file is in the Trash its row is removed on the main thread, while the core is still held.
       try await Self.waitUntil { !player.info.isShuffled }
@@ -6852,10 +6932,10 @@ struct PlayerPlaybackTests {
       try await Self.waitUntil { coreHold.hasLetGo }
       #expect(!trashedWhileHeld, "Deleting a playlist item's file moved it to the Trash on the main thread")
       #expect(removedWhileHeld, "Removing the row of a deleted file waited for mpv")
-      #expect(!FileManager.default.fileExists(atPath: file.path))
+      #expect(await !Self.fileExists(file))
       try await Self.waitUntil { player.info.$playlist.withLock { $0.count } == count - 1 }
       #expect(!player.info.$playlist.withLock { $0.contains { $0.filename == file.path } })
-      #expect(FileManager.default.fileExists(atPath: trash.appendingPathComponent(file.lastPathComponent).path),
+      #expect(await Self.fileExists(trash.appendingPathComponent(file.lastPathComponent)),
               "The deleted file was not moved to the Trash")
     }
   }
@@ -6963,9 +7043,9 @@ struct PlayerPlaybackTests {
     #expect(!openedWhileHeld, "Writing the first line made the log folder on the main thread")
     try await Self.waitUntil { Logger.logDirectory != nil }
     let folder = try #require(Logger.logDirectory)
-    defer { try? FileManager.default.removeItem(at: folder) }
+    defer { await Self.removeItem(folder) }
     let file = folder.appendingPathComponent("iina.log")
-    try await Self.waitUntil { (try? String(contentsOf: file, encoding: .utf8))?.contains(line) == true }
+    try await Self.waitUntil { (try? await Self.onFileSystem { try String(contentsOf: file, encoding: .utf8) })?.contains(line) == true }
     #expect(folder != logDirectory)
     #expect(Self.isOpen(file))
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -7118,7 +7198,7 @@ struct PlayerPlaybackTests {
       let handler: MainMenuActionHandler = player.mainWindow.menuActionHandler
       let file = try #require(player.info.currentURL)
       let count = player.info.$playlist.withLock { $0.count }
-      let (trash, restoreTrashItem) = try Self.useTestTrash(in: folder)
+      let (trash, restoreTrashItem) = try await Self.useTestTrash(in: folder)
       defer { restoreTrashItem() }
       let deletedWhileHeld = try await Self.returnsWhileHeld(player) {
         if hard {
@@ -7128,10 +7208,10 @@ struct PlayerPlaybackTests {
         }
       }
       #expect(deletedWhileHeld, "Deleting the current file waited for mpv")
-      try await Self.waitUntil { !FileManager.default.fileExists(atPath: file.path) }
+      try await Self.waitUntil { await !Self.fileExists(file) }
       try await Self.waitUntil { player.info.$playlist.withLock { $0.count } == count - 1 }
       #expect(!player.info.$playlist.withLock { $0.contains { $0.filename == file.path } })
-      #expect(FileManager.default.fileExists(atPath: trash.appendingPathComponent(file.lastPathComponent).path) == !hard,
+      #expect(await Self.fileExists(trash.appendingPathComponent(file.lastPathComponent)) == !hard,
               "The deleted file was not moved to the Trash, or was deleted for good")
     }
   }
@@ -7213,7 +7293,7 @@ struct PlayerPlaybackTests {
           try await Self.withOpenSubServer { server in
             // A file too small for Open Subtitles to hash, so that the search stops once the file is read.
             let file = folder.appendingPathComponent("small.mp4")
-            try Data(count: 1024).write(to: file)
+            try await Self.onFileSystem { try Data(count: 1024).write(to: file) }
             let keychainHold = await QueueHold.reached(KeychainAccess.queue, limit: Self.holdLimit)
             let hashHold = await QueueHold.reached(OpenSub.Fetcher.hashQueue, limit: Self.holdLimit)
             let coreHold = try MPVCoreHold(player.mpv, limit: Self.holdLimit)
@@ -7294,25 +7374,35 @@ struct PlayerPlaybackTests {
   /// Write `<identifier>-<version>.iinaplgz` in `folder`, the package of a plugin with `identifier`, `version` and the other keys of
   /// `info`, whose script sets `globalThis.version` to its version.
   private static func makePluginPackage(in folder: URL, identifier: String, version: String,
-                                        info: [String: Any] = [:]) throws -> URL {
+                                        info: [String: Any] = [:]) async throws -> URL {
     let source = folder.appendingPathComponent("\(identifier)-\(version)")
-    try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
     let required: [String: Any] = ["name": "iinaTests", "author": ["name": "iinaTests"], "identifier": identifier,
                                    "version": version, "entry": "main.js"]
-    let infoFile = source.appendingPathComponent("Info.json")
-    let script = source.appendingPathComponent("main.js")
-    try JSONSerialization.data(withJSONObject: required.merging(info) { $1 }).write(to: infoFile)
-    try "globalThis.version = \"\(version)\";".write(to: script, atomically: true, encoding: .utf8)
+    let infoData = try JSONSerialization.data(withJSONObject: required.merging(info) { $1 })
     let package = folder.appendingPathComponent("\(identifier)-\(version).iinaplgz")
-    let zip = Process()
-    zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-    zip.arguments = ["-j", "-q", package.path, infoFile.path, script.path]
-    try zip.run()
-    zip.waitUntilExit()
-    try #require(zip.terminationStatus == 0)
+    // The package is written and zipped off the main thread, which does no file I/O and waits for no process.
+    let status = try await onFileSystem {
+      let infoFile = source.appendingPathComponent("Info.json")
+      let script = source.appendingPathComponent("main.js")
+      try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+      try infoData.write(to: infoFile)
+      try "globalThis.version = \"\(version)\";".write(to: script, atomically: true, encoding: .utf8)
+      return try zipFiles([infoFile, script], into: package)
+    }
+    try #require(status == 0)
     return package
   }
 
+  /// Add `files` to the zip archive `package` and wait for `zip` to exit, on the calling thread.
+  /// - Returns: The exit status of `zip`.
+  nonisolated private static func zipFiles(_ files: [URL], into package: URL) throws -> Int32 {
+    let zip = Process()
+    zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+    zip.arguments = ["-j", "-q", package.path] + files.map(\.path)
+    try zip.run()
+    zip.waitUntilExit()
+    return zip.terminationStatus
+  }
   /// The installed plugin with `identifier`, if there is one.
   private static func installedPlugin(_ identifier: String) -> JavascriptPlugin? {
     JavascriptPlugin.plugins.first { $0.identifier == identifier }
@@ -7359,11 +7449,11 @@ struct PlayerPlaybackTests {
 
   @Test("Reading the plugins folder again reads it on the plugin install queue, returning while the queue is held, then replaces the plugin list with the plugins read")
   func pluginListReadDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.list-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
-    let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
+    let package = try await Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
     await PluginManager(window: NSWindow()).install(localPackageURL: package)
     let installed = try #require(Self.installedPlugin(identifier))
     // The plugins read replace the plugins listed, which the other tests hold, so those are put back.
@@ -7385,13 +7475,13 @@ struct PlayerPlaybackTests {
 
   @Test("Installing the packages of a folder, as the default plugins are installed on first launch, unpacks them and moves their plugins into the plugins folder on the plugin install queue, returning while the queue is held, then installs and enables the plugins")
   func pluginPackagesInstallDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.default-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let packages = folder.appendingPathComponent("packages")
-    try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true)
-    _ = try Self.makePluginPackage(in: packages, identifier: identifier, version: "1.0")
+    try await Self.onFileSystem { try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true) }
+    _ = try await Self.makePluginPackage(in: packages, identifier: identifier, version: "1.0")
     let destination = Utility.pluginsURL.appendingPathComponent("\(identifier).iinaplugin")
     let installedAll = Box<Bool>()
     // The packages are unpacked while the queue is held first, and their plugins moved into the plugins folder while it is held again.
@@ -7402,8 +7492,9 @@ struct PlayerPlaybackTests {
     unpackHold.release()
     let moveHold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: Self.holdLimit)
     try await Task.sleep(for: Self.heldAnswerWindow)
+    let present = await Self.fileExists(destination)
     let movedWhileHeld = moveHold.limitPassed || installedAll.value != nil || Self.installedPlugin(identifier) != nil
-      || FileManager.default.fileExists(atPath: destination.path)
+      || present
     moveHold.release()
     #expect(!unpackedWhileHeld, "Installing the packages of a folder unpacked them on the main thread")
     #expect(!movedWhileHeld, "Installing the packages of a folder moved their plugins into the plugins folder on the main thread")
@@ -7416,12 +7507,12 @@ struct PlayerPlaybackTests {
 
   @Test("Installing a plugin package unpacks and reads it on the plugin install queue, returning while the queue is held, then installs and enables the plugin")
   func pluginPackageInstallDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.package"
     Self.uninstallPlugin(identifier)
     defer { Self.uninstallPlugin(identifier) }
-    let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
+    let package = try await Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0")
     let manager = PluginManager(window: NSWindow())
     let (offMain, reported) = try await Self.installWhileHeld(identifier) { report in
       await manager.install(localPackageURL: package, handler: report)
@@ -7442,14 +7533,15 @@ struct PlayerPlaybackTests {
   @Test("Each site that unpacks a plugin package returns while the package file is held, the process unpacking it waiting for the file off the main thread, then installs and enables the plugin once the file is answered",
         arguments: PluginPackageUnpack.allCases)
   func pluginPackageUnpackDoesNotWait(_ site: PluginPackageUnpack) async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.unpack-\(site.rawValue)-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let packages = folder.appendingPathComponent("packages")
-    try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true)
-    let package = try Self.makePluginPackage(in: packages, identifier: identifier, version: "1.0")
-    let hold = try FileHold(package, contents: try Data(contentsOf: package), limit: Self.holdLimit)
+    try await Self.onFileSystem { try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true) }
+    let package = try await Self.makePluginPackage(in: packages, identifier: identifier, version: "1.0")
+    let contents = try await Self.onFileSystem { try Data(contentsOf: package) }
+    let hold = try FileHold(package, contents: contents, limit: Self.holdLimit)
     defer { hold.release() }
     let ended = Box<Bool>()
     switch site {
@@ -7471,18 +7563,18 @@ struct PlayerPlaybackTests {
 
   @Test("Installing a plugin from GitHub finds, downloads and unpacks it on the plugin install queue, returning while the queue is held, then installs and enables the plugin")
   func pluginGitHubInstallDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.github"
     Self.uninstallPlugin(identifier)
     defer { Self.uninstallPlugin(identifier) }
-    let package = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0",
+    let package = try await Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0",
                                              info: ["ghRepo": "iinaTests/github", "ghVersion": 1])
     let release = "https://api.github.com/repos/iinaTests/github/releases/latest"
     let download = "https://github.com/iinaTests/github/releases/download/1.0/iinaTests.iinaplgz"
     let assets: [String: Any] = ["assets": [["name": "iinaTests.iinaplgz", "browser_download_url": download]]]
     let github = GitHubRecorder([release: try JSONSerialization.data(withJSONObject: assets),
-                                 download: try Data(contentsOf: package)])
+                                 download: try await Self.onFileSystem { try Data(contentsOf: package) }])
     let get = JavascriptPlugin.getFromGitHub
     JavascriptPlugin.getFromGitHub = github.answer
     defer { JavascriptPlugin.getFromGitHub = get }
@@ -7517,12 +7609,12 @@ struct PlayerPlaybackTests {
       defer { Self.uninstallPlugin(identifier) }
       let window = NSWindow()
       let manager = PluginManager(window: window)
-      let installed = try Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0",
+      let installed = try await Self.makePluginPackage(in: folder, identifier: identifier, version: "1.0",
                                                  info: ["ghRepo": "iinaTests/update", "ghVersion": 1])
       await manager.install(localPackageURL: installed)
       let plugin = try #require(Self.installedPlugin(identifier))
       let position = try #require(JavascriptPlugin.plugins.firstIndex(of: plugin))
-      let update = try Self.makePluginPackage(in: folder, identifier: identifier, version: "2.0",
+      let update = try await Self.makePluginPackage(in: folder, identifier: identifier, version: "2.0",
                                               info: ["ghRepo": "iinaTests/update", "ghVersion": 2])
       let latest = "https://raw.githubusercontent.com/iinaTests/update/main/Info.json"
       let release = "https://api.github.com/repos/iinaTests/update/releases/latest"
@@ -7531,7 +7623,7 @@ struct PlayerPlaybackTests {
       let github = GitHubRecorder([
         latest: try JSONSerialization.data(withJSONObject: ["ghVersion": 2, "version": "2.0"] as [String: Any]),
         release: try JSONSerialization.data(withJSONObject: assets),
-        download: try Data(contentsOf: update),
+        download: try await Self.onFileSystem { try Data(contentsOf: update) },
       ])
       let get = JavascriptPlugin.getFromGitHub
       JavascriptPlugin.getFromGitHub = github.answer
@@ -7563,16 +7655,15 @@ struct PlayerPlaybackTests {
 
   /// Write the package `makePluginPackage` writes, of a plugin whose global entry `global.js` also sets `globalThis.version` to its
   /// version.
-  private static func makeGlobalPluginPackage(in folder: URL, identifier: String, version: String) throws -> URL {
-    let package = try makePluginPackage(in: folder, identifier: identifier, version: version, info: ["globalEntry": "global.js"])
+  private static func makeGlobalPluginPackage(in folder: URL, identifier: String, version: String) async throws -> URL {
+    let package = try await makePluginPackage(in: folder, identifier: identifier, version: version, info: ["globalEntry": "global.js"])
     let script = folder.appendingPathComponent("\(identifier)-\(version)").appendingPathComponent("global.js")
-    try "globalThis.version = \"\(version)\";".write(to: script, atomically: true, encoding: .utf8)
-    let zip = Process()
-    zip.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-    zip.arguments = ["-j", "-q", package.path, script.path]
-    try zip.run()
-    zip.waitUntilExit()
-    try #require(zip.terminationStatus == 0)
+    // The script is written and zipped off the main thread, which does no file I/O and waits for no process.
+    let status = try await onFileSystem {
+      try "globalThis.version = \"\(version)\";".write(to: script, atomically: true, encoding: .utf8)
+      return try zipFiles([script], into: package)
+    }
+    try #require(status == 0)
     return package
   }
 
@@ -7581,7 +7672,7 @@ struct PlayerPlaybackTests {
   /// - Returns: The plugin and the player its global instance made, which has no window and whose `mpv` is idle.
   private static func installGlobalPlugin(_ identifier: String, version: String = "1.0",
                                           in folder: URL) async throws -> (JavascriptPlugin, PlayerCore) {
-    let package = try makeGlobalPluginPackage(in: folder, identifier: identifier, version: version)
+    let package = try await makeGlobalPluginPackage(in: folder, identifier: identifier, version: version)
     await PluginManager(window: NSWindow()).install(localPackageURL: package)
     let plugin = try #require(installedPlugin(identifier))
     try await waitUntil { plugin.globalInstance != nil }
@@ -7619,7 +7710,7 @@ struct PlayerPlaybackTests {
   /// instance made, and `JavascriptPlugin.installQueue` are both held. Once the answer has had the time to be handled, `check` looks
   /// at what it did while both were held; then both are let go and the player is waited for until it has shut down.
   /// - Returns: Whether `check` passed and the answer asked the player to shut down, both holds holding until then.
-  private static func answerWhileHeld(_ window: NSWindow, player: PlayerCore, check: () -> Bool) async throws -> Bool {
+  private static func answerWhileHeld(_ window: NSWindow, player: PlayerCore, check: () async -> Bool) async throws -> Bool {
     try await waitUntil { window.attachedSheet != nil }
     let sheet = try #require(window.attachedSheet)
     let answeredWhileHeld: Bool
@@ -7629,7 +7720,7 @@ struct PlayerPlaybackTests {
       let queueHold = await QueueHold.reached(JavascriptPlugin.installQueue, limit: holdLimit)
       window.endSheet(sheet, returnCode: .alertFirstButtonReturn)
       try await Task.sleep(for: heldAnswerWindow)
-      answeredWhileHeld = check() && player.info.state == .shuttingDown && !coreHold.hasLetGo && !queueHold.limitPassed
+      answeredWhileHeld = await check() && player.info.state == .shuttingDown && !coreHold.hasLetGo && !queueHold.limitPassed
       queueHold.release()
       coreHold.release()
       try await waitUntil { coreHold.hasLetGo }
@@ -7646,8 +7737,8 @@ struct PlayerPlaybackTests {
 
   @Test("A plugin's global instance cleaning up shuts down the players it made, returning while their mpv's core is held, after which they have shut down")
   func pluginGlobalCleanUpDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.cleanup-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let (plugin, player) = try await Self.installGlobalPlugin(identifier, in: folder)
@@ -7658,10 +7749,10 @@ struct PlayerPlaybackTests {
     #expect(controller.instances.isEmpty)
   }
 
-  @Test("A plugin's global instance cleaning up with no players left shuts nothing down and keeps no player or child")
+  @Test("A plugin's global instance cleaning up again once the players it made are gone keeps no player and no child API")
   func pluginGlobalCleanUpWithNoPlayers() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.cleanup-empty-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let (plugin, player) = try await Self.installGlobalPlugin(identifier, in: folder)
@@ -7703,8 +7794,8 @@ struct PlayerPlaybackTests {
 
   @Test("Turning a plugin off and on with its switch in the settings' plugin list releases its instances, returning while mpv's core of the players its global instance made is held, then makes them from the scripts read when the plugin was made, returning while the plugin install queue is held")
   func pluginSettingsSwitchDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.switch-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let (plugin, made) = try await Self.installGlobalPlugin(identifier, in: folder)
@@ -7734,22 +7825,21 @@ struct PlayerPlaybackTests {
 
   @Test("Reinstalling a plugin disables the old one, returning while mpv's core of the players its global instance made is held, then removes its files and moves the new one into its place on the plugin install queue, returning while the queue is held, then enables the new one")
   func pluginReinstallDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.reinstall-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let (old, made) = try await Self.installGlobalPlugin(identifier, in: folder)
     let oldRoot = old.root
     let position = try #require(JavascriptPlugin.plugins.firstIndex(of: old))
-    let package = try Self.makeGlobalPluginPackage(in: folder, identifier: identifier, version: "2.0")
+    let package = try await Self.makeGlobalPluginPackage(in: folder, identifier: identifier, version: "2.0")
     let window = NSWindow()
     let manager = PluginManager(window: window)
     let reported = Box<PluginManager.Result>()
     let task = Task { await manager.install(localPackageURL: package) { reported.value = $0 } }
     // The new plugin replaces the old one once the user agrees, after which the old one's files are removed on the held queue.
     let answeredWhileHeld = try await Self.answerWhileHeld(window, player: made) {
-      reported.value == nil && old.globalInstance == nil && Self.installedPlugin(identifier) == nil
-        && FileManager.default.fileExists(atPath: oldRoot.path)
+      await Self.fileExists(oldRoot) && reported.value == nil && old.globalInstance == nil && Self.installedPlugin(identifier) == nil
     }
     await task.value
     #expect(answeredWhileHeld, "Reinstalling a plugin waited for mpv to shut down the old one's players, or removed its files or moved the new one on the main thread")
@@ -7766,8 +7856,8 @@ struct PlayerPlaybackTests {
 
   @Test("Uninstalling a plugin disables it, returning while mpv's core of the players its global instance made is held, and removes its files on the plugin install queue, returning while the queue is held, then removes them")
   func pluginUninstallDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.uninstall-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let (plugin, made) = try await Self.installGlobalPlugin(identifier, in: folder)
@@ -7777,18 +7867,17 @@ struct PlayerPlaybackTests {
     let uninstalled = Box<Bool>()
     let task = Task { uninstalled.value = await manager.uninstall(plugin) }
     let answeredWhileHeld = try await Self.answerWhileHeld(window, player: made) {
-      uninstalled.value == true && plugin.globalInstance == nil && Self.installedPlugin(identifier) == nil
-        && FileManager.default.fileExists(atPath: root.path)
+      await Self.fileExists(root) && uninstalled.value == true && plugin.globalInstance == nil && Self.installedPlugin(identifier) == nil
     }
     await task.value
     #expect(answeredWhileHeld, "Uninstalling a plugin waited for mpv to shut down its players or removed its files on the main thread")
-    try await Self.waitUntil { !FileManager.default.fileExists(atPath: root.path) }
+    try await Self.waitUntil { await !Self.fileExists(root) }
   }
 
   @Test("Uninstalling a plugin from the settings' plugin list disables it, returning while mpv's core of the players its global instance made is held, and removes its files on the plugin install queue, returning while the queue is held, then removes them")
   func pluginSettingsUninstallDoesNotWait() async throws {
-    let folder = try Self.makeFolder()
-    defer { try? FileManager.default.removeItem(at: folder) }
+    let folder = try await Self.makeFolder()
+    defer { await Self.removeItem(folder) }
     let identifier = "io.iina.tests.settings-uninstall-\(UUID().uuidString)"
     defer { Self.uninstallPlugin(identifier) }
     let (plugin, made) = try await Self.installGlobalPlugin(identifier, in: folder)
@@ -7807,10 +7896,10 @@ struct PlayerPlaybackTests {
     Self.keptObjects += [page, list, window]
     list.uninstallAction()
     let answeredWhileHeld = try await Self.answerWhileHeld(window, player: made) {
-      plugin.globalInstance == nil && Self.installedPlugin(identifier) == nil && FileManager.default.fileExists(atPath: root.path)
+      await Self.fileExists(root) && plugin.globalInstance == nil && Self.installedPlugin(identifier) == nil
     }
     #expect(answeredWhileHeld, "Uninstalling a plugin in the settings waited for mpv to shut down its players or removed its files on the main thread")
-    try await Self.waitUntil { !FileManager.default.fileExists(atPath: root.path) }
+    try await Self.waitUntil { await !Self.fileExists(root) }
   }
 
   @Test("A language token field reads the language list on the list's queue, its saved language a token of its code and its completions empty while the queue is held, then makes the language's token again with its description and completes a typed name from the list")
