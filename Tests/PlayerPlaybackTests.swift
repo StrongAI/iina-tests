@@ -4035,6 +4035,48 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A plugin's mpv getFlag settles with false for a property mpv has no flag for")
+  func mpvGetFlagSettlesFalseForAbsentProperty() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try await Self.makePlugin(in: folder)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      _ = instance.js.evaluateScript("""
+        globalThis.answer = undefined;
+        iina.mpv.getFlag("user-data/iinaTests/absent").then(value => { answer = value; });
+        """)
+      try await Self.waitUntil { instance.js.evaluateScript("answer !== undefined")?.toBool() == true }
+      #expect(instance.js.evaluateScript("answer === false")?.toBool() == true)
+    }
+  }
+
+  @Test("A plugin's mpv getNumber settles with 0 for a property mpv has no number for")
+  func mpvGetNumberSettlesZeroForAbsentProperty() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try await Self.makePlugin(in: folder)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      _ = instance.js.evaluateScript("""
+        globalThis.answer = undefined;
+        iina.mpv.getNumber("user-data/iinaTests/absent").then(value => { answer = value; });
+        """)
+      try await Self.waitUntil { instance.js.evaluateScript("answer !== undefined")?.toBool() == true }
+      #expect(instance.js.evaluateScript("answer === 0")?.toBool() == true)
+    }
+  }
+
+  @Test("A plugin's mpv getNative settles with null for a property mpv has no node for")
+  func mpvGetNativeSettlesNullForAbsentProperty() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try await Self.makePlugin(in: folder)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      _ = instance.js.evaluateScript("""
+        globalThis.answer = undefined;
+        iina.mpv.getNative("user-data/iinaTests/absent").then(value => { answer = value; });
+        """)
+      try await Self.waitUntil { instance.js.evaluateScript("answer !== undefined")?.toBool() == true }
+      #expect(instance.js.evaluateScript("answer === null")?.toBool() == true)
+    }
+  }
+
   @Test("Jump to returns while mpv's core is held, then shows its prompt filled with the position mpv answers, and a prompt dismissed seeks nowhere")
   func jumpToDoesNotWait() async throws {
     try await Self.withPlayer { player, _ in
@@ -7614,6 +7656,23 @@ struct PlayerPlaybackTests {
     let returnedWhileHeld = try await Self.shutsDownWhileHeld(player) { controller.cleanUp(instance) }
     #expect(returnedWhileHeld, "A plugin's global instance cleaning up waited for mpv to shut its players down")
     #expect(controller.instances.isEmpty)
+  }
+
+  @Test("A plugin's global instance cleaning up with no players left shuts nothing down and keeps no player or child")
+  func pluginGlobalCleanUpWithNoPlayers() async throws {
+    let folder = try Self.makeFolder()
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identifier = "io.iina.tests.cleanup-empty-\(UUID().uuidString)"
+    defer { Self.uninstallPlugin(identifier) }
+    let (plugin, player) = try await Self.installGlobalPlugin(identifier, in: folder)
+    let instance = try #require(plugin.globalInstance)
+    let controller = try #require(instance.apis["global"] as? JavascriptAPIGlobalController)
+    _ = try await Self.shutsDownWhileHeld(player) { controller.cleanUp(instance) }
+    try #require(controller.instances.isEmpty)
+    // The players the plugin made are gone, so this clean-up takes the route with no players to shut down.
+    controller.cleanUp(instance)
+    #expect(controller.instances.isEmpty)
+    #expect(controller.childAPIs.isEmpty)
   }
 
   @Test("Disabling a plugin releases its instances, its global instance shutting down the players it made, returning while their mpv's core is held; enabling it makes its instances from the scripts read when the plugin was made, returning while the plugin install queue is held")
