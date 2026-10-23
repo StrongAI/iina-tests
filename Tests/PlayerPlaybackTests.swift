@@ -4576,7 +4576,7 @@ struct PlayerPlaybackTests {
         defer {
           player.info.currentURL = url
           player.info.isNetworkResource = false
-          try? FileManager.default.removeItem(at: cache)
+          await Self.removeItem(cache)
         }
         switch file {
         case .networkResource:
@@ -5322,12 +5322,15 @@ struct PlayerPlaybackTests {
     if clear != .history { try fm.createDirectory(at: url, withIntermediateDirectories: true) }
     try await Self.onFileSystem { try Data([1]).write(to: marker) }
     // Whether what clearing changes is cleared: the history file holds no entry, and anything else's marker is removed.
-    func cleared() -> Bool {
-      guard clear == .history else { return !fm.fileExists(atPath: marker.path) }
-      guard let data = try? Data(contentsOf: url),
-            let object = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, PlaybackHistory.self], from: data)
-      else { return false }
-      return (object as? [PlaybackHistory])?.isEmpty == true
+    // Both are read off the main thread, which does no file I/O and no decoding.
+    func cleared() async -> Bool {
+      guard clear == .history else { return await !Self.fileExists(marker) }
+      return (try? await Self.onFileSystem {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: [NSArray.self, PlaybackHistory.self], from: data)
+        else { return false }
+        return (object as? [PlaybackHistory])?.isEmpty == true
+      }) ?? false
     }
     try await Self.restoringSettings([Preference.Key.iinaLastPlayedFilePath.rawValue,
                                       Preference.Key.iinaLastPlayedFilePosition.rawValue]) {
@@ -5375,10 +5378,11 @@ struct PlayerPlaybackTests {
       ask()
       try await Self.answerSheet(of: window, with: .alertFirstButtonReturn)
       await Self.drainMain()
-      let clearedWhileHeld = hold.limitPassed || cleared()
+      let isCleared = await cleared()
+      let clearedWhileHeld = hold.limitPassed || isCleared
       hold.release()
       #expect(!clearedWhileHeld, "The \(page) utilities page cleared the \(clear) on the main thread")
-      try await Self.waitUntil { cleared() }
+      try await Self.waitUntil { await cleared() }
       try await Self.waitUntil { shown() }
       if clear == .history {
         // Clearing the history forgets the last played file.
