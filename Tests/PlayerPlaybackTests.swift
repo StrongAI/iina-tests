@@ -5191,7 +5191,7 @@ struct PlayerPlaybackTests {
       let contents = try await Self.onFileSystem { try String(contentsOfFile: path, encoding: .utf8) }
       let read = { (path: String) in try? String(contentsOfFile: path, encoding: .utf8) }
       let source = fm.temporaryDirectory.appendingPathComponent("iinaTests-\(UUID().uuidString)", isDirectory: true)
-      defer { try? fm.removeItem(at: source) }
+      defer { await Self.removeItem(source) }
       let ask: () -> Void
       // Whether the change is on disk, and the config the page shows once it is.
       let made: () -> Bool
@@ -5213,7 +5213,7 @@ struct PlayerPlaybackTests {
         ask = { shown.rename(newName, newPath) }
         made = { !fm.fileExists(atPath: path) && read(newPath) == contents }
       case .importFile:
-        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        try await Self.onFileSystem { try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true) }
         let imported = source.appendingPathComponent("\(newName).conf")
         try await Self.onFileSystem { try contents.write(to: imported, atomically: true, encoding: .utf8) }
         ask = { shown.importFile(imported) }
