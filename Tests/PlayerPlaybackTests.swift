@@ -5397,19 +5397,18 @@ struct PlayerPlaybackTests {
 
   @Test("The app's folders are made on the folder queue, returning while the queue is held, and a first-run flag is looked for, written and removed there after them")
   func appFoldersDoNotWait() async throws {
-    let fm = FileManager.default
     let folder = Utility.screenshotCacheURL
     // What the account holds there is set aside while the test makes the folder, and put back once the test is done.
     let aside = folder.deletingLastPathComponent()
       .appendingPathComponent("\(folder.lastPathComponent).iinaTests-\(UUID().uuidString)")
-    let setAside = (try? fm.moveItem(at: folder, to: aside)) != nil
+    let setAside = (try? await Self.onFileSystem { try FileManager.default.moveItem(at: folder, to: aside) }) != nil
     let key = FirstRunManager.Key("iinaTests-\(UUID().uuidString)")
     let flag = Utility.appSupportDirUrl.appendingPathComponent(".\(key.rawValue)", isDirectory: false)
     defer {
-      try? fm.removeItem(at: flag)
+      await Self.removeItem(flag)
       if setAside {
-        try? fm.removeItem(at: folder)
-        try? fm.moveItem(at: aside, to: folder)
+        await Self.removeItem(folder)
+        _ = try? await Self.onFileSystem { try FileManager.default.moveItem(at: aside, to: folder) }
       }
     }
     let hold = await QueueHold.reached(Utility.folderQueue, limit: Self.holdLimit)
@@ -5418,14 +5417,15 @@ struct PlayerPlaybackTests {
     var firstRun: Bool?
     FirstRunManager.isFirstRun(for: key) { firstRun = $0 }
     await Self.drainMain()
-    let madeWhileHeld = hold.limitPassed || made || firstRun != nil || fm.fileExists(atPath: folder.path)
-      || fm.fileExists(atPath: flag.path)
+    let folderMade = await Self.fileExists(folder)
+    let flagMade = await Self.fileExists(flag)
+    let madeWhileHeld = hold.limitPassed || made || firstRun != nil || folderMade || flagMade
     hold.release()
     #expect(!madeWhileHeld, "The app's folders or a first-run flag were looked for or made on the main thread")
     try await Self.waitUntil { made && firstRun != nil }
     #expect(firstRun == true)
-    #expect(fm.fileExists(atPath: folder.path))
-    #expect(fm.fileExists(atPath: flag.path))
+    #expect(await Self.fileExists(folder))
+    #expect(await Self.fileExists(flag))
     var nextRun: Bool?
     FirstRunManager.isFirstRun(for: key) { nextRun = $0 }
     try await Self.waitUntil { nextRun != nil }
@@ -5433,10 +5433,11 @@ struct PlayerPlaybackTests {
     let removalHold = await QueueHold.reached(Utility.folderQueue, limit: Self.holdLimit)
     FirstRunManager.unsetFirstRun(for: key)
     await Self.drainMain()
-    let removedWhileHeld = removalHold.limitPassed || !fm.fileExists(atPath: flag.path)
+    let gone = await !Self.fileExists(flag)
+    let removedWhileHeld = removalHold.limitPassed || gone
     removalHold.release()
     #expect(!removedWhileHeld, "A first-run flag was removed on the main thread")
-    try await Self.waitUntil { !fm.fileExists(atPath: flag.path) }
+    try await Self.waitUntil { await !Self.fileExists(flag) }
   }
 
   @Test("Refreshing a player's display link and EDR mode for a new display sets mpv's display, tone mapping and ICC profile options without waiting for mpv, returning while its core is held, then the options are set")
