@@ -3936,14 +3936,17 @@ struct PlayerPlaybackTests {
     }
   }
 
-  /// A plugin in `folder` with `permissions` and `author` whose script does nothing, in whose context a test evaluates scripts.
+  /// A plugin in `folder` with `permissions`, `author` and `preferenceDefaults` whose script does nothing, in whose context a test
+  /// evaluates scripts.
   private static func makePlugin(in folder: URL, permissions: [String] = [],
                                  author: [String: String] = ["name": "iinaTests"],
+                                 preferenceDefaults: [String: Any] = [:],
                                  scripts: [String: String] = ["main.js": ""]) throws -> JavascriptPlugin {
     let root = folder.appendingPathComponent("iinaTests-plugin")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let info: [String: Any] = ["name": "iinaTests", "author": author, "identifier": "io.iina.tests",
-                               "version": "1.0", "entry": "main.js", "permissions": permissions]
+                               "version": "1.0", "entry": "main.js", "permissions": permissions,
+                               "preferenceDefaults": preferenceDefaults]
     try JSONSerialization.data(withJSONObject: info).write(to: root.appendingPathComponent("Info.json"))
     for (path, script) in scripts {
       let url = root.appendingPathComponent(path)
@@ -4011,6 +4014,20 @@ struct PlayerPlaybackTests {
       #expect(instance.js.evaluateScript("answers.string")?.toString() == player.mpv.getString("filename"))
       let tracks = try #require(player.mpv.getNode("track-list") as? [Any])
       #expect(instance.js.evaluateScript("answers.native.length")?.toInt32() == Int32(tracks.count))
+    }
+  }
+
+  @Test("A plugin's mpv getString settles with null for a property mpv has no string for")
+  func mpvGetStringSettlesNullForAbsentProperty() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      _ = instance.js.evaluateScript("""
+        globalThis.answer = undefined;
+        iina.mpv.getString("user-data/iinaTests/absent").then(value => { answer = value; });
+        """)
+      try await Self.waitUntil { instance.js.evaluateScript("answer !== undefined")?.toBool() == true }
+      #expect(instance.js.evaluateScript("answer === null")?.toBool() == true)
     }
   }
 
@@ -5941,6 +5958,27 @@ struct PlayerPlaybackTests {
     }
   }
 
+  @Test("A plugin's fileInPath settles with false for an empty name, and for any name when the plugin lacks the file system permission")
+  func pluginFileInPathRefused() async throws {
+    try await Self.withPlayer { player, folder in
+      for permissions in [["file-system"], []] {
+        let plugin = try Self.makePlugin(in: folder.appendingPathComponent("\(permissions.count)"), permissions: permissions)
+        Self.keptPlugins.append(plugin)
+        let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+        func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+        _ = instance.js.evaluateScript("""
+          globalThis.empty = null;
+          globalThis.ls = null;
+          iina.utils.fileInPath("").then(value => { globalThis.empty = value; });
+          iina.utils.fileInPath("/bin/ls").then(value => { globalThis.ls = value; });
+          """)
+        try await Self.waitUntil { holds("globalThis.empty !== null && globalThis.ls !== null") }
+        #expect(holds("globalThis.empty === false"))
+        #expect(holds("globalThis.ls === \(!permissions.isEmpty)"))
+      }
+    }
+  }
+
   @Test("A plugin's preferences get and set wait for the preferences file to be read on the plugins' preferences queue, returning promises while the queue is held, then settle with the value read and set it")
   func pluginPreferencesDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
@@ -5972,6 +6010,31 @@ struct PlayerPlaybackTests {
       #expect(holds("answers.set === true && answers.get === 1 && answers.written === 2"))
       #expect(plugin.preferences["stored"] as? Int == 1)
       #expect(plugin.preferences["written"] as? Int == 2)
+    }
+  }
+
+  @Test("A plugin's preferences get settles with the default in its Info.json for a key it has not stored, and with undefined for a key it has neither stored nor a default for")
+  func pluginPreferencesGetDefaultAndUndefined() async throws {
+    try await Self.withPlayer { player, folder in
+      let plugin = try Self.makePlugin(in: folder, preferenceDefaults: ["defaulted": "fallback"])
+      Self.keptPlugins.append(plugin)
+      let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
+        .appendingPathComponent("\(plugin.identifier).plist")
+      let stored = try? Data(contentsOf: file)
+      defer {
+        if let stored { try? stored.write(to: file) } else { try? FileManager.default.removeItem(at: file) }
+      }
+      try? FileManager.default.removeItem(at: file)
+      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+      func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+      _ = instance.js.evaluateScript("""
+        globalThis.answers = {};
+        iina.preferences.get("defaulted").then(value => { answers.defaulted = value; });
+        iina.preferences.get("absent").then(value => { answers.absent = value; answers.settled = true; });
+        """)
+      try await Self.waitUntil { holds("answers.settled === true && answers.defaulted !== undefined") }
+      #expect(holds("answers.defaulted === 'fallback'"))
+      #expect(holds("'absent' in answers && answers.absent === undefined"))
     }
   }
 
