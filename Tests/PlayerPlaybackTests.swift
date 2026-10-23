@@ -1086,7 +1086,7 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
       let pane = Self.kept(SidebarPlaylistPane(player: player))
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       // The last entry is dragged to the top of the table it is shown in.
@@ -1114,7 +1114,7 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       let path = { (name: String) in folder.appendingPathComponent("\(name).mp4").path }
       let pane = Self.kept(SidebarPlaylistPane(player: player))
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let removals: [(name: String, remove: () -> Void)] = [
@@ -2151,7 +2151,7 @@ struct PlayerPlaybackTests {
       let window: MainWindowController = player.mainWindow
       // A plugin's script is read when its instance is made, so the instance is made before the core is held. The plugin is kept,
       // since its instance holds it weakly and reads it when the instance is let go.
-      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      let plugin = try await Self.makePlugin(in: folder, permissions: ["file-system"])
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       func script(_ source: String) -> () -> Void {
@@ -2601,7 +2601,7 @@ struct PlayerPlaybackTests {
         ask = { window.close() }
       case .jsStop:
         // The plugin is kept, since its instance holds it weakly and reads it when the instance is let go.
-        let plugin = try Self.makePlugin(in: folder)
+        let plugin = try await Self.makePlugin(in: folder)
         Self.keptPlugins.append(plugin)
         let instance = JavascriptPluginInstance(player: player, plugin: plugin)
         ask = { _ = instance.js.evaluateScript("iina.core.stop()") }
@@ -2669,17 +2669,17 @@ struct PlayerPlaybackTests {
     func url(_ string: String) throws -> URL {
       try #require(URL(string: string))
     }
-    func makeTestPlugin() throws -> JavascriptPlugin {
+    func makeTestPlugin() async throws -> JavascriptPlugin {
       // Kept, since the instances, views and windows showing a plugin hold it without keeping it.
-      let plugin = try makePlugin(in: folder, permissions: ["file-system"],
+      let plugin = try await makePlugin(in: folder, permissions: ["file-system"],
                                   author: ["name": "iinaTests", "url": link.absoluteString, "email": "tests@iina.io"])
       keptPlugins.append(plugin)
       return plugin
     }
-    func script(_ source: String) throws -> () -> Void {
+    func script(_ source: String) async throws -> () -> Void {
       // A plugin's script is read when its instance is made, so the instance is made before the queue is held.
       let player = try #require(player)
-      let instance = JavascriptPluginInstance(player: player, plugin: try makeTestPlugin())
+      let instance = JavascriptPluginInstance(player: player, plugin: try await makeTestPlugin())
       return { _ = instance.js.evaluateScript(source) }
     }
     // With every kind of media checked IINA is made the default app of each content type once, MP4 videos and MP3 audio among them.
@@ -2758,13 +2758,13 @@ struct PlayerPlaybackTests {
       ask = { _ = fetcher.checkToken() }
       expected = [.open(try url(AppData.assrtRegisterLink))]
     case .jsShowInFinder:
-      ask = try script("iina.file.showInFinder(\"\(file.path)\")")
+      ask = try await script("iina.file.showInFinder(\"\(file.path)\")")
       expected = [.revealInFinder([URL(fileURLWithPath: file.path)])]
     case .jsOpenLink:
-      ask = try script("iina.utils.open(\"\(link.absoluteString)\")")
+      ask = try await script("iina.utils.open(\"\(link.absoluteString)\")")
       expected = [.open(link)]
     case .jsOpenFile:
-      ask = try script("iina.utils.open(\"\(file.path)\")")
+      ask = try await script("iina.utils.open(\"\(file.path)\")")
       expected = [.open(URL(fileURLWithPath: file.path))]
     case .guideWebsite:
       let controller = AppDelegate.shared.guideWindow
@@ -2832,7 +2832,7 @@ struct PlayerPlaybackTests {
       ask = { controller.ytdlHelpAction(controller) }
       expected = [.open(try url(AppData.ytdlHelpLink))]
     case .prefPluginWebsite, .prefPluginEmail, .prefShowPlugin:
-      let plugin = try makeTestPlugin()
+      let plugin = try await makeTestPlugin()
       let controller = PrefPluginViewController()
       controller.currentPlugin = plugin
       switch request {
@@ -2912,7 +2912,7 @@ struct PlayerPlaybackTests {
       ask = { editor.showConfFileAction(editor) }
       expected = [.revealInFinder([URL(fileURLWithPath: path)])]
     case .settingsShowPlugin:
-      let plugin = try makeTestPlugin()
+      let plugin = try await makeTestPlugin()
       let page = SettingsPagePlugin()
       let list = PluginListView(page: page)
       keptObjects += [page, list]
@@ -2924,7 +2924,7 @@ struct PlayerPlaybackTests {
     case .settingsPluginLink:
       // A page of a plugin's about tab that links to an external page has it opened in the browser.
       let parent = NSWindow()
-      let details = PluginDetailsWindow(plugin: try makeTestPlugin(), window: parent)
+      let details = PluginDetailsWindow(plugin: try await makeTestPlugin(), window: parent)
       keptObjects += [parent, details]
       let webView = WKWebView()
       let action = NavigationAction(link)
@@ -3233,10 +3233,10 @@ struct PlayerPlaybackTests {
       defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
       _ = defaults.object(forKey: Preference.Key.useLegacyFullScreen.rawValue)
     }
-    func pluginInstance() throws -> JavascriptPluginInstance {
+    func pluginInstance() async throws -> JavascriptPluginInstance {
       // A plugin's script is read when its instance is made, so the instance is made before the core is held. The plugin is kept,
       // since its instance holds it weakly and reads it when the instance is let go.
-      let plugin = try makePlugin(in: folder)
+      let plugin = try await makePlugin(in: folder)
       keptPlugins.append(plugin)
       return JavascriptPluginInstance(player: player, plugin: plugin)
     }
@@ -3274,7 +3274,7 @@ struct PlayerPlaybackTests {
       ask = { window.updateTitle() }
       applied = { window.window?.title == title && window.titleBarView.titleTextField.stringValue == title }
     case .jsTitle:
-      let instance = try pluginInstance()
+      let instance = try await pluginInstance()
       var read: String?
       ask = { read = instance.js.evaluateScript("iina.core.status.title")?.toString() }
       applied = { read == title }
@@ -3380,7 +3380,7 @@ struct PlayerPlaybackTests {
     case .jsChapters:
       // The test files have no chapters, so the player is given one, as if mpv had reported it.
       player.info.chapters = [MPVChapter(title: "iinaTests", startTime: 2, index: 0)]
-      let instance = try pluginInstance()
+      let instance = try await pluginInstance()
       var read: [Any]?
       ask = { read = instance.js.evaluateScript("iina.core.getChapters()")?.toArray() }
       applied = { (read?.first as? [String: Any])?["title"] as? String == "iinaTests" }
@@ -3534,7 +3534,7 @@ struct PlayerPlaybackTests {
       let mpv: MPVController = player.mpv
       // A plugin's script is read when its instance is made, so the instance is made before the core is held. The plugin is kept,
       // since its instance holds it weakly and reads it when the instance is let go.
-      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      let plugin = try await Self.makePlugin(in: folder, permissions: ["file-system"])
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       func script(_ source: String) -> () -> Void {
@@ -3588,7 +3588,7 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       let mpv: MPVController = player.mpv
       // The plugin is kept, since its instance holds it weakly and reads it when the instance is let go.
-      let plugin = try Self.makePlugin(in: folder, permissions: refusal == .setUnsupportedValue ? ["file-system"] : [])
+      let plugin = try await Self.makePlugin(in: folder, permissions: refusal == .setUnsupportedValue ? ["file-system"] : [])
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       // user-data is neither a safe option nor set by a safe command, so each request would set it if it were not refused.
@@ -3941,18 +3941,22 @@ struct PlayerPlaybackTests {
   private static func makePlugin(in folder: URL, permissions: [String] = [],
                                  author: [String: String] = ["name": "iinaTests"],
                                  preferenceDefaults: [String: Any] = [:],
-                                 scripts: [String: String] = ["main.js": ""]) throws -> JavascriptPlugin {
+                                 scripts: [String: String] = ["main.js": ""]) async throws -> JavascriptPlugin {
     let root = folder.appendingPathComponent("iinaTests-plugin")
-    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let info: [String: Any] = ["name": "iinaTests", "author": author, "identifier": "io.iina.tests",
                                "version": "1.0", "entry": "main.js", "permissions": permissions,
                                "preferenceDefaults": preferenceDefaults]
-    try JSONSerialization.data(withJSONObject: info).write(to: root.appendingPathComponent("Info.json"))
-    for (path, script) in scripts {
-      let url = root.appendingPathComponent(path)
-      try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-      try Data(script.utf8).write(to: url)
-    }
+    let infoData = try JSONSerialization.data(withJSONObject: info)
+    let files = scripts.map { (root.appendingPathComponent($0.key), Data($0.value.utf8)) }
+    // The plugin's files are written off the main thread, which does no file I/O.
+    try await Task.detached {
+      try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+      try infoData.write(to: root.appendingPathComponent("Info.json"))
+      for (url, data) in files {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url)
+      }
+    }.value
     return try #require(JavascriptPlugin(filename: root.lastPathComponent, externalURL: root))
   }
 
@@ -3972,7 +3976,7 @@ struct PlayerPlaybackTests {
       player.seek(percent: 50, forceExact: true)
       try await Self.waitForPosition(2, of: player)
       player.syncUITimer?.invalidate()
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       // A position mpv does not hold shows whether the getter settles with the position mpv holds.
       player.info.videoPosition = VideoTime(0)
@@ -3996,7 +4000,7 @@ struct PlayerPlaybackTests {
   func mpvGettersDoNotWait() async throws {
     try await Self.withPlayer { player, folder in
       player.syncUITimer?.invalidate()
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let returnedWhileHeld = try await Self.returnsWhileHeld(player) {
         instance.js.evaluateScript("""
@@ -4020,7 +4024,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's mpv getString settles with null for a property mpv has no string for")
   func mpvGetStringSettlesNullForAbsentProperty() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       _ = instance.js.evaluateScript("""
         globalThis.answer = undefined;
@@ -4658,7 +4662,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's data and temporary folders are made when the plugin is made, and a path its script names in them reads no file system")
   func pluginFolderPathReadsNoFiles() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let folders = [plugin.dataFolderURL, plugin.tmpFolderURL]
       #expect(folders.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
@@ -4681,7 +4685,7 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       let scripts = ["main.js": "globalThis.value = require(\"./lib/value.js\");",
                      "lib/value.js": "module.exports = \"read when made\";"]
-      let plugin = try Self.makePlugin(in: folder, scripts: scripts)
+      let plugin = try await Self.makePlugin(in: folder, scripts: scripts)
       Self.keptPlugins.append(plugin)
       let holds = try scripts.map { path, script in
         try FileHold(plugin.root.appendingPathComponent(path), contents: Data(script.utf8), limit: Self.holdLimit)
@@ -5754,7 +5758,7 @@ struct PlayerPlaybackTests {
   func versionReadsDoNotWait() async throws {
     try await Self.withPlayer { player, folder in
       let shared = await Self.versions(of: MPVOptionDefaults.shared)
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let about = AboutWindowController()
@@ -5878,7 +5882,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin subtitle's download makes the URLs of the paths its provider answers as files' without reading the file system")
   func pluginSubtitleDownloadReadsNoFiles() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      let plugin = try await Self.makePlugin(in: folder, permissions: ["file-system"])
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let api = try #require(instance.apis["subtitle"] as? JavascriptAPISubtitle)
@@ -5907,7 +5911,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's exec looks up its binary and starts its process on the plugin's queue, returning while the queue is held, then rejects a binary it cannot find and runs one it can")
   func pluginExecDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      let plugin = try await Self.makePlugin(in: folder, permissions: ["file-system"])
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
@@ -5936,7 +5940,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's fileInPath looks for the file on the plugin's queue, returning a promise while the queue is held, then settles with whether the file is there")
   func pluginFileInPathDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder, permissions: ["file-system"])
+      let plugin = try await Self.makePlugin(in: folder, permissions: ["file-system"])
       Self.keptPlugins.append(plugin)
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
@@ -5962,7 +5966,7 @@ struct PlayerPlaybackTests {
   func pluginFileInPathRefused() async throws {
     try await Self.withPlayer { player, folder in
       for permissions in [["file-system"], []] {
-        let plugin = try Self.makePlugin(in: folder.appendingPathComponent("\(permissions.count)"), permissions: permissions)
+        let plugin = try await Self.makePlugin(in: folder.appendingPathComponent("\(permissions.count)"), permissions: permissions)
         Self.keptPlugins.append(plugin)
         let instance = JavascriptPluginInstance(player: player, plugin: plugin)
         func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
@@ -5982,7 +5986,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's preferences get and set wait for the preferences file to be read on the plugins' preferences queue, returning promises while the queue is held, then settle with the value read and set it")
   func pluginPreferencesDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
         .appendingPathComponent("\(plugin.identifier).plist")
@@ -6016,25 +6020,37 @@ struct PlayerPlaybackTests {
   @Test("A plugin's preferences get settles with the default in its Info.json for a key it has not stored, and with undefined for a key it has neither stored nor a default for")
   func pluginPreferencesGetDefaultAndUndefined() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder, preferenceDefaults: ["defaulted": "fallback"])
+      let plugin = try await Self.makePlugin(in: folder, preferenceDefaults: ["defaulted": "fallback"])
       Self.keptPlugins.append(plugin)
       let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
         .appendingPathComponent("\(plugin.identifier).plist")
-      let stored = try? Data(contentsOf: file)
-      defer {
-        if let stored { try? stored.write(to: file) } else { try? FileManager.default.removeItem(at: file) }
+      // The stored preferences are read, removed and restored off the main thread, which does no file I/O.
+      let stored = await Task.detached { () -> Data? in
+        let stored = try? Data(contentsOf: file)
+        try? FileManager.default.removeItem(at: file)
+        return stored
+      }.value
+      func restore() async {
+        await Task.detached {
+          if let stored { try? stored.write(to: file) } else { try? FileManager.default.removeItem(at: file) }
+        }.value
       }
-      try? FileManager.default.removeItem(at: file)
-      let instance = JavascriptPluginInstance(player: player, plugin: plugin)
-      func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
-      _ = instance.js.evaluateScript("""
-        globalThis.answers = {};
-        iina.preferences.get("defaulted").then(value => { answers.defaulted = value; });
-        iina.preferences.get("absent").then(value => { answers.absent = value; answers.settled = true; });
-        """)
-      try await Self.waitUntil { holds("answers.settled === true && answers.defaulted !== undefined") }
-      #expect(holds("answers.defaulted === 'fallback'"))
-      #expect(holds("'absent' in answers && answers.absent === undefined"))
+      do {
+        let instance = JavascriptPluginInstance(player: player, plugin: plugin)
+        func holds(_ expression: String) -> Bool { instance.js.evaluateScript(expression).toBool() }
+        _ = instance.js.evaluateScript("""
+          globalThis.answers = {};
+          iina.preferences.get("defaulted").then(value => { answers.defaulted = value; });
+          iina.preferences.get("absent").then(value => { answers.absent = value; answers.settled = true; });
+          """)
+        try await Self.waitUntil { holds("answers.settled === true && answers.defaulted !== undefined") }
+        #expect(holds("answers.defaulted === 'fallback'"))
+        #expect(holds("'absent' in answers && answers.absent === undefined"))
+      } catch {
+        await restore()
+        throw error
+      }
+      await restore()
     }
   }
 
@@ -6042,7 +6058,7 @@ struct PlayerPlaybackTests {
   func pluginPreferencesSyncDoesNotWait() async throws {
     let folder = try Self.makeFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
-    let plugin = try Self.makePlugin(in: folder)
+    let plugin = try await Self.makePlugin(in: folder)
     Self.keptPlugins.append(plugin)
     let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
       .appendingPathComponent("\(plugin.identifier).plist")
@@ -6071,7 +6087,7 @@ struct PlayerPlaybackTests {
   func pluginPreferencesSaveDoesNotWait(_ save: PluginPreferencesSave) async throws {
     let folder = try Self.makeFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
-    let plugin = try Self.makePlugin(in: folder)
+    let plugin = try await Self.makePlugin(in: folder)
     Self.keptPlugins.append(plugin)
     let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
       .appendingPathComponent("\(plugin.identifier).plist")
@@ -6115,7 +6131,7 @@ struct PlayerPlaybackTests {
   func pluginPreferencePageGetDoesNotWait(_ page: KeyBindingConfigPage) async throws {
     let folder = try Self.makeFolder()
     defer { try? FileManager.default.removeItem(at: folder) }
-    let plugin = try Self.makePlugin(in: folder)
+    let plugin = try await Self.makePlugin(in: folder)
     Self.keptPlugins.append(plugin)
     let file = Utility.pluginsURL.appendingPathComponent(".preferences", isDirectory: true)
       .appendingPathComponent("\(plugin.identifier).plist")
@@ -6169,7 +6185,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's keychainWrite and keychainRead ask the Keychain on its queue, returning promises while the queue is held, then settle with what the Keychain answered")
   func pluginKeychainDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let service = KeychainAccess.ServiceName("\(plugin.identifier) - account")
       try await Self.withKeychainRecorded(stored: [service.rawValue: ("stored-user", "stored-password")]) { keychain in
@@ -6199,7 +6215,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's file functions use the file system on the file API's queue, returning promises while the queue is held, then settle in the order they were asked with what the file system answered")
   func pluginFileDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       // A folder of the plugin's own, so that the folder listed holds only the test's files.
       let sub = UUID().uuidString
@@ -6263,7 +6279,7 @@ struct PlayerPlaybackTests {
   @Test("A plugin's file handle moves, reads, writes and closes on the file API's queue, returning promises while the queue is held, then settles in the order it was asked with what the file answered")
   func pluginFileHandleDoesNotWait() async throws {
     try await Self.withPlayer { player, folder in
-      let plugin = try Self.makePlugin(in: folder)
+      let plugin = try await Self.makePlugin(in: folder)
       Self.keptPlugins.append(plugin)
       let sub = UUID().uuidString
       let folderURL = plugin.tmpFolderURL.appendingPathComponent(sub)
