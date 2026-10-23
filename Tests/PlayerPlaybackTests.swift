@@ -3286,7 +3286,8 @@ struct PlayerPlaybackTests {
       hold.release()
       #expect(returnedWhileHeld, "Showing the title bar's title waited for the file system")
       let path = try #require(player.info.currentURL).path
-      try await waitUntil { field.stringValue == FileManager.default.displayName(atPath: path) && titleBar.docIcon.image != nil }
+      let name = try await onFileSystem { FileManager.default.displayName(atPath: path) }
+      try await waitUntil { field.stringValue == name && titleBar.docIcon.image != nil }
       return
     case .mediaTitle:
       var read = ""
@@ -6981,7 +6982,8 @@ struct PlayerPlaybackTests {
       let titles = try #require(menus.titles.first)
       // One item for the file and each folder it is in, but not the root.
       #expect(titles.count == file.pathComponents.count - 1)
-      #expect(titles.first == FileManager.default.displayName(atPath: file.path))
+      let name = try await Self.onFileSystem { FileManager.default.displayName(atPath: file.path) }
+      #expect(titles.first == name)
     }
   }
 
