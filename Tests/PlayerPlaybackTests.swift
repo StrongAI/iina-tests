@@ -78,6 +78,11 @@ struct PlayerPlaybackTests {
     await Task.detached { FileManager.default.fileExists(atPath: url.path) }.value
   }
 
+  /// The paths of `urls` with their symbolic links resolved, off the main thread, which does no file I/O.
+  private static func resolvedPaths(_ urls: [URL]) async -> [String] {
+    await Task.detached { urls.map { $0.resolvingSymlinksInPath().path } }.value
+  }
+
   /// Open `b.mp4` of a new folder in a new player under the test settings, run `body` once the play state of the file has been
   /// decided and the folder's other files are in the playlist, then shut the player down and restore the settings.
   private static func withPlayer(_ body: (PlayerCore, URL) async throws -> Void) async throws {
@@ -2324,9 +2329,13 @@ struct PlayerPlaybackTests {
     let keys = [Preference.Key.iinaLastPlayedFilePath.rawValue, Preference.Key.iinaLastPlayedFilePosition.rawValue]
     let stored = keys.map { defaults.object(forKey: $0) }
     defer { zip(keys, stored).forEach { defaults.set($1, forKey: $0) } }
-    let caches = try #require(FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first)
-    let folder = caches.appendingPathComponent("iinaTests-watch-later-\(UUID().uuidString)")
-    try await Self.onFileSystem { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+    let made = try await Self.onFileSystem { () -> URL? in
+      guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
+      let folder = caches.appendingPathComponent("iinaTests-watch-later-\(UUID().uuidString)")
+      try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+      return folder
+    }
+    let folder = try #require(made)
     defer { await Self.removeItem(folder) }
     let watchLaterDirectory = try #require(player.mpv.getString("watch-later-directory"))
     player.mpv.setString("watch-later-directory", folder.path)
@@ -2787,13 +2796,13 @@ struct PlayerPlaybackTests {
       expected = [.open(try url(AppData.assrtRegisterLink))]
     case .jsShowInFinder:
       ask = try await script("iina.file.showInFinder(\"\(file.path)\")")
-      expected = [.revealInFinder([URL(fileURLWithPath: file.path)])]
+      expected = [.revealInFinder([URL(fileURLWithPath: file.path, isDirectory: false)])]
     case .jsOpenLink:
       ask = try await script("iina.utils.open(\"\(link.absoluteString)\")")
       expected = [.open(link)]
     case .jsOpenFile:
       ask = try await script("iina.utils.open(\"\(file.path)\")")
-      expected = [.open(URL(fileURLWithPath: file.path))]
+      expected = [.open(URL(fileURLWithPath: file.path, isDirectory: false))]
     case .guideWebsite:
       let controller = AppDelegate.shared.guideWindow
       ask = { controller.visitIINAWebsite(controller) }
@@ -2850,7 +2859,7 @@ struct PlayerPlaybackTests {
       let controller = PrefKeyBindingViewController()
       controller.currentConfFilePath = conf.path
       ask = { controller.showConfFileAction(controller) }
-      expected = [.revealInFinder([URL(fileURLWithPath: conf.path)])]
+      expected = [.revealInFinder([URL(fileURLWithPath: conf.path, isDirectory: false)])]
     case .prefKeyBindingsHelp:
       let controller = PrefKeyBindingViewController()
       ask = { controller.openKeyBindingsHelpAction(controller) }
@@ -2938,7 +2947,7 @@ struct PlayerPlaybackTests {
       try await waitUntil { editor.currentConfFilePath != nil }
       let path = try #require(editor.currentConfFilePath)
       ask = { editor.showConfFileAction(editor) }
-      expected = [.revealInFinder([URL(fileURLWithPath: path)])]
+      expected = [.revealInFinder([URL(fileURLWithPath: path, isDirectory: false)])]
     case .settingsShowPlugin:
       let plugin = try await makeTestPlugin()
       let page = SettingsPagePlugin()
@@ -2989,7 +2998,7 @@ struct PlayerPlaybackTests {
       if request == .playlistShowInFinder {
         pane.selectedRows = IndexSet([0, 2])
         ask = { pane.contextMenuShowInFinder(NSMenuItem()) }
-        expected = [.revealInFinder([0, 2].map { URL(fileURLWithPath: player.info.playlist[$0].filename) })]
+        expected = [.revealInFinder([0, 2].map { URL(fileURLWithPath: player.info.playlist[$0].filename, isDirectory: false) })]
       } else {
         // Only an entry read over the network is opened in the browser, so a link is added to the playlist after its files.
         player.addToPlaylist(paths: [link.absoluteString])
@@ -3209,7 +3218,7 @@ struct PlayerPlaybackTests {
     hold.release()
     #expect(answerReturned, "Answering \(request)'s panel to show the config file of a taken name waited for LaunchServices")
     await withCheckedContinuation { continuation in Utility.workspaceQueue.async { continuation.resume() } }
-    #expect(recorder.requests == [.revealInFinder([URL(fileURLWithPath: taken.path)])])
+    #expect(recorder.requests == [.revealInFinder([URL(fileURLWithPath: taken.path, isDirectory: false)])])
     #expect(path == nil)
   }
 
@@ -3648,17 +3657,19 @@ struct PlayerPlaybackTests {
     try await Self.withPlayer { player, folder in
       let path = folder.appendingPathComponent("b.mp4").path
       let name = "com.apple.lastuseddate#PS"
-      removexattr(path, name, 0)
-      func written() -> Bool { getxattr(path, name, nil, 0, 0, 0) > 0 }
+      // The file's date last opened is removed and looked for off the main thread, which does no file I/O.
+      _ = await Task.detached { removexattr(path, name, 0) }.value
+      func written() async -> Bool { await Task.detached { getxattr(path, name, nil, 0, 0, 0) > 0 }.value }
       // The background queue may be finishing the open's search for files to load, which posts notifications observed on the main
       // queue, so the hold is awaited rather than waited for.
       let hold = await QueueHold.reached(player.backgroundQueue, limit: Self.holdLimit)
       player.fileStarted(path: path)
-      let returnedWhileHeld = !hold.limitPassed && !written()
+      let writtenWhileHeld = await written()
+      let returnedWhileHeld = !hold.limitPassed && !writtenWhileHeld
       hold.release()
       #expect(returnedWhileHeld, "Starting a file wrote its date last opened on the main thread")
-      try await Self.waitUntil(written)
-      #expect(player.info.currentURL == URL(fileURLWithPath: path))
+      try await Self.waitUntil { await written() }
+      #expect(player.info.currentURL == URL(fileURLWithPath: path, isDirectory: false))
     }
   }
 
@@ -4400,12 +4411,13 @@ struct PlayerPlaybackTests {
           let url = player.info.currentURL
           let other = folder.appendingPathComponent("a.mp4").path
           let name = "com.apple.lastuseddate#PS"
-          removexattr(other, name, 0)
+          // The file's date last opened is removed and looked for off the main thread, which does no file I/O.
+          _ = await Task.detached { removexattr(other, name, 0) }.value
           player.fileStarted(path: other)
           // A date last opened is written on the player's background queue, so this runs after any write the start asked for.
           await withCheckedContinuation { continuation in player.backgroundQueue.async { continuation.resume() } }
           #expect(player.info.currentURL == url)
-          #expect(getxattr(other, name, nil, 0, 0, 0) < 0)
+          #expect(await Task.detached { getxattr(other, name, nil, 0, 0, 0) }.value < 0)
         case .mediaTitle:
           player.mediaTitleChanged("iinaTests-title")
           await Self.drainMain()
@@ -4774,12 +4786,13 @@ struct PlayerPlaybackTests {
                      "lib/value.js": "module.exports = \"read when made\";"]
       let plugin = try await Self.makePlugin(in: folder, scripts: scripts)
       Self.keptPlugins.append(plugin)
-      let holds = try scripts.map { path, script in
-        try FileHold(plugin.root.appendingPathComponent(path), contents: Data(script.utf8), limit: Self.holdLimit)
+      var holds: [FileHold] = []
+      for (path, script) in scripts {
+        holds.append(try await FileHold(plugin.root.appendingPathComponent(path), contents: Data(script.utf8), limit: Self.holdLimit))
       }
       let instance = JavascriptPluginInstance(player: player, plugin: plugin)
       let readWhileHeld = holds.contains { $0.limitPassed }
-      holds.forEach { $0.release() }
+      for hold in holds { await hold.release() }
       #expect(!readWhileHeld, "A plugin's instance read its scripts from their files on the script's thread")
       #expect(instance.js.evaluateScript("globalThis.value === \"read when made\"").toBool())
     }
@@ -4802,13 +4815,13 @@ struct PlayerPlaybackTests {
       try #require(plugin.enabled)
       let entry = plugin.root.appendingPathComponent(plugin.entryPath)
       let contents = try await Self.onFileSystem { try Data(contentsOf: entry) }
-      let hold = try FileHold(entry, contents: contents, limit: Self.holdLimit)
+      let hold = try await FileHold(entry, contents: contents, limit: Self.holdLimit)
       switch load {
       case .loadPlugins: player.loadPlugins()
       case .reloadPlugin: player.reloadPlugin(plugin, forced: true)
       }
       let readWhileHeld = hold.limitPassed
-      hold.release()
+      await hold.release()
       #expect(!readWhileHeld, "Making a player's instance of a plugin read its entry script from its file on the main thread")
       let instance = try #require(player.plugins.first { $0.plugin === plugin })
       #expect(instance.js.evaluateScript("globalThis.version === \"1.0\"").toBool())
@@ -5185,50 +5198,55 @@ struct PlayerPlaybackTests {
     try await Self.withTestInputConfig { name, path in
       let shown = Self.makeConfigPage(page)
       try await Self.waitUntil { shown.currentPath() == path }
-      let fm = FileManager.default
       let newName = "\(name)-\(change)"
       let newPath = Utility.userInputConfDirURL.appendingPathComponent("\(newName).conf").path
       let contents = try await Self.onFileSystem { try String(contentsOfFile: path, encoding: .utf8) }
-      let read = { (path: String) in try? String(contentsOfFile: path, encoding: .utf8) }
-      let source = fm.temporaryDirectory.appendingPathComponent("iinaTests-\(UUID().uuidString)", isDirectory: true)
+      // The config files are read and looked for off the main thread, which does no file I/O.
+      let read = { (path: String) async -> String? in try? await Self.onFileSystem { try String(contentsOfFile: path, encoding: .utf8) } }
+      let exists = { (path: String) async -> Bool in await Task.detached { FileManager.default.fileExists(atPath: path) }.value }
+      let source = FileManager.default.temporaryDirectory.appendingPathComponent("iinaTests-\(UUID().uuidString)", isDirectory: true)
       defer { await Self.removeItem(source) }
       let ask: () -> Void
       // Whether the change is on disk, and the config the page shows once it is.
-      let made: () -> Bool
+      let made: () async -> Bool
       var shownName = newName
       switch change {
       case .save:
         shown.add(KeyMapping(rawKey: "y", rawAction: "show-text saved"))
         let saved = KeyMapping.generateInputConf(from: shown.mappings())
         ask = shown.save
-        made = { read(path) == saved }
+        made = { await read(path) == saved }
         shownName = name
       case .create:
         ask = { shown.create(newName, newPath) }
-        made = { fm.fileExists(atPath: newPath) }
+        made = { await exists(newPath) }
       case .duplicate:
         ask = { shown.duplicate(newName, newPath) }
-        made = { read(newPath) == contents }
+        made = { await read(newPath) == contents }
       case .rename:
         ask = { shown.rename(newName, newPath) }
-        made = { !fm.fileExists(atPath: path) && read(newPath) == contents }
+        made = {
+          guard await !exists(path) else { return false }
+          return await read(newPath) == contents
+        }
       case .importFile:
         try await Self.onFileSystem { try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true) }
         let imported = source.appendingPathComponent("\(newName).conf")
         try await Self.onFileSystem { try contents.write(to: imported, atomically: true, encoding: .utf8) }
         ask = { shown.importFile(imported) }
-        made = { read(newPath) == contents }
+        made = { await read(newPath) == contents }
       case .delete:
         ask = shown.delete
-        made = { !fm.fileExists(atPath: path) }
+        made = { await !exists(path) }
         shownName = "IINA Default"
       }
       let hold = await QueueHold.reached(PlayerCore.keyBindingsQueue, limit: Self.holdLimit)
       ask()
-      let changedWhileHeld = hold.limitPassed || made() || shown.currentName() != name
+      let madeWhileHeld = await made()
+      let changedWhileHeld = hold.limitPassed || madeWhileHeld || shown.currentName() != name
       hold.release()
       #expect(!changedWhileHeld, "The \(page) page's \(change) changed the key binding config files on the main thread")
-      try await Self.waitUntil { made() && shown.currentName() == shownName }
+      try await Self.waitUntil { await made() && shown.currentName() == shownName }
     }
   }
 
@@ -5301,7 +5319,6 @@ struct PlayerPlaybackTests {
 
   @Test("A utilities settings page clears the saved playback progress or the thumbnail cache on the file removal queue and the playback history on the history queue, returning while the queue is held, then shows it cleared", arguments: KeyBindingConfigPage.allCases, UtilitiesClear.allCases)
   func utilitiesClearDoesNotWait(_ page: KeyBindingConfigPage, _ clear: UtilitiesClear) async throws {
-    let fm = FileManager.default
     let url = clear.url
     // Clearing the history empties the history the shared history controller holds, which is put back once the test is done. The
     // controller reads the account's history file first.
@@ -5309,17 +5326,21 @@ struct PlayerPlaybackTests {
     await QueueHold.reached(HistoryController.queue, limit: Self.holdLimit).release()
     let history = HistoryController.shared.history
     defer { HistoryController.shared.history = history }
-    // What the account holds there is set aside while the test clears its own, and put back once the test is done.
+    // What the account holds there is set aside while the test clears its own, and put back once the test is done, both off the main
+    // thread, which does no file I/O.
     let aside = url.deletingLastPathComponent().appendingPathComponent("\(url.lastPathComponent).iinaTests-\(UUID().uuidString)")
-    let setAside = (try? fm.moveItem(at: url, to: aside)) != nil
+    let setAside = (try? await Self.onFileSystem { try FileManager.default.moveItem(at: url, to: aside) }) != nil
+    let isHistory = clear == .history
     defer {
-      try? fm.removeItem(at: url)
-      if setAside { try? fm.moveItem(at: aside, to: url) }
-      if clear != .history { Utility.createDirIfNotExist(url: url) }
+      await Task.detached {
+        try? FileManager.default.removeItem(at: url)
+        if setAside { try? FileManager.default.moveItem(at: aside, to: url) }
+        if !isHistory { Utility.createDirIfNotExist(url: url) }
+      }.value
     }
     // A file that clearing removes, or for the history a file holding no history, which clearing writes empty.
     let marker = clear == .history ? url : url.appendingPathComponent("iinaTests-\(UUID().uuidString)")
-    if clear != .history { try fm.createDirectory(at: url, withIntermediateDirectories: true) }
+    if clear != .history { try await Self.onFileSystem { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) } }
     try await Self.onFileSystem { try Data([1]).write(to: marker) }
     // Whether what clearing changes is cleared: the history file holds no entry, and anything else's marker is removed.
     // Both are read off the main thread, which does no file I/O and no decoding.
@@ -5389,7 +5410,7 @@ struct PlayerPlaybackTests {
         #expect(Preference.url(for: .iinaLastPlayedFilePath) == nil)
         #expect(Preference.double(for: .iinaLastPlayedFilePosition) == 0)
       } else {
-        #expect(fm.fileExists(atPath: url.path))
+        #expect(await Self.fileExists(url))
       }
       if let sheet = window.attachedSheet { window.endSheet(sheet) }
     }
@@ -5735,7 +5756,7 @@ struct PlayerPlaybackTests {
                                      Preference.Key.userOptions.rawValue: [[String]]()]
     defaults.setVolatileDomain(arguments.merging(Self.settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
     defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
-    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    let hold = try await ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
     let player = PlayerCore()
     player.label = "iinaTests-playback-\(Self.playerCount)"
     Self.playerCount += 1
@@ -5774,7 +5795,7 @@ struct PlayerPlaybackTests {
                                      Preference.Key.userOptions.rawValue: [[String]]()]
     defaults.setVolatileDomain(arguments.merging(Self.settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
     defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
-    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    let hold = try await ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
     // A player with no window, whose video is never initialized, so that nothing but the test destroys its handle.
     let player = PlayerCore()
     player.label = "iinaTests-playback-\(Self.playerCount)"
@@ -5819,7 +5840,7 @@ struct PlayerPlaybackTests {
                                      Preference.Key.userOptions.rawValue: [[String]]()]
     defaults.setVolatileDomain(arguments.merging(Self.settings) { $1 }.merging(configured) { $1 }, forName: UserDefaults.argumentDomain)
     defer { defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain) }
-    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    let hold = try await ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
     let made = (controller.createPlayerInstance([:]) as? Int).flatMap { controller.instances[$0] }
     let returnedWhileHeld = !hold.limitPassed && made != nil
     hold.release()
@@ -5838,7 +5859,7 @@ struct PlayerPlaybackTests {
     let folder = try await Self.makeFolder()
     defer { await Self.removeItem(folder) }
     // The defaults' mpv reads mpv.conf from the folder it is given as it initializes, and the file it includes, which the test holds.
-    let hold = try ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
+    let hold = try await ConfigIncludeHold(in: folder, contents: "title=iinaTests-held-conf\n", limit: Self.holdLimit)
     let defaults = MPVOptionDefaults(configDir: folder.path)
     let returnedWhileHeld = !hold.limitPassed
     hold.release()
@@ -6502,7 +6523,8 @@ struct PlayerPlaybackTests {
           !controller.lastFileContainerView.isHidden && controller.appIcon.image?.representations.isEmpty == false
         }
         #expect(controller.lastFileNameLabel.stringValue == "last.mp4")
-        #expect(!controller.recentDocuments.contains { $0.resolvingSymlinksInPath() == file.resolvingSymlinksInPath() })
+        let recentPaths = await Self.resolvedPaths(controller.recentDocuments)
+        #expect(await !recentPaths.contains(Self.resolvedPaths([file])[0]))
         controller.close()
       }
     }
@@ -6514,7 +6536,7 @@ struct PlayerPlaybackTests {
     defer { await Self.removeItem(folder) }
     let file = folder.appendingPathComponent("recent.mp4")
     try await Self.onFileSystem { try Data().write(to: file) }
-    let bookmark = try file.bookmarkData()
+    let bookmark = try await Self.onFileSystem { try file.bookmarkData() }
     // The documents are listed by the recorder, not in the recent-documents list the installed app shares.
     let recent = RecentDocumentsRecorder()
     let (documents, note) = (AppDelegate.recentDocumentURLs, AppDelegate.noteRecentDocumentURL)
@@ -6531,7 +6553,7 @@ struct PlayerPlaybackTests {
       hold.release()
       #expect(!listedWhileHeld, "Restoring the recent documents resolved their bookmarks on the main thread")
       try await Self.waitUntil { !recent.documents().isEmpty }
-      #expect(recent.documents().map { $0.resolvingSymlinksInPath().path } == [file.resolvingSymlinksInPath().path])
+      #expect(await Self.resolvedPaths(recent.documents()) == Self.resolvedPaths([file]))
     }
   }
 
@@ -6566,9 +6588,12 @@ struct PlayerPlaybackTests {
       #expect(!savedWhileHeld, "Saving the recent documents made their bookmarks on the main thread")
       try await Self.waitUntil { !(defaults.array(forKey: key) ?? []).isEmpty }
       let bookmark = try #require(defaults.array(forKey: key)?.first as? Data)
-      var isStale = false
-      let resolved = try URL(resolvingBookmarkData: bookmark, bookmarkDataIsStale: &isStale)
-      #expect(resolved.resolvingSymlinksInPath().path == file.resolvingSymlinksInPath().path)
+      // The bookmark is resolved off the main thread, which does no file I/O.
+      let resolved = try await Self.onFileSystem {
+        var isStale = false
+        return try URL(resolvingBookmarkData: bookmark, bookmarkDataIsStale: &isStale)
+      }
+      #expect(await Self.resolvedPaths([resolved]) == Self.resolvedPaths([file]))
     }
   }
 
@@ -6837,7 +6862,7 @@ struct PlayerPlaybackTests {
   func fileTypeIconDoesNotWait() async throws {
     let hold = await QueueHold.reached(Utility.iconQueue, limit: Self.holdLimit)
     var icon: NSImage?
-    Utility.icon(for: URL(fileURLWithPath: "/iinaTests/a.mp4")) { icon = $0 }
+    Utility.icon(for: URL(fileURLWithPath: "/iinaTests/a.mp4", isDirectory: false)) { icon = $0 }
     let lookedUpWhileHeld = hold.limitPassed || icon != nil
     hold.release()
     #expect(!lookedUpWhileHeld, "The icon of a file's type was looked up on the main thread")
@@ -6964,7 +6989,8 @@ struct PlayerPlaybackTests {
       #expect(!shownWhileHeld, "Adding a subtitle to a playlist item found its folder on the main thread")
       try await Self.waitUntil { panel()?.isVisible == true }
       let openPanel = try #require(panel())
-      #expect(openPanel.directoryURL?.resolvingSymlinksInPath().path == folder.resolvingSymlinksInPath().path)
+      let directory = openPanel.directoryURL.map { [$0] } ?? []
+      #expect(await Self.resolvedPaths(directory) == Self.resolvedPaths([folder]))
       openPanel.cancel(nil)
     }
   }
@@ -6999,34 +7025,43 @@ struct PlayerPlaybackTests {
     defer { Logger.enabled = enabled }
     // The log folder is made when the first line is written to the log file, so the file is looked for once a line is written.
     func file() -> URL? { Logger.logDirectory?.appendingPathComponent("iina.log") }
-    func written(_ line: String) -> Bool {
-      file().flatMap { try? String(contentsOf: $0, encoding: .utf8) }?.contains(line) == true
+    // The log file is read, and the descriptors open on it looked for, off the main thread, which does no file I/O.
+    func written(_ line: String) async -> Bool {
+      guard let file = file() else { return false }
+      return await Task.detached { (try? String(contentsOf: file, encoding: .utf8))?.contains(line) == true }.value
     }
-    func isOpen() -> Bool { file().map(Self.isOpen) == true }
+    func isOpen() async -> Bool {
+      guard let file = file() else { return false }
+      return await Self.isOpen(file)
+    }
     // At the error level, so that the line is logged whatever level the settings log at.
     let line = "iinaTests-log-\(UUID().uuidString)"
     let writeHold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
     Logger.log(line, level: .error)
-    let writtenWhileHeld = writeHold.limitPassed || written(line)
+    let lineWritten = await written(line)
+    let writtenWhileHeld = writeHold.limitPassed || lineWritten
     writeHold.release()
     #expect(!writtenWhileHeld, "Logging a line wrote it to the log file on the main thread")
-    try await Self.waitUntil { written(line) }
-    #expect(isOpen())
+    try await Self.waitUntil { await written(line) }
+    #expect(await isOpen())
     // The log file stays closed for the rest of the run, the lines logged after it written only to the console. Its caller is told
     // on the main thread once the lines logged before the close are written and the file is closed, as termination is.
     let lastLine = "iinaTests-log-last-\(UUID().uuidString)"
     let closeHold = await QueueHold.reached(Logger.fileQueue, limit: Self.holdLimit)
     Logger.log(lastLine, level: .error)
-    let closed = Box<(onMain: Bool, lastWritten: Bool, fileOpen: Bool)>()
-    Logger.closeLogFile { closed.value = (Thread.isMainThread, written(lastLine), isOpen()) }
+    let toldOnMain = Box<Bool>()
+    Logger.closeLogFile { toldOnMain.value = Thread.isMainThread }
     try await Task.sleep(for: Self.heldAnswerWindow)
-    let closedWhileHeld = closeHold.limitPassed || !isOpen() || closed.value != nil
+    let openWhileHeld = await isOpen()
+    let closedWhileHeld = closeHold.limitPassed || !openWhileHeld || toldOnMain.value != nil
     closeHold.release()
     #expect(!closedWhileHeld, "Closing the log file closed it, or told its caller it had, on the main thread")
-    try await Self.waitUntil { closed.value != nil }
-    #expect(closed.value?.onMain == true)
-    #expect(closed.value?.lastWritten == true, "The log file was closed before the lines logged ahead of the close were written")
-    #expect(closed.value?.fileOpen == false)
+    try await Self.waitUntil { toldOnMain.value != nil }
+    #expect(toldOnMain.value == true)
+    // Nothing is written to the log file once it is closed, so what it holds and whether it is open are as they were when its
+    // caller was told.
+    #expect(await written(lastLine), "The log file was closed before the lines logged ahead of the close were written")
+    #expect(await !isOpen())
   }
 
   @Test("The first line written to the log file makes this session's log folder and opens the file in it on the logger's file queue, returning while the queue is held, then the file holds the line")
@@ -7054,7 +7089,7 @@ struct PlayerPlaybackTests {
     let file = folder.appendingPathComponent("iina.log")
     try await Self.waitUntil { (try? await Self.onFileSystem { try String(contentsOf: file, encoding: .utf8) })?.contains(line) == true }
     #expect(folder != logDirectory)
-    #expect(Self.isOpen(file))
+    #expect(await Self.isOpen(file))
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
       Logger.fileQueue.async {
         if case let .open(fileHandle, _) = Logger.logFile {
@@ -7223,15 +7258,17 @@ struct PlayerPlaybackTests {
     }
   }
 
-  /// Whether this process has the file at `url` open.
-  private static func isOpen(_ url: URL) -> Bool {
-    let path = url.resolvingSymlinksInPath().path
-    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-    return (0..<getdtablesize()).contains { descriptor in
-      buffer.withUnsafeMutableBufferPointer { pointer in
-        fcntl(descriptor, F_GETPATH, pointer.baseAddress!) != -1 && String(cString: pointer.baseAddress!) == path
+  /// Whether this process has the file at `url` open, asked off the main thread, which does no file I/O.
+  private static func isOpen(_ url: URL) async -> Bool {
+    await Task.detached {
+      let path = url.resolvingSymlinksInPath().path
+      var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+      return (0..<getdtablesize()).contains { descriptor in
+        buffer.withUnsafeMutableBufferPointer { pointer in
+          fcntl(descriptor, F_GETPATH, pointer.baseAddress!) != -1 && String(cString: pointer.baseAddress!) == path
+        }
       }
-    }
+    }.value
   }
 
   /// Run `body` with each Keychain request recorded by a `KeychainRecorder` in place of being made.
@@ -7548,8 +7585,8 @@ struct PlayerPlaybackTests {
     try await Self.onFileSystem { try FileManager.default.createDirectory(at: packages, withIntermediateDirectories: true) }
     let package = try await Self.makePluginPackage(in: packages, identifier: identifier, version: "1.0")
     let contents = try await Self.onFileSystem { try Data(contentsOf: package) }
-    let hold = try FileHold(package, contents: contents, limit: Self.holdLimit)
-    defer { hold.release() }
+    let hold = try await FileHold(package, contents: contents, limit: Self.holdLimit)
+    defer { await hold.release() }
     let ended = Box<Bool>()
     switch site {
     case .install:
@@ -8030,7 +8067,8 @@ private final class LocalStreamServer {
   let url: URL
 
   init(serving file: URL) async throws {
-    let body = try Data(contentsOf: file)
+    // The file is read off the main thread, which does no file I/O.
+    let body = try await Task.detached { try Data(contentsOf: file) }.value
     let parameters = NWParameters.tcp
     parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
     let listener = try NWListener(using: parameters)
@@ -8472,11 +8510,14 @@ private final class FileHold: @unchecked Sendable {
   private var answered = false
   private var passed = false
 
-  init(_ url: URL, contents: Data, limit: DispatchTimeInterval) throws {
+  init(_ url: URL, contents: Data, limit: DispatchTimeInterval) async throws {
     self.url = url
     self.contents = contents
-    try FileManager.default.removeItem(at: url)
-    guard mkfifo(url.path, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    // The pipe is put in the file's place off the main thread, which does no file I/O.
+    try await Task.detached {
+      try FileManager.default.removeItem(at: url)
+      guard mkfifo(url.path, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    }.value
     DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + limit) { [self] in answerRead(atLimit: true) }
   }
 
@@ -8518,13 +8559,14 @@ private final class FileHold: @unchecked Sendable {
     DispatchQueue.global(qos: .userInitiated).async { [self] in answerRead(atLimit: false) }
   }
 
-  /// Release the hold, putting the file back in the pipe's place.
-  func release() {
-    lock.lock()
-    released = true
-    lock.unlock()
-    try? FileManager.default.removeItem(at: url)
-    try? contents.write(to: url)
+  /// Release the hold, putting the file back in the pipe's place off the main thread, which does no file I/O.
+  func release() async {
+    lock.withLock { released = true }
+    let (url, contents) = (url, contents)
+    await Task.detached {
+      try? FileManager.default.removeItem(at: url)
+      try? contents.write(to: url)
+    }.value
   }
 }
 
@@ -8537,12 +8579,15 @@ private final class ConfigIncludeHold: @unchecked Sendable {
   private var passed = false
 
   /// Write mpv.conf in `folder`, including from the socket a file of the given contents.
-  init(in folder: URL, contents: String, limit: DispatchTimeInterval) throws {
+  init(in folder: URL, contents: String, limit: DispatchTimeInterval) async throws {
     var ends: [Int32] = [-1, -1]
     guard socketpair(AF_UNIX, SOCK_STREAM, 0, &ends) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-    // mpv owns the reader once it reads the include, and closes it once it has read the end of the file.
-    try "include=fdclose://\(ends[0])\n".write(to: folder.appendingPathComponent("mpv.conf"), atomically: true, encoding: .utf8)
     writer = ends[1]
+    // mpv owns the reader once it reads the include, and closes it once it has read the end of the file. The file is written off
+    // the main thread, which does no file I/O.
+    let include = "include=fdclose://\(ends[0])\n"
+    let conf = folder.appendingPathComponent("mpv.conf")
+    try await Task.detached { try include.write(to: conf, atomically: true, encoding: .utf8) }.value
     _ = contents.withCString { write(ends[1], $0, strlen($0)) }
     DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + limit) { [self] in
       guard letGo() else { return }
